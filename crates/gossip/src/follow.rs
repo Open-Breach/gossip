@@ -43,7 +43,8 @@ pub async fn run(args: FollowArgs) -> anyhow::Result<()> {
 }
 
 /// What to follow and how: the flags, over the template when one is named,
-/// over the `[defaults]` of the config file, over the built-in defaults.
+/// over the `[defaults]` and the `[columns]` of the config file, over the
+/// built-in defaults.
 ///
 /// The filter is the one thing a flag does not override. The filter flags
 /// narrow the filter of the config file: a record must pass both. With
@@ -60,15 +61,13 @@ fn settings(args: &FollowArgs, config: &Config) -> anyhow::Result<Settings> {
         filter: None,
         fields: args.fields.clone(),
         output: args.output,
+        columns: args.columns.unwrap_or_default(),
     };
     let template = match &args.template {
         Some(name) => crate::templates::find(config, name)?.clone(),
         None => Template::default(),
     };
-    let mut settings = asked
-        .or(template)
-        .or(config.defaults.clone().into())
-        .resolve();
+    let mut settings = asked.or(template).or(config.base()).resolve();
     // What is left in `filter` is the filter of the config file: the
     // template's, or the one of the defaults.
     let from_config = settings.filter.take().filter(|_| !args.no_filter);
@@ -155,6 +154,7 @@ impl Printer {
                 // it speaks UTF-8.
                 emoji: !args.no_emoji && stdout_is_terminal && locale_is_utf8(),
                 zone: Zone::Local,
+                columns: settings.columns,
             }))
         };
         Printer { mode }
@@ -213,6 +213,43 @@ mod tests {
         assert_eq!(settings.filter, None);
         assert_eq!(settings.fields, None);
         assert_eq!(settings.output, Output::Text);
+        assert_eq!(settings.columns, gossip_core::Columns::default());
+    }
+
+    #[test]
+    fn the_columns_flag_goes_over_the_template_and_the_config_file() {
+        use gossip_core::Cut;
+
+        let config = Config::from_toml(
+            r#"
+            [columns]
+            pod = { width = 30, cut = "start" }
+            container = { width = 8 }
+
+            [templates.t]
+            targets = ["flowcpt"]
+            columns = { pod = { cut = "end" }, level = { width = 0 } }
+            "#,
+        )
+        .unwrap();
+        let columns =
+            |arguments: &[&str]| settings(&follow_args(arguments), &config).unwrap().columns;
+
+        // Without a template: the table of the config file over the built-in
+        // columns.
+        let plain = columns(&["flowcpt"]);
+        assert_eq!((plain.pod.width, plain.pod.cut), (30, Cut::Start));
+        assert_eq!((plain.container.width, plain.container.cut), (8, Cut::End));
+        assert_eq!(plain.level.width, 5);
+
+        // The template over that, and the flag over both, part by part.
+        let template = columns(&["--template", "t"]);
+        assert_eq!((template.pod.width, template.pod.cut), (30, Cut::End));
+        assert_eq!(template.level.width, 0);
+        let flag = columns(&["--template", "t", "--columns", "pod=12,level=5:none"]);
+        assert_eq!((flag.pod.width, flag.pod.cut), (12, Cut::End));
+        assert_eq!((flag.level.width, flag.level.cut), (5, Cut::None));
+        assert_eq!(flag.container.width, 8);
     }
 
     #[test]

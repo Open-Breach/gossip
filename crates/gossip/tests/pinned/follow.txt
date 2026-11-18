@@ -1,0 +1,12 @@
+13:59:57.000 deployment…c-web-api EVNT              ScalingReplicaSet: Scaled up replica set fc-web-api-5c8b6d7f9 to 1
+13:59:58.000 7f698fb95f-vxfgs     EVNT              Killing: Container api failed liveness probe, will be restarted
+13:59:59.000 5c8b6d7f9-m4q8z      EVNT              BackOff: Back-off restarting failed container
+14:00:01.000 7f698fb95f-vxfgs     api         INFO  http.method=GET http.route=/api/v1/sources http.status_code=200 tenant_id=3K6ehNLhnRsPfWhzjugmea user_id=auth0|6a86204723ca712d0c11f85a request_id=32e49c93-4c57-43a0-9439-c554e5fff1f6 time.busy=5.53ms  close
+14:00:02.000 5c8b6d7f9-m4q8z      linkerd-p…  WARN  peer=10.0.0.7:8080  connection refused
+14:00:03.000 redis-0              redis             1:M 18 Nov 2026 14:00:03.000 * Ready to accept connections
+14:00:04.000 fc-web-api…m4q8z     api         ERROR ERROR upstream is gone
+14:00:05.000 fc-api…vxfgs         api               thread 'main' (7) panicked at src/main.rs:5:5:
+boom
+stack backtrace:
+   0: fc_api::main
+14:00:05.004 fc-api…vxfgs         api         DEBUG attempt=2  worker restarted

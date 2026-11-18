@@ -5,6 +5,7 @@
 
 mod age;
 mod cli;
+mod columns;
 mod fields;
 mod follow;
 mod list;

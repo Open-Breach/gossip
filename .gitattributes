@@ -1,0 +1,2 @@
+# The pinned output of the tests is compared byte for byte.
+crates/gossip/tests/pinned/** text eol=lf

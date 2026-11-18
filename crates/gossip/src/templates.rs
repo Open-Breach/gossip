@@ -3,7 +3,7 @@
 use std::io::Write;
 
 use anyhow::bail;
-use gossip_core::{Config, Filter, FormatSetting, Template, format_duration};
+use gossip_core::{ColumnsSetting, Config, Filter, FormatSetting, Template, format_duration};
 
 use crate::cli::{TemplatesArgs, TemplatesCommand};
 use crate::table::Table;
@@ -104,7 +104,30 @@ fn show(name: &str, template: &Template) -> String {
     if let Some(output) = template.output {
         line("output", quoted(output.as_str()));
     }
+    if !template.columns.is_empty() {
+        line("columns", columns_text(&template.columns));
+    }
     text
+}
+
+/// A `columns` table as the config file writes it on one line.
+fn columns_text(columns: &ColumnsSetting) -> String {
+    let entries: Vec<String> = columns
+        .entries()
+        .into_iter()
+        .filter(|(_, setting)| !setting.is_empty())
+        .map(|(name, setting)| {
+            let mut parts = Vec::new();
+            if let Some(width) = setting.width {
+                parts.push(format!("width = {width}"));
+            }
+            if let Some(cut) = setting.cut {
+                parts.push(format!("cut = {}", quoted(cut.as_str())));
+            }
+            format!("{name} = {{ {} }}", parts.join(", "))
+        })
+        .collect();
+    format!("{{ {} }}", entries.join(", "))
 }
 
 /// A filter as the config file writes it: a rule on one line, `all` and
@@ -195,6 +218,7 @@ format = { api = "json", envoy = "text" }
 filter = { not = { field = "f.debug", op = "exists" } }
 fields = []
 output = "json"
+columns = { pod = { width = 24, cut = "middle" }, container = { width = 8 }, level = { cut = "none" } }
 
 [templates."with a space"]
 targets = ["flowcpt"]
@@ -249,6 +273,7 @@ format = { api = "json", envoy = "text" }
 filter = { not = { field = "f.debug", op = "exists" } }
 fields = []
 output = "json"
+columns = { pod = { width = 24, cut = "middle" }, container = { width = 8 }, level = { cut = "none" } }
 "#
         );
     }

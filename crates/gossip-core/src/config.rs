@@ -18,6 +18,7 @@ use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
+use crate::columns::{Columns, ColumnsSetting};
 use crate::filter::Filter;
 use crate::parser::FormatChoice;
 use crate::target::{Pattern, Target};
@@ -54,6 +55,10 @@ pub struct Config {
     /// Fills in anything a template or the command line leaves out.
     #[serde(default, skip_serializing_if = "Defaults::is_empty")]
     pub defaults: Defaults,
+    /// The columns of the prefix of a line, for every run; a template and
+    /// the `--columns` flag go over it.
+    #[serde(default, skip_serializing_if = "ColumnsSetting::is_empty")]
+    pub columns: ColumnsSetting,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub templates: BTreeMap<String, Template>,
 }
@@ -74,6 +79,15 @@ impl Config {
             return Ok(Config::default());
         }
         Config::load_from(&path)
+    }
+
+    /// The lowest layer the config file gives: its `[defaults]` and its
+    /// `[columns]`, as a template without targets.
+    pub fn base(&self) -> Template {
+        Template {
+            columns: self.columns,
+            ..self.defaults.clone().into()
+        }
     }
 
     /// Reads a config file.
@@ -159,6 +173,10 @@ pub struct Template {
     pub fields: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<Output>,
+    /// The columns of the prefix of a line; what it leaves out comes from
+    /// the `[columns]` of the config file.
+    #[serde(default, skip_serializing_if = "ColumnsSetting::is_empty")]
+    pub columns: ColumnsSetting,
 }
 
 impl Template {
@@ -182,11 +200,13 @@ impl Template {
         self.filter = self.filter.or(lower.filter);
         self.fields = self.fields.or(lower.fields);
         self.output = self.output.or(lower.output);
+        self.columns = self.columns.or(lower.columns);
         self
     }
 
     /// Fills in what is still left out with the built-in defaults: the last
-    /// 20 lines, events on, formats detected, text output.
+    /// 20 lines, events on, formats detected, text output, the built-in
+    /// columns.
     pub fn resolve(self) -> Settings {
         let tail = match (self.since, self.tail) {
             (None, None) => Some(DEFAULT_TAIL),
@@ -203,6 +223,7 @@ impl Template {
             filter: self.filter,
             fields: self.fields,
             output: self.output.unwrap_or_default(),
+            columns: self.columns.resolve(),
         }
     }
 }
@@ -254,6 +275,7 @@ impl From<Defaults> for Template {
             filter: defaults.filter,
             fields: defaults.fields,
             output: defaults.output,
+            columns: ColumnsSetting::default(),
         }
     }
 }
@@ -273,6 +295,7 @@ pub struct Settings {
     pub filter: Option<Filter>,
     pub fields: Option<Vec<String>>,
     pub output: Output,
+    pub columns: Columns,
 }
 
 /// The `format` key: one format for every container, or a table of formats
@@ -378,6 +401,7 @@ impl FromStr for Output {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::columns::Cut;
     use crate::record::Level;
 
     /// The example of the spec, section 6, as it stands there.
@@ -469,10 +493,12 @@ since = "5m"
             filter = { field = "level", op = ">=", value = "warn" }
             fields = ["tenant_id"]
             output = "json"
+            columns = { pod = { width = 24, cut = "start" }, level = { width = 0 } }
             "#,
         )
         .unwrap();
         let template = &config.templates["everything"];
+        assert_eq!(template.columns, "pod=24:start,level=0".parse().unwrap());
         assert_eq!(template.targets.len(), 2);
         assert!(template.container.as_ref().unwrap().matches("envoy"));
         assert_eq!(template.since, Some(Duration::from_secs(5400)));
@@ -483,6 +509,100 @@ since = "5m"
         assert_eq!(format.for_container("envoy"), FormatChoice::Text);
         assert_eq!(format.for_container("sidecar"), FormatChoice::Auto);
         assert_eq!(template.output, Some(Output::Json));
+    }
+
+    /// The example of the round-two spec, section 5, as it stands there.
+    const COLUMNS_EXAMPLE: &str = r#"
+[columns]
+pod = { width = 20, cut = "middle" }
+container = { width = 10, cut = "end" }
+level = { width = 5 }
+"#;
+
+    #[test]
+    fn the_columns_table_of_the_spec() {
+        let config = Config::from_toml(COLUMNS_EXAMPLE).unwrap();
+        assert_eq!(
+            config.columns,
+            "pod=20:middle,container=10:end,level=5".parse().unwrap()
+        );
+        assert_eq!(config.columns.resolve(), Columns::default());
+        assert!(config.defaults.is_empty() && config.templates.is_empty());
+        // Written as sub-tables it reads the same.
+        let tables = Config::from_toml(
+            "[columns.pod]\nwidth = 20\ncut = \"middle\"\n[columns.container]\nwidth = 10\ncut = \"end\"\n[columns.level]\nwidth = 5\n",
+        )
+        .unwrap();
+        assert_eq!(tables, config);
+    }
+
+    #[test]
+    fn the_columns_layer_part_by_part_from_the_flag_down_to_the_config_file() {
+        let config = Config::from_toml(
+            r#"
+            [defaults]
+            tail = 5
+
+            [columns]
+            pod = { width = 30, cut = "start" }
+            container = { width = 8 }
+
+            [templates.t]
+            targets = ["flowcpt"]
+            columns = { pod = { cut = "end" }, level = { width = 0 } }
+            "#,
+        )
+        .unwrap();
+        // The lowest layer of the file holds its defaults and its columns.
+        let base = config.base();
+        assert_eq!(base.tail, Some(5));
+        assert_eq!(base.columns, config.columns);
+
+        let flag = Template {
+            columns: "container=12".parse().unwrap(),
+            ..Template::default()
+        };
+        let settings = flag
+            .or(config.templates["t"].clone())
+            .or(config.base())
+            .resolve();
+        let columns = settings.columns;
+        // The width of the file with the side of the template.
+        assert_eq!((columns.pod.width, columns.pod.cut), (30, Cut::End));
+        // The width of the flag with the built-in side.
+        assert_eq!(
+            (columns.container.width, columns.container.cut),
+            (12, Cut::End)
+        );
+        assert_eq!(columns.level.width, 0);
+        assert_eq!(columns.time, Columns::default().time);
+    }
+
+    #[test]
+    fn a_columns_table_that_cannot_be_read_is_an_error_with_the_line_number() {
+        for (text, line, expected) in [
+            ("[columns]\nnode = { width = 20 }\n", "line 2", "node"),
+            ("[columns]\npod = { wide = 20 }\n", "line 2", "wide"),
+            ("[columns]\npod = { width = -1 }\n", "line 2", "width"),
+            ("[columns]\npod = { width = \"20\" }\n", "line 2", "width"),
+            ("[columns]\n\npod = { cut = \"left\" }\n", "line 3", "left"),
+            ("[columns]\npod = 20\n", "line 2", "pod"),
+            (
+                "[templates.t]\ncolumns = { node = { width = 20 } }\n",
+                "line 2",
+                "node",
+            ),
+            // The columns are a table of their own, not a default.
+            (
+                "[defaults]\ncolumns = { pod = { width = 20 } }\n",
+                "line 2",
+                "columns",
+            ),
+        ] {
+            let error = error_of(text);
+            assert!(error.contains(line), "`{text}` gave: {error}");
+            assert!(error.contains(expected), "`{text}` gave: {error}");
+        }
     }
 
     #[test]
@@ -699,11 +819,15 @@ since = "5m"
         assert_eq!(settings.filter, None);
         assert_eq!(settings.fields, None);
         assert_eq!(settings.output, Output::Text);
+        assert_eq!(settings.columns, Columns::default());
     }
 
     #[test]
     fn the_config_survives_a_round_trip_through_toml() {
         let config = Config::from_toml(SPEC_EXAMPLE).unwrap();
+        let text = config.to_toml().unwrap();
+        assert_eq!(Config::from_toml(&text).unwrap(), config, "{text}");
+        let config = Config::from_toml(COLUMNS_EXAMPLE).unwrap();
         let text = config.to_toml().unwrap();
         assert_eq!(Config::from_toml(&text).unwrap(), config, "{text}");
 
@@ -713,9 +837,11 @@ since = "5m"
                 since: Some(Duration::from_secs(90)),
                 ..Defaults::default()
             },
+            columns: "time=0,pod=:start".parse().unwrap(),
             templates: BTreeMap::from([(
                 "t".to_string(),
                 Template {
+                    columns: "container=8:none".parse().unwrap(),
                     targets: vec![target("flowcpt/-/*/api")],
                     format: Some(FormatSetting::PerContainer(BTreeMap::from([(
                         "api".to_string(),
