@@ -160,11 +160,13 @@ The format of every line is detected on its own:
   (`message` or `msg`) and fields. The application's own timestamp is kept as
   the field `timestamp`. A nested object is kept as one field, as JSON text.
 - The fields of a `tracing` span are fields of the line. `tracing-subscriber`'s
-  JSON formatter writes them under `span`, and the chain of spans around it
-  under `spans`; Gossip merges the keys of `span` into the fields, where a
-  field of the line itself wins over a span field of the same name, and drops
-  `spans`, which repeats them. So `--field tenant_id=t_123` finds a tenant
-  whose id was recorded on the request's span.
+  JSON formatter writes the fields of the current span under `span`, and the
+  chain of spans the line was logged in under `spans`. Gossip merges the keys
+  of all of them into the fields and keeps neither `span` nor `spans`. A field
+  of the line itself wins over a span field of the same name, and an inner
+  span over an outer one. So `--field tenant_id=t_123` finds a tenant whose
+  id was recorded on the request's span, also for a line logged in a span
+  inside that one. The name of the innermost span is the field `name`.
 - A logfmt line (`level=info msg="request done" status=200`) is read the same
   way.
 - Anything else is text. Its level is guessed from a leading `ERROR`, `WARN`,

@@ -42,7 +42,7 @@ pub const TIMESTAMP_FIELD: &str = "timestamp";
 pub const TARGET_FIELD: &str = "target";
 
 /// Where `tracing-subscriber` puts the fields of the current span, and where
-/// it puts the chain of spans around it.
+/// it puts the chain of spans the line was logged in, from the outermost in.
 const SPAN_KEY: &str = "span";
 const SPANS_KEY: &str = "spans";
 
@@ -256,8 +256,8 @@ struct Structured {
     format: Format,
     /// The top-level keys of the line.
     fields: BTreeMap<String, Value>,
-    /// The fields of the span the line was logged in, for a JSON line that
-    /// has them under `span`.
+    /// The fields of the spans the line was logged in, for a JSON line that
+    /// has them under `span` and `spans`.
     span: BTreeMap<String, Value>,
 }
 
@@ -371,26 +371,37 @@ fn normalise(fields: &mut BTreeMap<String, Value>) -> (Option<Level>, String) {
 /// Its top-level keys become the fields; nested objects and arrays are kept
 /// as JSON text.
 ///
-/// One nested object is opened: `span`, where `tracing-subscriber` puts the
-/// fields of the current span. Its keys are handed back apart, to be merged
-/// into the fields of the line. `spans`, the chain of spans around it,
-/// repeats them and is dropped.
+/// The exception is what `tracing-subscriber` writes about the spans a line
+/// was logged in: the fields of the current span under `span`, and the whole
+/// chain of spans under `spans`, from the outermost in. Their keys are handed
+/// back apart, to be merged into the fields of the line. The chain is not
+/// only a repetition of `span`: a line logged in a span inside the span of a
+/// request has the fields of the request, its tenant among them, in the
+/// chain alone. So the chain is read too, an inner span winning over an
+/// outer one and `span` over all of them.
 fn parse_json(line: &str) -> Option<(BTreeMap<String, Value>, BTreeMap<String, Value>)> {
     if !line.starts_with('{') {
         return None;
     }
     let mut object: serde_json::Map<String, Value> = serde_json::from_str(line).ok()?;
-    let span = match object.remove(SPAN_KEY) {
-        Some(Value::Object(span)) => span.into_iter().map(flat).collect(),
-        // Not what `tracing` writes: a field like any other.
+    let mut span = BTreeMap::new();
+    // Anything but a list is not what `tracing` writes: a field like any
+    // other. The same holds for a `span` that is not an object.
+    if matches!(object.get(SPANS_KEY), Some(Value::Array(_)))
+        && let Some(Value::Array(chain)) = object.remove(SPANS_KEY)
+    {
+        for around in chain {
+            if let Value::Object(around) = around {
+                span.extend(around.into_iter().map(flat));
+            }
+        }
+    }
+    match object.remove(SPAN_KEY) {
+        Some(Value::Object(current)) => span.extend(current.into_iter().map(flat)),
         Some(other) => {
             object.insert(SPAN_KEY.to_string(), other);
-            BTreeMap::new()
         }
-        None => BTreeMap::new(),
-    };
-    if matches!(object.get(SPANS_KEY), Some(Value::Array(_))) {
-        object.remove(SPANS_KEY);
+        None => {}
     }
     Some((object.into_iter().map(flat).collect(), span))
 }
@@ -679,12 +690,85 @@ mod tests {
         assert_eq!(parsed.fields["span"], json!("2 m"));
         assert_eq!(parsed.fields["spans"], json!(3));
 
-        // The chain is dropped also when there is no current span beside it.
+        // A chain with something in it that is no span: that part is left
+        // out, and the chain is no field.
         let parsed = one(
             FormatChoice::Auto,
-            r#"{"message":"m","spans":[{"name":"request"}]}"#,
+            r#"{"message":"m","spans":["request",{"tenant_id":"t_123"},7]}"#,
         );
-        assert!(parsed.fields.is_empty());
+        assert_eq!(
+            parsed.fields,
+            BTreeMap::from([("tenant_id".to_string(), json!("t_123"))])
+        );
+    }
+
+    /// What `tracing-subscriber` 0.3.23 writes with `flatten_event(true)` for
+    /// a line logged in the span `load_sources` inside the span `request`,
+    /// and for the end of that inner span: the current span under `span`,
+    /// and under `spans` the chain from the outermost in, which at the end
+    /// of a span is its parents only.
+    const NESTED_LINE: &str = r#"{"timestamp":"2026-11-18T21:00:15.993033Z","level":"INFO","message":"in a nested span","rows":3,"target":"spanprobe","span":{"table":"sources","name":"load_sources"},"spans":[{"http.method":"GET","http.route":"/api/v1/sources","request_id":"32e49c93","tenant_id":"3K6ehNLhnRsPfWhzjugmea","name":"request"},{"table":"sources","name":"load_sources"}]}"#;
+    const NESTED_CLOSE: &str = r#"{"timestamp":"2026-11-18T21:00:15.993085Z","level":"INFO","message":"close","time.busy":"48.2µs","time.idle":"5.57µs","target":"spanprobe","span":{"table":"sources","name":"load_sources"},"spans":[{"http.method":"GET","http.route":"/api/v1/sources","request_id":"32e49c93","tenant_id":"3K6ehNLhnRsPfWhzjugmea","name":"request"}]}"#;
+
+    #[test]
+    fn a_line_logged_in_a_nested_span_has_the_fields_of_the_spans_around_it() {
+        let parsed = one(FormatChoice::Auto, NESTED_LINE);
+        assert_eq!(parsed.message, "in a nested span");
+        assert_eq!(
+            parsed.fields,
+            BTreeMap::from(
+                [
+                    // Of the line itself.
+                    ("rows", json!(3)),
+                    ("target", json!("spanprobe")),
+                    ("timestamp", json!("2026-11-18T21:00:15.993033Z")),
+                    // Of the span it was logged in, whose name wins over the
+                    // name of the span around it.
+                    ("table", json!("sources")),
+                    ("name", json!("load_sources")),
+                    // Of the request around that, found in the chain only.
+                    ("http.method", json!("GET")),
+                    ("http.route", json!("/api/v1/sources")),
+                    ("request_id", json!("32e49c93")),
+                    ("tenant_id", json!("3K6ehNLhnRsPfWhzjugmea")),
+                ]
+                .map(|(key, value)| (key.to_string(), value))
+            )
+        );
+
+        // The end of the inner span: the chain is its parents.
+        let parsed = one(FormatChoice::Auto, NESTED_CLOSE);
+        assert_eq!(parsed.message, "close");
+        assert_eq!(parsed.fields["name"], json!("load_sources"));
+        assert_eq!(parsed.fields["table"], json!("sources"));
+        assert_eq!(parsed.fields["tenant_id"], json!("3K6ehNLhnRsPfWhzjugmea"));
+        assert_eq!(parsed.fields["time.busy"], json!("48.2µs"));
+        assert!(!parsed.fields.contains_key("spans"));
+    }
+
+    #[test]
+    fn an_inner_span_wins_over_an_outer_one_and_the_line_over_both() {
+        let parsed = one(
+            FormatChoice::Auto,
+            r#"{"message":"m","step":"line","span":{"step":"current","depth":"current","name":"c"},"spans":[{"step":"outer","depth":"outer","attempt":"outer","user":"outer","name":"a"},{"step":"inner","depth":"inner","attempt":"inner","name":"b"}]}"#,
+        );
+        assert_eq!(parsed.fields["step"], json!("line"));
+        assert_eq!(parsed.fields["depth"], json!("current"));
+        assert_eq!(parsed.fields["attempt"], json!("inner"));
+        assert_eq!(parsed.fields["user"], json!("outer"));
+        assert_eq!(parsed.fields["name"], json!("c"));
+    }
+
+    #[test]
+    fn the_chain_is_read_also_when_there_is_no_current_span_beside_it() {
+        // `with_current_span(false)` leaves `span` out.
+        let parsed = one(
+            FormatChoice::Auto,
+            r#"{"message":"m","spans":[{"tenant_id":"t_123","name":"request"}]}"#,
+        );
+        assert_eq!(parsed.fields["tenant_id"], json!("t_123"));
+        assert_eq!(parsed.fields["name"], json!("request"));
+        assert!(!parsed.fields.contains_key("spans"));
     }
 
     #[test]

@@ -394,6 +394,39 @@ async fn the_field_flag_sees_the_fields_of_a_tracing_span() {
     follow.expect_quiet().await;
 }
 
+/// What `tracing-subscriber` writes for a line logged in a span inside the
+/// span of a request: the fields of the request, its tenant among them, are
+/// in the chain under `spans` only.
+const NESTED_SPAN_LINE: &str = r#"{"timestamp":"2026-11-18T20:39:01.180112Z","level":"INFO","message":"sources loaded","rows":3,"target":"flowcpt_api::sources","span":{"table":"sources","name":"load_sources"},"spans":[{"http.method":"GET","http.route":"/api/v1/sources","request_id":"32e49c93-4c57-43a0-9439-c554e5fff1f6","tenant_id":"3K6ehNLhnRsPfWhzjugmea","name":"request"},{"table":"sources","name":"load_sources"}]}"#;
+
+#[tokio::test]
+async fn the_field_flag_finds_a_line_logged_in_a_span_inside_the_span_of_a_request() {
+    let fake = FakeCluster::start().await;
+    seed_span_lines(&fake);
+    fake.log(NS, "fc-api-0", "api", at(3_000), NESTED_SPAN_LINE);
+
+    let mut follow = Follow::start(
+        &fake,
+        "span-nested",
+        &[
+            "flowcpt",
+            "--no-color",
+            "--fields",
+            "name,table,rows,request_id",
+            "--field",
+            "tenant_id=3K6ehNLhnRsPfWhzjugmea",
+        ],
+    );
+    assert_eq!(
+        follow.lines(2).await,
+        [
+            "14:00:01.000 fc-api-0 api  INFO  request_id=32e49c93-4c57-43a0-9439-c554e5fff1f6  close",
+            "14:00:03.000 fc-api-0 api  INFO  name=load_sources table=sources rows=3 request_id=32e49c93-4c57-43a0-9439-c554e5fff1f6  sources loaded",
+        ]
+    );
+    follow.expect_quiet().await;
+}
+
 #[tokio::test]
 async fn a_tracing_span_as_json_is_flat_and_raw_is_the_line_as_it_came() {
     let fake = FakeCluster::start().await;
