@@ -40,7 +40,13 @@ pub struct SessionOptions {
     /// How long a record is held back so that records of different sources
     /// come out in the order of their time.
     pub hold: Duration,
+    /// How long a log stream may be silent before it is opened again. A
+    /// connection can die without a word, and silence is the only sign.
+    pub idle: Duration,
 }
+
+/// How long a silent log stream is left alone by default.
+pub const DEFAULT_IDLE: Duration = Duration::from_secs(90);
 
 impl Default for SessionOptions {
     fn default() -> Self {
@@ -50,6 +56,7 @@ impl Default for SessionOptions {
             containers: None,
             format: FormatSetting::default(),
             hold: DEFAULT_HOLD,
+            idle: DEFAULT_IDLE,
         }
     }
 }
@@ -62,6 +69,7 @@ impl From<&Settings> for SessionOptions {
             containers: settings.container.clone(),
             format: settings.format.clone(),
             hold: DEFAULT_HOLD,
+            idle: DEFAULT_IDLE,
         }
     }
 }
@@ -134,6 +142,7 @@ async fn drive(
             tail: options.tail,
         },
         formats: options.format.clone(),
+        idle: options.idle,
         records: records_tx,
     });
     // The state of every followed container, as its follower sees it.

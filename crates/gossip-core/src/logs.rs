@@ -13,7 +13,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use futures::io::{AsyncBufRead, AsyncBufReadExt};
 use k8s_openapi::api::core::v1::Pod;
 use k8s_openapi::jiff::Timestamp;
@@ -26,7 +26,7 @@ use crate::config::FormatSetting;
 use crate::error::describe;
 use crate::parser::{LineParser, MAX_LINE_BYTES, ParsedLine};
 use crate::record::{Kind, Record};
-use crate::resolver::{ContainerId, ContainerView};
+use crate::resolver::{ContainerId, ContainerState, ContainerView};
 
 /// How long a line is kept back for continuation lines that may follow it,
 /// once the stream goes quiet.
@@ -39,6 +39,17 @@ const STATUS_GRACE: Duration = Duration::from_secs(2);
 /// How long a stream is still read after its container was let go, for the
 /// last lines of a pod that went away.
 const CLOSING_GRACE: Duration = Duration::from_secs(2);
+
+/// How long opening a stream may take before it counts as failed.
+const OPEN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A stream that breaks sooner than this after it was opened, without a
+/// line, may not have delivered the history it was asked for.
+const HISTORY_GRACE: Duration = Duration::from_secs(2);
+
+/// How far the clock of this machine and the clocks of the cluster are
+/// allowed to differ where the two are compared.
+const CLOCK_TOLERANCE: TimeDelta = TimeDelta::seconds(5);
 
 /// The pause before the first retry, and the longest pause.
 const BACKOFF_START: Duration = Duration::from_secs(1);
@@ -61,6 +72,8 @@ pub(crate) struct Followers {
     pub cluster: String,
     pub history: History,
     pub formats: FormatSetting,
+    /// A stream that has been silent this long is opened again.
+    pub idle: Duration,
     /// Where the records go: the merge of the session.
     pub records: mpsc::Sender<Record>,
 }
@@ -75,6 +88,8 @@ enum End {
     Finished,
     /// It broke.
     Broken(String),
+    /// Nothing came for so long that the connection may be dead.
+    Idle,
 }
 
 /// Which run of the container a stream reads, and what that means for its
@@ -125,12 +140,17 @@ pub(crate) async fn follow(
         status,
         format,
         position: None,
+        history_pending: false,
+        floor: None,
+        stalled_at: None,
         backoff: Backoff::new(),
         waiting_noticed: None,
     };
     // Gone is the one way out, and not an error.
     let _ = follower.run(initial).await;
 }
+
+type LogStream = Pin<Box<dyn AsyncBufRead + Send>>;
 
 struct Follower {
     context: Arc<Followers>,
@@ -140,6 +160,14 @@ struct Follower {
     format: crate::parser::FormatChoice,
     /// The last line seen of the container's log.
     position: Option<Position>,
+    /// The start-up history has not been delivered yet, so the next stream
+    /// asks for it.
+    history_pending: bool,
+    /// From when on lines are wanted while no line has been seen: the start
+    /// of the history that was asked for. None means from the beginning.
+    floor: Option<DateTime<Utc>>,
+    /// When the stream was last opened again because it had gone silent.
+    stalled_at: Option<DateTime<Utc>>,
     backoff: Backoff,
     /// The reason of the waiting state that a notice has told already.
     waiting_noticed: Option<String>,
@@ -150,78 +178,96 @@ impl Follower {
         let first = self.status.borrow().clone();
         // A container that exists at start gets the start-up history; one
         // that starts later is read from its beginning.
-        let mut history_pending = initial && first.state.has_output();
-        if initial && has_previous_run(&first) {
-            self.read_previous(Reading::PreviousAtStart).await?;
-        }
+        self.history_pending = initial && first.state.has_output();
 
         // The run, by its restart count, that was read to its end, and the
         // run of the stream opened last.
         let mut finished: Option<i32> = None;
         let mut reading: Option<i32> = None;
+        if initial && has_previous_run(&first) {
+            self.read_previous(Reading::PreviousAtStart).await?;
+            if !first.state.has_output() {
+                // It waits to be started again: the run just read is the
+                // only one it has, and it is over.
+                finished = Some(first.restart_count);
+            }
+        }
+
         loop {
             let view = self.wait_for_output(finished).await?;
             let run = view.restart_count;
             if let Some(read) = reading
                 && run > read
                 && finished != Some(read)
-                && self.position.is_some()
             {
                 // The run being read ended while its stream was down.
                 self.read_previous(Reading::RestOfPrevious).await?;
             }
             reading = Some(run);
 
-            let params = self.params(history_pending);
-            match self.api.log_stream(&self.id.pod, &params).await {
-                Ok(stream) => match self
-                    .read(Box::pin(stream), Reading::Current, &mut history_pending)
-                    .await?
-                {
-                    End::Finished => {
-                        if self.ended_for_good(run).await? {
-                            finished = Some(run);
-                        } else {
-                            let pause = self.backoff.next();
-                            let message = format!(
-                                "the log stream of {} ended while the container is still running; \
-                                 opening it again in {}",
-                                self.name(),
-                                seconds(pause)
-                            );
-                            self.notice(message).await?;
-                            self.pause(pause).await?;
-                        }
-                    }
-                    End::Broken(reason) => {
-                        let pause = self.backoff.next();
-                        let message = format!(
-                            "lost the log stream of {}: {reason}; opening it again in {}",
-                            self.name(),
-                            seconds(pause)
-                        );
-                        self.notice(message).await?;
-                        self.pause(pause).await?;
-                    }
-                },
-                Err(error) => match refusal(&error) {
+            let params = self.params();
+            let stream = match self.open(&params).await? {
+                Ok(stream) => stream,
+                Err(Refusal::Gone) => {
                     // The resolver will let the container go in a moment.
-                    Refusal::Gone => self.status.changed().await.map_err(|_| Gone)?,
-                    Refusal::NotReady => {
-                        let pause = self.backoff.next();
-                        self.wait_for_change_or(pause).await?;
-                    }
-                    Refusal::Other(reason) => {
+                    self.status.changed().await.map_err(|_| Gone)?;
+                    continue;
+                }
+                Err(Refusal::NotReady) => {
+                    let pause = self.backoff.next();
+                    self.wait_for_change_or(pause).await?;
+                    continue;
+                }
+                Err(Refusal::Other(reason)) => {
+                    let pause = self.backoff.next();
+                    let message = format!(
+                        "cannot open the log stream of {}: {reason}; trying again in {}",
+                        self.name(),
+                        seconds(pause)
+                    );
+                    self.notice(message).await?;
+                    self.pause(pause).await?;
+                    continue;
+                }
+            };
+            if self.history_pending && self.floor.is_none() {
+                // From here on the history that was asked for counts,
+                // whether or not a line of it arrives.
+                let since = self.context.history.since.unwrap_or_default();
+                let back = TimeDelta::from_std(since).unwrap_or_default() + CLOCK_TOLERANCE;
+                self.floor = Some(Utc::now() - back);
+            }
+
+            match self.read(stream, Reading::Current).await? {
+                End::Finished => {
+                    if self.ended_for_good(run).await? {
+                        finished = Some(run);
+                    } else {
                         let pause = self.backoff.next();
                         let message = format!(
-                            "cannot open the log stream of {}: {reason}; trying again in {}",
+                            "the log stream of {} ended while the container is still running; \
+                             opening it again in {}",
                             self.name(),
                             seconds(pause)
                         );
                         self.notice(message).await?;
                         self.pause(pause).await?;
                     }
-                },
+                }
+                End::Broken(reason) => {
+                    let pause = self.backoff.next();
+                    let message = format!(
+                        "lost the log stream of {}: {reason}; opening it again in {}",
+                        self.name(),
+                        seconds(pause)
+                    );
+                    self.notice(message).await?;
+                    self.pause(pause).await?;
+                }
+                // A connection can die without a word, and a log stream
+                // never writes, so silence is all there is to go by. Open
+                // the stream again; if it was alive this changes nothing.
+                End::Idle => self.stalled_at = Some(Utc::now()),
             }
         }
     }
@@ -231,19 +277,28 @@ impl Follower {
         format!("{} in pod {}", self.id.container, self.id.pod)
     }
 
-    fn params(&self, history_pending: bool) -> LogParams {
+    fn params(&self) -> LogParams {
         let mut params = LogParams {
             container: Some(self.id.container.clone()),
             follow: true,
             timestamps: true,
             ..LogParams::default()
         };
-        if history_pending {
-            self.add_history(&mut params);
+        self.add_start(&mut params);
+        params
+    }
+
+    /// Where a stream starts: with the start-up history while that is still
+    /// owed, after the last line seen otherwise, and when no line was seen,
+    /// where the history began.
+    fn add_start(&self, params: &mut LogParams) {
+        if self.history_pending {
+            self.add_history(params);
         } else if let Some(position) = self.position {
             params.since_time = Some(to_timestamp(position.time));
+        } else if let Some(floor) = self.floor {
+            params.since_time = Some(to_timestamp(floor));
         }
-        params
     }
 
     fn add_history(&self, params: &mut LogParams) {
@@ -257,13 +312,34 @@ impl Follower {
             .map(|since| i64::try_from(since.as_secs()).unwrap_or(i64::MAX).max(1));
     }
 
+    /// Opens a log stream. Gives up when the API server does not answer in
+    /// time, and at once when the container is let go.
+    async fn open(&mut self, params: &LogParams) -> Result<Result<LogStream, Refusal>, Gone> {
+        let request = tokio::time::timeout(OPEN_TIMEOUT, self.api.log_stream(&self.id.pod, params));
+        tokio::pin!(request);
+        loop {
+            tokio::select! {
+                answer = &mut request => {
+                    return Ok(match answer {
+                        Ok(Ok(stream)) => Ok(Box::pin(stream) as LogStream),
+                        Ok(Err(error)) => Err(refusal(&error)),
+                        Err(_) => Err(Refusal::Other(
+                            "the API server did not answer in time".to_string(),
+                        )),
+                    });
+                }
+                changed = self.status.changed() => changed.map_err(|_| Gone)?,
+            }
+        }
+    }
+
     /// Waits until the container has output that was not read to its end
     /// yet, and tells its waiting state on the way.
     async fn wait_for_output(&mut self, finished: Option<i32>) -> Result<ContainerView, Gone> {
         loop {
             let view = self.status.borrow_and_update().clone();
             self.notice_waiting(&view).await?;
-            if view.state.has_output() && finished != Some(view.restart_count) {
+            if has_log(&view) && finished != Some(view.restart_count) {
                 return Ok(view);
             }
             self.status.changed().await.map_err(|_| Gone)?;
@@ -273,7 +349,7 @@ impl Follower {
     /// A container that waits has no stream; its state comes as a notice
     /// whenever the reason changes.
     async fn notice_waiting(&mut self, view: &ContainerView) -> Result<(), Gone> {
-        let crate::resolver::ContainerState::Waiting { reason, message } = &view.state else {
+        let ContainerState::Waiting { reason, message } = &view.state else {
             self.waiting_noticed = None;
             return Ok(());
         };
@@ -343,33 +419,25 @@ impl Follower {
             timestamps: true,
             ..LogParams::default()
         };
-        match (reading, self.position) {
-            (Reading::RestOfPrevious, Some(position)) => {
-                params.since_time = Some(to_timestamp(position.time));
-            }
+        match reading {
+            Reading::RestOfPrevious => self.add_start(&mut params),
             _ => self.add_history(&mut params),
         }
-        let failure = match self.api.log_stream(&self.id.pod, &params).await {
-            Ok(stream) => match self.read(Box::pin(stream), reading, &mut false).await? {
+        let failure = match self.open(&params).await? {
+            Ok(stream) => match self.read(stream, reading).await? {
                 End::Finished => return Ok(()),
                 End::Broken(reason) => reason,
+                End::Idle => "it went silent".to_string(),
             },
-            Err(error) => match refusal(&error) {
-                Refusal::Gone | Refusal::NotReady => return Ok(()),
-                Refusal::Other(reason) => reason,
-            },
+            Err(Refusal::Gone | Refusal::NotReady) => return Ok(()),
+            Err(Refusal::Other(reason)) => reason,
         };
         let message = format!("cannot read the previous run of {}: {failure}", self.name());
         self.notice(message).await
     }
 
     /// Reads a stream to its end and passes its lines on as records.
-    async fn read(
-        &mut self,
-        stream: Pin<Box<dyn AsyncBufRead + Send>>,
-        reading: Reading,
-        history_pending: &mut bool,
-    ) -> Result<End, Gone> {
+    async fn read(&mut self, stream: LogStream, reading: Reading) -> Result<End, Gone> {
         let mut lines = LineReader::new(stream, MAX_LINE_BYTES + TIMESTAMP_ROOM);
         let mut parser = LineParser::new(self.format);
         let previous = reading == Reading::PreviousAtStart;
@@ -378,14 +446,19 @@ impl Follower {
             Reading::PreviousAtStart => None,
             Reading::Current | Reading::RestOfPrevious => self.position.map(Resume::after),
         };
+        let opened = Instant::now();
+        let mut got_a_line = false;
         let mut flush_at: Option<Instant> = None;
         let mut closing_at: Option<Instant> = None;
+        let mut idle_at = opened + self.context.idle;
 
+        // The branches are polled in no fixed order, so that a stream that
+        // always has a line ready cannot keep the others from running.
         let end = loop {
             tokio::select! {
-                biased;
                 line = lines.next_line() => match line {
                     Ok(Some(bytes)) => {
+                        idle_at = Instant::now() + self.context.idle;
                         let text = String::from_utf8_lossy(&bytes);
                         // A line without the kubelet's timestamp is something the
                         // kubelet or the API server put there itself.
@@ -396,22 +469,26 @@ impl Follower {
                         if resume.as_mut().is_some_and(|resume| resume.skips(time)) {
                             continue;
                         }
+                        got_a_line = true;
                         if reading != Reading::PreviousAtStart {
                             self.position = Some(Position::advance(self.position, time));
                         }
                         if reading == Reading::Current {
-                            *history_pending = false;
                             self.backoff.reset();
+                            self.notice_stall(time).await?;
                         }
                         if let Some(parsed) = parser.push(time, line) {
                             self.send_line(parsed, previous).await?;
                         }
                         flush_at = Some(Instant::now() + FLUSH_IDLE);
+                        if closing_at.is_some_and(|at| Instant::now() >= at) {
+                            break End::Finished;
+                        }
                     }
                     Ok(None) => break End::Finished,
                     Err(error) => break End::Broken(error.to_string()),
                 },
-                _ = sleep_until(flush_at.unwrap_or_else(Instant::now)), if flush_at.is_some() => {
+                _ = sleep_until(flush_at.unwrap_or(opened)), if flush_at.is_some() => {
                     flush_at = None;
                     if let Some(parsed) = parser.flush() {
                         self.send_line(parsed, previous).await?;
@@ -422,12 +499,10 @@ impl Follower {
                         closing_at = Some(Instant::now() + CLOSING_GRACE);
                     }
                 }
-                _ = sleep_until(closing_at.unwrap_or_else(Instant::now)), if closing_at.is_some() => {
-                    if let Some(parsed) = parser.flush() {
-                        self.send_line(parsed, previous).await?;
-                    }
-                    return Err(Gone);
+                _ = sleep_until(closing_at.unwrap_or(opened)), if closing_at.is_some() => {
+                    break End::Finished;
                 }
+                _ = sleep_until(idle_at), if closing_at.is_none() => break End::Idle,
             }
         };
         if let Some(parsed) = parser.flush() {
@@ -436,7 +511,33 @@ impl Follower {
         if closing_at.is_some() {
             return Err(Gone);
         }
+        // The history that was asked for has been delivered when a line of
+        // it came, when the stream ended in good order, or when the stream
+        // held for a while: the server sends the history first.
+        if reading == Reading::Current
+            && (got_a_line || !matches!(end, End::Broken(_)) || opened.elapsed() >= HISTORY_GRACE)
+        {
+            self.history_pending = false;
+        }
         Ok(end)
+    }
+
+    /// After a stream was opened again because it had gone silent: if the
+    /// first new line is older than that moment, the old stream was dead
+    /// and lines were held up, which is worth a notice.
+    async fn notice_stall(&mut self, first_new_line: DateTime<Utc>) -> Result<(), Gone> {
+        let Some(stalled_at) = self.stalled_at.take() else {
+            return Ok(());
+        };
+        if first_new_line >= stalled_at - CLOCK_TOLERANCE {
+            return Ok(());
+        }
+        let message = format!(
+            "the log stream of {} had gone dead without a word; it was opened again and the \
+             lines since then follow",
+            self.name()
+        );
+        self.notice(message).await
     }
 
     async fn send_line(&self, line: ParsedLine, previous: bool) -> Result<(), Gone> {
@@ -469,6 +570,14 @@ impl Follower {
         );
         self.context.records.send(record).await.map_err(|_| Gone)
     }
+}
+
+/// Whether the kubelet has a log to serve for the container: it runs, it
+/// ran, or it waits to be started again after a run that ended. In that
+/// last state the kubelet serves the run that ended.
+fn has_log(view: &ContainerView) -> bool {
+    view.state.has_output()
+        || (view.has_previous && matches!(view.state, ContainerState::Waiting { .. }))
 }
 
 /// Whether a container gets the tail of its previous run at start: its
@@ -771,6 +880,37 @@ mod tests {
     fn a_time_becomes_the_timestamp_the_api_takes() {
         let stamp = to_timestamp(at(482));
         assert_eq!(stamp.to_string(), "2026-11-18T14:02:11.482Z");
+    }
+
+    #[test]
+    fn which_containers_have_a_log_to_read() {
+        use crate::resolver::{ContainerRole, ContainerState};
+        let view = |state: ContainerState, has_previous: bool| ContainerView {
+            name: "api".into(),
+            role: ContainerRole::Main,
+            restart_count: 1,
+            state,
+            has_previous,
+        };
+        let waiting = || ContainerState::Waiting {
+            reason: Some("CrashLoopBackOff".into()),
+            message: None,
+        };
+        let terminated = ContainerState::Terminated {
+            exit_code: 1,
+            reason: None,
+            finished_at: None,
+        };
+        assert!(has_log(&view(
+            ContainerState::Running { started_at: None },
+            false
+        )));
+        assert!(has_log(&view(terminated, false)));
+        // Between two runs the kubelet serves the one that ended.
+        assert!(has_log(&view(waiting(), true)));
+        // Before the first run there is nothing.
+        assert!(!has_log(&view(waiting(), false)));
+        assert!(!has_log(&view(ContainerState::Unknown, false)));
     }
 
     #[test]

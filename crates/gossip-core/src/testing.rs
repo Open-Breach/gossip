@@ -82,6 +82,8 @@ struct Shared {
     logs: HashMap<(String, String, String), ContainerLog>,
     /// How many of the next log requests are answered with a 500.
     failing_log_requests: usize,
+    /// Log streams that were left connected but silent.
+    stalled: Vec<mpsc::UnboundedSender<Chunk>>,
 }
 
 /// The log of one container: its runs, the last one being the current one.
@@ -326,6 +328,17 @@ impl FakeCluster {
                 let _ = follower.send(Chunk::Break);
             }
         }
+    }
+
+    /// Leaves every open log stream connected but silent from now on, the
+    /// way a connection that died without a word looks to the client.
+    pub fn stall_log_streams(&self) {
+        let mut shared = self.shared.lock().unwrap();
+        let mut stalled = Vec::new();
+        for log in shared.logs.values_mut() {
+            stalled.append(&mut log.followers);
+        }
+        shared.stalled.append(&mut stalled);
     }
 
     /// Answers the next `count` log requests with a 500.
