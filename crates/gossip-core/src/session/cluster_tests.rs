@@ -456,6 +456,174 @@ async fn a_pod_that_comes_up_later_is_read_from_its_beginning() {
 }
 
 #[tokio::test]
+async fn a_run_that_crashed_unseen_is_still_read() {
+    let fake = FakeCluster::start().await;
+    set_pod(&fake, POD, 0, running(), None);
+    log_lines(&fake, POD, 0, &["first run"]);
+    let mut session = Session::start(&fake.cluster(), vec![target("flowcpt")], None, options());
+    assert_eq!(texts(&take(&mut session, 1).await), ["first run"]);
+    fake.end_run(NS, POD, "api");
+    set_pod(&fake, POD, 0, terminated(1), None);
+    expect_quiet(&mut session).await;
+
+    // The next run starts and crashes before the pod reports either. All
+    // there is to see afterwards is that the container waits again.
+    fake.start_run(NS, POD, "api");
+    log_lines(&fake, POD, 5_000, &["second run", "second run panicked"]);
+    fake.back_off(NS, POD, "api");
+    set_pod(&fake, POD, 1, crash_loop(), Some(terminated(101)));
+    let mut seen = texts(&take(&mut session, 3).await);
+    seen.sort();
+    assert_eq!(
+        seen,
+        [
+            format!(
+                "-- api in pod {POD} is waiting: CrashLoopBackOff (back-off 40s restarting \
+                 failed container)"
+            ),
+            "second run".to_string(),
+            "second run panicked".to_string(),
+        ]
+    );
+    // It is read once, not again while the container keeps waiting.
+    expect_quiet(&mut session).await;
+
+    fake.start_run(NS, POD, "api");
+    log_lines(&fake, POD, 10_000, &["third run"]);
+    set_pod(&fake, POD, 2, running(), Some(terminated(101)));
+    assert_eq!(texts(&take(&mut session, 1).await), ["third run"]);
+    expect_quiet(&mut session).await;
+}
+
+#[tokio::test]
+async fn a_quiet_container_that_crashes_during_an_outage_loses_nothing() {
+    let fake = FakeCluster::start().await;
+    set_pod(&fake, POD, 0, running(), None);
+    // It runs and has logged nothing yet, so the follower has no last line
+    // to go by.
+    fake.start_run(NS, POD, "api");
+    let mut session = Session::start(
+        &fake.cluster(),
+        vec![target("flowcpt")],
+        None,
+        SessionOptions {
+            since: Some(Duration::from_secs(60)),
+            tail: None,
+            ..options()
+        },
+    );
+    // Long enough for the empty history to count as delivered.
+    tokio::time::sleep(Duration::from_millis(2_300)).await;
+
+    // The connection drops. While it is down the container prints its
+    // panic and is started again.
+    fake.break_log_streams();
+    fake.log(NS, POD, "api", Utc::now(), "panicked while nobody listened");
+    fake.end_run(NS, POD, "api");
+    fake.start_run(NS, POD, "api");
+    fake.log(NS, POD, "api", Utc::now(), "second run");
+    set_pod(&fake, POD, 1, running(), Some(terminated(101)));
+
+    let records = take(&mut session, 3).await;
+    assert!(
+        records[0].message.starts_with("lost the log stream of api"),
+        "{}",
+        records[0].message
+    );
+    assert_eq!(
+        texts(&records[1..]),
+        ["panicked while nobody listened", "second run"]
+    );
+    expect_quiet(&mut session).await;
+
+    // Both were asked for from where the history began, not as a new
+    // history counted from the moment of the reconnect.
+    let requests = fake.requests();
+    let reopened: Vec<&String> = requests
+        .iter()
+        .filter(|request| request.contains("/log?"))
+        .skip(1)
+        .collect();
+    assert_eq!(reopened.len(), 2, "{requests:#?}");
+    for request in reopened {
+        assert!(request.contains("sinceTime="), "{request}");
+        assert!(!request.contains("sinceSeconds"), "{request}");
+    }
+}
+
+#[tokio::test]
+async fn a_silent_stream_is_opened_again_without_a_word_or_a_repeated_line() {
+    let fake = FakeCluster::start().await;
+    set_pod(&fake, POD, 0, running(), None);
+    log_lines(&fake, POD, 0, &["one", "two"]);
+    let mut session = Session::start(
+        &fake.cluster(),
+        vec![target("flowcpt")],
+        None,
+        SessionOptions {
+            idle: Duration::from_millis(300),
+            ..options()
+        },
+    );
+    assert_eq!(texts(&take(&mut session, 2).await), ["one", "two"]);
+
+    // Several times the idle time goes by with nothing logged.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    expect_quiet(&mut session).await;
+    let opened = fake
+        .requests()
+        .iter()
+        .filter(|request| request.contains("/log?"))
+        .count();
+    assert!(opened >= 3, "the stream was opened {opened} times");
+
+    // The stream that was opened last still follows.
+    fake.log(NS, POD, "api", Utc::now(), "three");
+    assert_eq!(texts(&take(&mut session, 1).await), ["three"]);
+    expect_quiet(&mut session).await;
+}
+
+#[tokio::test]
+async fn a_stream_that_died_without_a_word_is_opened_again_and_says_so() {
+    let fake = FakeCluster::start().await;
+    set_pod(&fake, POD, 0, running(), None);
+    log_lines(&fake, POD, 0, &["before"]);
+    let mut session = Session::start(
+        &fake.cluster(),
+        vec![target("flowcpt")],
+        None,
+        SessionOptions {
+            idle: Duration::from_millis(300),
+            ..options()
+        },
+    );
+    assert_eq!(texts(&take(&mut session, 1).await), ["before"]);
+
+    // The connection stays open and carries nothing any more.
+    fake.stall_log_streams();
+    log_lines(
+        &fake,
+        POD,
+        1_000,
+        &["during the silence, 1", "during the silence, 2"],
+    );
+    let mut seen = texts(&take(&mut session, 3).await);
+    seen.sort();
+    assert_eq!(
+        seen,
+        [
+            format!(
+                "-- the log stream of api in pod {POD} had gone dead without a word; it was \
+                 opened again and the lines since then follow"
+            ),
+            "during the silence, 1".to_string(),
+            "during the silence, 2".to_string(),
+        ]
+    );
+    expect_quiet(&mut session).await;
+}
+
+#[tokio::test]
 async fn a_pod_that_goes_away_is_let_go_with_a_notice() {
     let fake = FakeCluster::start().await;
     set_pod(&fake, POD, 0, running(), None);

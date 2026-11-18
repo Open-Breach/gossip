@@ -46,7 +46,13 @@ pub struct SessionOptions {
     /// How long a record is held back so that records of different sources
     /// come out in the order of their time.
     pub hold: Duration,
+    /// How long a log stream may be silent before it is opened again. A
+    /// connection can die without a word, and silence is the only sign.
+    pub idle: Duration,
 }
+
+/// How long a silent log stream is left alone by default.
+pub const DEFAULT_IDLE: Duration = Duration::from_secs(90);
 
 impl Default for SessionOptions {
     fn default() -> Self {
@@ -57,6 +63,7 @@ impl Default for SessionOptions {
             containers: None,
             format: FormatSetting::default(),
             hold: DEFAULT_HOLD,
+            idle: DEFAULT_IDLE,
         }
     }
 }
@@ -70,6 +77,7 @@ impl From<&Settings> for SessionOptions {
             containers: settings.container.clone(),
             format: settings.format.clone(),
             hold: DEFAULT_HOLD,
+            idle: DEFAULT_IDLE,
         }
     }
 }
@@ -134,16 +142,18 @@ async fn drive(
 ) {
     // Events are told from where the history of the lines begins: as far
     // back as `since` reaches, or from now on.
-    let events_since = options.events.then(|| {
-        let back = options
-            .since
-            .and_then(|since| TimeDelta::from_std(since).ok())
-            .unwrap_or_default();
-        // Many events carry their time in whole seconds, so the start of
-        // the history is a whole second too; otherwise an event of this
-        // very second would count as older than the session.
-        let start = Utc::now() - back;
-        DateTime::from_timestamp(start.timestamp(), 0).unwrap_or(start)
+    // Events that are there when the session starts are told as far back
+    // as `since` reaches; with a history in lines, none of them is. Events
+    // that happen while the session runs are always told.
+    let events_since = options.events.then(|| match options.since {
+        Some(since) => {
+            let back = TimeDelta::from_std(since).unwrap_or_default();
+            // Many events carry their time in whole seconds, so the start
+            // of the history is a whole second too.
+            let start = Utc::now() - back;
+            DateTime::from_timestamp(start.timestamp(), 0).unwrap_or(start)
+        }
+        None => DateTime::<Utc>::MAX_UTC,
     });
     let mut resolver = Resolver::start(&cluster, targets, options.containers.clone(), events_since);
     let (records_tx, mut records_rx) = mpsc::channel(1024);
@@ -155,6 +165,7 @@ async fn drive(
             tail: options.tail,
         },
         formats: options.format.clone(),
+        idle: options.idle,
         records: records_tx,
     });
     // The state of every followed container, as its follower sees it.
