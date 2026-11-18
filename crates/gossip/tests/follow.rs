@@ -1,0 +1,431 @@
+//! `gossip follow`, run as a program against the stand-in API server of the
+//! core. These are the acceptance points that need no cluster, as far as a
+//! stand-in can show them; the real thing is checked by hand.
+
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::time::Duration;
+
+use chrono::{DateTime, TimeDelta, TimeZone, Utc};
+use gossip_core::testing::{
+    FakeCluster, deployments, owner, pod_object, pods, replica_sets, workload_object,
+};
+use tokio::io::{AsyncBufReadExt, BufReader, Lines};
+use tokio::process::{Child, ChildStdout, Command};
+use tokio::time::timeout;
+
+const NS: &str = "flowcpt";
+const POD_A: &str = "flowcpt-api-7d9f-xk2p1";
+const POD_B: &str = "flowcpt-api-7d9f-m4q8z";
+
+/// A time `millis` after a fixed moment in the past.
+fn at(millis: i64) -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 11, 18, 14, 0, 0).unwrap() + TimeDelta::milliseconds(millis)
+}
+
+/// The deployment `flowcpt-api` with two pods, each with the containers
+/// `api` and `envoy`.
+fn seed(fake: &FakeCluster) {
+    let api = [("app", "flowcpt-api")];
+    fake.apply(
+        &deployments(NS),
+        workload_object(NS, "flowcpt-api", &api, None),
+    );
+    fake.apply(
+        &replica_sets(NS),
+        workload_object(
+            NS,
+            "flowcpt-api-7d9f",
+            &api,
+            Some(owner("Deployment", "flowcpt-api")),
+        ),
+    );
+    for pod in [POD_A, POD_B] {
+        let set = owner("ReplicaSet", "flowcpt-api-7d9f");
+        fake.apply(
+            &pods(NS),
+            pod_object(NS, pod, &api, Some(set), &["api", "envoy"]),
+        );
+    }
+}
+
+/// A running `gossip follow`.
+struct Follow {
+    child: Child,
+    stdout: Lines<BufReader<ChildStdout>>,
+    kubeconfig: PathBuf,
+}
+
+impl Follow {
+    /// Starts `gossip follow` with these arguments against the stand-in.
+    fn start(fake: &FakeCluster, test: &str, args: &[&str]) -> Follow {
+        let kubeconfig =
+            std::env::temp_dir().join(format!("gossip-{}-{test}.kubeconfig", std::process::id()));
+        std::fs::write(&kubeconfig, fake.kubeconfig()).unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_gossip"));
+        command
+            .arg("follow")
+            .args(args)
+            .env("KUBECONFIG", &kubeconfig)
+            // Times are printed in the local zone; pin it down.
+            .env("TZ", "UTC")
+            .env_remove("GOSSIP_CONFIG")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        for variable in [
+            "HTTPS_PROXY",
+            "https_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+        ] {
+            command.env_remove(variable);
+        }
+        let mut child = command.spawn().expect("gossip should start");
+        let stdout = BufReader::new(child.stdout.take().unwrap()).lines();
+        Follow {
+            child,
+            stdout,
+            kubeconfig,
+        }
+    }
+
+    async fn line(&mut self) -> String {
+        match timeout(Duration::from_secs(15), self.stdout.next_line()).await {
+            Ok(Ok(Some(line))) => line,
+            Ok(Ok(None)) => panic!("gossip ended"),
+            Ok(Err(error)) => panic!("cannot read from gossip: {error}"),
+            Err(_) => panic!("gossip printed nothing in time"),
+        }
+    }
+
+    async fn lines(&mut self, count: usize) -> Vec<String> {
+        let mut lines = Vec::new();
+        for _ in 0..count {
+            lines.push(self.line().await);
+        }
+        lines
+    }
+
+    async fn expect_quiet(&mut self) {
+        if let Ok(line) = timeout(Duration::from_millis(600), self.stdout.next_line()).await {
+            panic!("expected nothing more, got {line:?}");
+        }
+    }
+}
+
+impl Drop for Follow {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.kubeconfig);
+    }
+}
+
+#[tokio::test]
+async fn follow_prints_the_last_20_lines_of_every_container_and_then_new_lines() {
+    let fake = FakeCluster::start().await;
+    seed(&fake);
+    // 25 lines in every container, of which the last 20 are history.
+    let mut offset = 0;
+    for pod in [POD_A, POD_B] {
+        for container in ["api", "envoy"] {
+            for number in 1..=25 {
+                let time = at(number * 1_000 + offset);
+                fake.log(
+                    NS,
+                    pod,
+                    container,
+                    time,
+                    &format!("{container} line {number}"),
+                );
+            }
+            offset += 10;
+        }
+    }
+
+    let mut follow = Follow::start(&fake, "tail", &["flowcpt/flowcpt-api", "--no-color"]);
+    let history = follow.lines(80).await;
+    // Twenty lines for each of the four containers, none older than line 6.
+    for pod in ["7d9f-xk2p1", "7d9f-m4q8z"] {
+        for container in ["api", "envoy"] {
+            let of_container: Vec<&String> = history
+                .iter()
+                .filter(|line| line.contains(&format!(" {pod} {container}")))
+                .collect();
+            assert_eq!(of_container.len(), 20, "{pod} {container}");
+            assert!(
+                of_container[0].ends_with(&format!("{container} line 6")),
+                "{}",
+                of_container[0]
+            );
+            assert!(
+                of_container[19].ends_with(&format!("{container} line 25")),
+                "{}",
+                of_container[19]
+            );
+        }
+    }
+    // Ordered by time across the four streams, with a prefix per source.
+    // The pod names are shortened: every pod belongs to a deployment.
+    assert_eq!(
+        history[0],
+        // The container column is as wide as the widest name seen so far.
+        "14:00:06.000 7d9f-xk2p1 api        api line 6"
+    );
+    assert_eq!(
+        history[1],
+        "14:00:06.010 7d9f-xk2p1 envoy        envoy line 6"
+    );
+    assert_eq!(
+        history[2],
+        "14:00:06.020 7d9f-m4q8z api          api line 6"
+    );
+    let mut sorted = history.clone();
+    sorted.sort();
+    assert_eq!(history, sorted);
+    follow.expect_quiet().await;
+
+    // New lines arrive without any action.
+    fake.log(NS, POD_B, "api", at(60_000), "WARN something new");
+    assert_eq!(
+        follow.line().await,
+        "14:01:00.000 7d9f-m4q8z api    WARN  WARN something new"
+    );
+}
+
+const TENANT_LINES: [&str; 4] = [
+    r#"{"timestamp":"2026-11-18T14:00:01Z","level":"INFO","message":"request done","tenant_id":"t_123","request_id":"8b1c"}"#,
+    r#"{"timestamp":"2026-11-18T14:00:02Z","level":"WARN","message":"payment intent expired","tenant_id":"t_123","request_id":"8b1d"}"#,
+    r#"{"timestamp":"2026-11-18T14:00:03Z","level":"ERROR","message":"card declined","tenant_id":"t_999","request_id":"8b1e"}"#,
+    "a plain line with no level",
+];
+
+/// One pod with one container that wrote the four lines above.
+fn seed_tenant_lines(fake: &FakeCluster) {
+    fake.apply(&pods(NS), pod_object(NS, "redis-0", &[], None, &["api"]));
+    for (index, line) in TENANT_LINES.iter().enumerate() {
+        fake.log(NS, "redis-0", "api", at(1_000 + index as i64 * 1_000), line);
+    }
+}
+
+#[tokio::test]
+async fn a_json_line_is_rendered_as_level_fields_and_message() {
+    let fake = FakeCluster::start().await;
+    seed_tenant_lines(&fake);
+    let mut follow = Follow::start(
+        &fake,
+        "json-line",
+        &["flowcpt", "--no-color", "--fields", "tenant_id,request_id"],
+    );
+    assert_eq!(
+        follow.lines(4).await,
+        [
+            "14:00:01.000 redis-0 api  INFO  tenant_id=t_123 request_id=8b1c  request done",
+            "14:00:02.000 redis-0 api  WARN  tenant_id=t_123 request_id=8b1d  payment intent expired",
+            "14:00:03.000 redis-0 api  ERROR tenant_id=t_999 request_id=8b1e  card declined",
+            "14:00:04.000 redis-0 api        a plain line with no level",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn the_field_flag_keeps_only_that_tenants_lines() {
+    let fake = FakeCluster::start().await;
+    seed_tenant_lines(&fake);
+    let mut follow = Follow::start(
+        &fake,
+        "field",
+        &[
+            "flowcpt",
+            "--no-color",
+            "--fields",
+            "request_id",
+            "--field",
+            "tenant_id=t_123",
+        ],
+    );
+    assert_eq!(
+        follow.lines(2).await,
+        [
+            "14:00:01.000 redis-0 api  INFO  request_id=8b1c  request done",
+            "14:00:02.000 redis-0 api  WARN  request_id=8b1d  payment intent expired",
+        ]
+    );
+    follow.expect_quiet().await;
+}
+
+#[tokio::test]
+async fn the_level_flag_hides_info_lines() {
+    let fake = FakeCluster::start().await;
+    seed_tenant_lines(&fake);
+    let mut follow = Follow::start(
+        &fake,
+        "level",
+        &[
+            "flowcpt",
+            "--no-color",
+            "--fields",
+            "request_id",
+            "--level",
+            "warn",
+        ],
+    );
+    assert_eq!(
+        follow.lines(2).await,
+        [
+            "14:00:02.000 redis-0 api  WARN  request_id=8b1d  payment intent expired",
+            "14:00:03.000 redis-0 api  ERROR request_id=8b1e  card declined",
+        ]
+    );
+    follow.expect_quiet().await;
+}
+
+#[tokio::test]
+async fn grep_and_match_filter_on_the_message() {
+    let fake = FakeCluster::start().await;
+    seed_tenant_lines(&fake);
+    let mut follow = Follow::start(
+        &fake,
+        "grep",
+        &[
+            "flowcpt",
+            "--no-color",
+            "--fields",
+            "request_id",
+            "--grep",
+            "e",
+            "--match",
+            "^(card|a plain)",
+        ],
+    );
+    assert_eq!(
+        follow.lines(2).await,
+        [
+            "14:00:03.000 redis-0 api  ERROR request_id=8b1e  card declined",
+            "14:00:04.000 redis-0 api        a plain line with no level",
+        ]
+    );
+    follow.expect_quiet().await;
+}
+
+#[tokio::test]
+async fn raw_prints_lines_byte_for_byte() {
+    let fake = FakeCluster::start().await;
+    seed_tenant_lines(&fake);
+    fake.log(
+        NS,
+        "redis-0",
+        "api",
+        at(9_000),
+        "  indented, with a tab\tand trailing spaces  ",
+    );
+    let mut follow = Follow::start(&fake, "raw", &["flowcpt", "--raw"]);
+    let mut expected: Vec<String> = TENANT_LINES.iter().map(|line| line.to_string()).collect();
+    expected.push("  indented, with a tab\tand trailing spaces  ".to_string());
+    assert_eq!(follow.lines(5).await, expected);
+}
+
+#[tokio::test]
+async fn output_json_prints_one_record_per_line_with_every_field() {
+    let fake = FakeCluster::start().await;
+    seed_tenant_lines(&fake);
+    let mut follow = Follow::start(&fake, "json", &["flowcpt", "--output", "json"]);
+    let lines = follow.lines(4).await;
+    let records: Vec<serde_json::Value> = lines
+        .iter()
+        .map(|line| serde_json::from_str(line).expect("every line is JSON"))
+        .collect();
+    assert_eq!(
+        records[1],
+        serde_json::json!({
+            "cluster": "fake",
+            "namespace": "flowcpt",
+            "pod": "redis-0",
+            "container": "api",
+            "time": "2026-11-18T14:00:02Z",
+            "kind": "line",
+            "format": "json",
+            "level": "warn",
+            "message": "payment intent expired",
+            "fields": {
+                "tenant_id": "t_123",
+                "request_id": "8b1d",
+                "timestamp": "2026-11-18T14:00:02Z"
+            },
+            "raw": TENANT_LINES[1],
+            "previous": false,
+            "truncated": false
+        })
+    );
+    assert_eq!(records[3]["format"], "text");
+    assert_eq!(records[3]["level"], serde_json::Value::Null);
+    assert_eq!(records[3]["message"], "a plain line with no level");
+}
+
+#[tokio::test]
+async fn a_notice_is_printed_with_two_dashes() {
+    let fake = FakeCluster::start().await;
+    let mut follow = Follow::start(&fake, "notice", &["flowcpt/flowcpt-api", "--no-color"]);
+    let line = follow.line().await;
+    assert!(
+        line.ends_with(" -- target flowcpt/flowcpt-api matches nothing yet; still watching"),
+        "{line}"
+    );
+}
+
+#[tokio::test]
+async fn ctrl_c_stops_the_session_and_exits_0() {
+    let fake = FakeCluster::start().await;
+    seed_tenant_lines(&fake);
+    let mut follow = Follow::start(&fake, "ctrl-c", &["flowcpt", "--no-color"]);
+    follow.lines(4).await;
+
+    let pid = follow.child.id().expect("gossip is running").to_string();
+    let killed = std::process::Command::new("kill")
+        .args(["-INT", &pid])
+        .status()
+        .expect("kill should run");
+    assert!(killed.success());
+    let status = timeout(Duration::from_secs(10), follow.child.wait())
+        .await
+        .expect("gossip should stop in time")
+        .unwrap();
+    assert_eq!(status.code(), Some(0));
+}
+
+#[tokio::test]
+async fn a_cluster_that_cannot_be_reached_at_start_exits_1_with_the_error() {
+    let kubeconfig = std::env::temp_dir().join(format!(
+        "gossip-{}-follow-nowhere.kubeconfig",
+        std::process::id()
+    ));
+    let text = "apiVersion: v1\nkind: Config\ncurrent-context: nowhere\nclusters:\n- name: nowhere\n  cluster:\n    server: https://127.0.0.1:1\ncontexts:\n- name: nowhere\n  context:\n    cluster: nowhere\n    user: nobody\nusers:\n- name: nobody\n  user:\n    token: x\n";
+    std::fs::write(&kubeconfig, text).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_gossip"));
+    command
+        .args(["follow", "flowcpt"])
+        .env("KUBECONFIG", &kubeconfig);
+    for variable in [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
+        command.env_remove(variable);
+    }
+    let output = timeout(Duration::from_secs(30), command.output())
+        .await
+        .expect("gossip should give up in time")
+        .unwrap();
+    std::fs::remove_file(&kubeconfig).unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.starts_with("gossip: cannot reach the cluster `nowhere`: "),
+        "{stderr}"
+    );
+}

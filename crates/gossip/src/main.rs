@@ -5,7 +5,9 @@
 
 mod age;
 mod cli;
+mod follow;
 mod list;
+mod render;
 mod table;
 
 use std::io;
@@ -32,6 +34,7 @@ async fn main() -> ExitCode {
 async fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::List(args) => list::run(&args, &mut io::stdout().lock()).await,
+        Command::Follow(args) => follow::run(*args).await,
     }
 }
 

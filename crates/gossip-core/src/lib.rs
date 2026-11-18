@@ -42,8 +42,8 @@ pub mod record;
 pub mod resolver;
 pub mod session;
 pub mod target;
-#[cfg(test)]
-pub(crate) mod testing;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 
 pub use cluster::{Cluster, ContextInfo};
 pub use config::{Config, ConfigError, Defaults, FormatSetting, Output, Settings, Template};

@@ -157,6 +157,30 @@ impl FakeCluster {
         Cluster::from_client("fake", client)
     }
 
+    /// A kubeconfig whose one context, `fake`, points at the stand-in, for
+    /// tests that run a program against it.
+    pub fn kubeconfig(&self) -> String {
+        format!(
+            "apiVersion: v1\n\
+             kind: Config\n\
+             current-context: fake\n\
+             clusters:\n\
+             - name: fake\n\
+             \x20 cluster:\n\
+             \x20   server: http://{}\n\
+             contexts:\n\
+             - name: fake\n\
+             \x20 context:\n\
+             \x20   cluster: fake\n\
+             \x20   user: fake\n\
+             users:\n\
+             - name: fake\n\
+             \x20 user:\n\
+             \x20   token: not-a-real-token\n",
+            self.address
+        )
+    }
+
     /// Creates or replaces an object of a collection. The object must have
     /// a `metadata.name`.
     pub fn apply(&self, collection: &str, mut object: Value) {
