@@ -32,6 +32,10 @@ use crate::resolver::{ContainerId, ContainerState, ContainerView};
 /// once the stream goes quiet.
 const FLUSH_IDLE: Duration = Duration::from_millis(50);
 
+/// The same for a panic block that is still open. A panic is not written in
+/// one go: resolving the symbols of a backtrace can take a moment.
+const BLOCK_FLUSH_IDLE: Duration = Duration::from_millis(500);
+
 /// How long the pod is given to report the end of a container after its
 /// stream ended, before the end is taken for a dropped connection.
 const STATUS_GRACE: Duration = Duration::from_secs(2);
@@ -480,7 +484,12 @@ impl Follower {
                         if let Some(parsed) = parser.push(time, line) {
                             self.send_line(parsed, previous).await?;
                         }
-                        flush_at = Some(Instant::now() + FLUSH_IDLE);
+                        let idle = if parser.in_block() {
+                            BLOCK_FLUSH_IDLE
+                        } else {
+                            FLUSH_IDLE
+                        };
+                        flush_at = Some(Instant::now() + idle);
                         if closing_at.is_some_and(|at| Instant::now() >= at) {
                             break End::Finished;
                         }

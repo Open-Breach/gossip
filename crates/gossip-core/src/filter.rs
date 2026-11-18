@@ -95,7 +95,7 @@ pub enum Op {
     Eq,
     /// `!=`, the opposite of `==`: true also when the record has no such field.
     Ne,
-    /// `>=`, on levels only.
+    /// `>=`, on levels only. A record with no level passes it.
     Ge,
     /// `contains`: the value is a part of the field's text.
     Contains,
@@ -142,8 +142,10 @@ impl FromStr for Op {
 
 /// One rule: `field operator value`.
 ///
-/// A rule on a field the record does not have is false, except `!=`, which
-/// is the opposite of `==` and so is true.
+/// A rule on a field the record does not have is false, with two
+/// exceptions: `!=` is the opposite of `==` and so is true, and a record
+/// with no level passes `level >=`, because a level that is not known is
+/// not a low level.
 #[derive(Debug, Clone)]
 pub struct Rule {
     field: Field,
@@ -215,7 +217,10 @@ impl Rule {
                 (Some(level), Op::Eq) => level == *wanted,
                 (Some(level), Op::Ne) => level != *wanted,
                 (Some(level), Op::Ge) => level >= *wanted,
-                (None, Op::Ne) => true,
+                // Unknown is not the same as unimportant: a record with no
+                // level passes `>=`, so that a plain-text panic does not
+                // vanish under a level filter.
+                (None, Op::Ne | Op::Ge) => true,
                 _ => false,
             },
             (Test::Kind(wanted), Op::Eq) => record.kind == *wanted,
@@ -543,8 +548,21 @@ mod tests {
         assert!(filter.matches(&line(Some(Level::Error), "", &[])));
         assert!(!filter.matches(&line(Some(Level::Info), "", &[])));
         assert!(!filter.matches(&line(Some(Level::Trace), "", &[])));
-        // A record without a level is not at least anything.
-        assert!(!filter.matches(&line(None, "", &[])));
+        // A record without a level always passes: unknown is not the same
+        // as unimportant.
+        assert!(filter.matches(&line(None, "", &[])));
+        assert!(rule("level", ">=", Some("error")).matches(&line(
+            None,
+            "thread 'main' panicked",
+            &[]
+        )));
+        // Which does not make it equal to any level.
+        assert!(!rule("level", "==", Some("warn")).matches(&line(None, "", &[])));
+        assert!(!rule("level", "exists", None).matches(&line(None, "", &[])));
+        // And saying `not` turns it around, as for any rule.
+        let below = Filter::Not(Box::new(rule("level", ">=", Some("warn"))));
+        assert!(below.matches(&line(Some(Level::Info), "", &[])));
+        assert!(!below.matches(&line(None, "", &[])));
     }
 
     #[test]

@@ -117,7 +117,8 @@ The core is an async library on `tokio` and `kube-rs`. Its public surface is sma
 - logfmt: a line made of `key=value` pairs, values quoted when they hold spaces (`time=2026-11-18T14:02:11Z level=info msg="request done" status=200`), becomes a record with the same `fields` and the same normalisation of the well-known keys. This is what most Go tooling in a cluster writes (ingress controllers, cert-manager, many operators). A line is logfmt only when every token is a pair; one bare word and it is text.
 - Text: any other line is a record of kind `text` with the raw line as `message`. A level is guessed from a leading `ERROR`, `WARN`, `INFO`, `DEBUG`, `TRACE` token when present, also when a timestamp or a bracketed module comes first.
 - Continuation: a line that starts with whitespace, or with `at ` or `Caused by:`, is appended to the previous record of the same container instead of becoming its own (a Rust panic's backtrace, a Java stack trace, a multi-line JSON pretty-print). The record's `message` grows by a newline and the line; its level and fields stay those of the first line. A continuation older than 2 s after the first line, or with no previous record, is text on its own.
-- `format` option, per template or per container (`format = "auto" | "json" | "logfmt" | "text"`, default `auto`): forces one recogniser for streams where detection is wrong, such as a text line that happens to start with `{`. `text` also turns the continuation rule off.
+- Panic block: the continuation rule has a second trigger. A line that starts with `thread '<name>' panicked at` opens a block (the first line of a Rust panic; toolchains since 1.91 put the id of the thread in brackets after the name, `thread 'main' (238) panicked at`). Every following line of the same container is appended to that record, as a continuation is, until a blank line, the next line that parses as JSON or logfmt, the next line that opens a block of its own, or the 2 s limit. The line that ends a block is a record of its own. So a panic arrives as one record with its message and its backtrace, although the message and `stack backtrace:` start at the margin.
+- `format` option, per template or per container (`format = "auto" | "json" | "logfmt" | "text"`, default `auto`): forces one recogniser for streams where detection is wrong, such as a text line that happens to start with `{`. `text` also turns the continuation rule off, panic blocks included.
 - Lines longer than 1 MiB are cut and marked.
 
 ### 4.7 Records
@@ -146,8 +147,9 @@ In words: every record knows where it came from, when, what kind of thing it is,
 
 - A filter is a tree: a rule, or `and` / `or` / `not` over filters.
 - A rule is `field operator value`. Fields: `level`, `message`, `pod`, `container`, `namespace`, `kind`, or any key of `fields` written `f.tenant_id`. Operators: `==`, `!=`, `>=` (levels only), `contains`, `matches` (regex), `exists`.
+- A record with no level passes `level >=`, whatever the level asked for. Unknown is not the same as unimportant: a plain-text panic must not vanish under `--level warn`.
 - Filters apply after parsing and before output. `notice` records always pass.
-- The CLI exposes the common cases as flags (5); the full tree lives in the config file (6). Both build the same `Filter` value.
+- The CLI exposes the common cases as flags (5); the full tree lives in the config file (6). Both build the same `Filter` value. The flags are about log lines: events always pass them (5.2). A filter in the config file is exactly what is written and applies to events too.
 
 ### 4.9 Session
 
@@ -173,7 +175,7 @@ Two commands in the prototype, plus `templates` to see what the config file hold
 
 ### 5.2 `gossip follow`
 
-`gossip follow <target>... [flags]` or `gossip follow --template <name> [flags]`. Flags given beside a template override its values.
+`gossip follow <target>... [flags]` or `gossip follow --template <name> [flags]`. Flags given beside a template override its values, except the filter flags, which narrow its filter (see below the table).
 
 | Flag | Meaning | Default |
 | --- | --- | --- |
@@ -186,11 +188,16 @@ Two commands in the prototype, plus `templates` to see what the config file hold
 | `--grep <text>` | `message contains text` | none |
 | `--match <regex>` | `message matches regex` | none |
 | `--field <k=v>` | `f.k == v`, repeatable | none |
+| `--no-filter` | drop the template's filter, so that only the filter flags apply | off |
 | `--raw` | print the raw line, no parsing or colouring | off |
 | `--output text\|json` | rendering (5.3) | text |
 | `--no-color` | plain text | colour when stdout is a terminal |
 
-Flags combine with `and`. More than that is a template.
+The filter flags (`--level`, `--grep`, `--match`, `--field`) combine with `and`. More than that is a template.
+
+- The filter flags apply to log lines. Events always pass them; `--no-events` is the switch for events.
+- Beside a template the filter flags narrow, they do not replace: they are combined with the template's filter by `and`, so a line must pass both.
+- `--no-filter` drops the template's filter first, for the case where one wants to replace it. The same holds for a filter under `[defaults]`.
 
 ### 5.3 Output
 
@@ -261,10 +268,10 @@ since = "5m"
 4. Roll out a new image while following: the new pods are picked up as they come, the old ones go away, with a notice for each.
 5. Scale a deployment from 0 while following a target that matched nothing: a notice says so at start, and the lines appear when the pod comes up.
 6. Put the laptop to sleep for a minute while following: the stream resumes by itself with a reconnect notice and the lines missed in between (within the kubelet's retention).
-7. A JSON line from `tracing-subscriber`'s JSON formatter is rendered as level, fields and message; `--field tenant_id=t_123` keeps only that tenant's lines; `--level warn` hides info lines; events still show.
+7. A JSON line from `tracing-subscriber`'s JSON formatter is rendered as level, fields and message; `--field tenant_id=t_123` keeps only that tenant's lines; `--level warn` hides info lines; lines with no level and events still show.
 8. A logfmt line from an ingress controller is rendered as level, fields and message like a JSON line; a Rust panic with its backtrace arrives as one record whose message holds every line; `format = "text"` on a container shows its lines untouched.
 9. `--no-events` shows no event records; `--raw` prints lines byte for byte.
-10. `gossip follow --template dev-api` behaves as the flags spelt out in the template; a flag beside it overrides.
+10. `gossip follow --template dev-api` behaves as the flags spelt out in the template; a flag beside it overrides, a filter flag narrows the template's filter, and `--no-filter` drops that filter first.
 11. `--output json` lines parse with `jq` and carry every field of the record.
 12. Following a namespace with 20 pods for an hour does not grow memory beyond the reorder buffer and the line buffers; CPU is idle between lines.
 13. `cargo test`, `cargo clippy --workspace -- -D warnings` and `cargo fmt --check` are clean. The core's tests cover target parsing and globs, the line parser on JSON, logfmt and plain lines and the continuation rule, filter evaluation, and the reorder buffer; the resolver and the streams are tested by hand against the dev cluster for the prototype, with no integration tests against a cluster in CI yet.

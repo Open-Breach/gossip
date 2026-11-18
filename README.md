@@ -129,6 +129,7 @@ Gossip keeps watching until something matches.
 | Flag | Meaning | Default |
 | --- | --- | --- |
 | `--template <name>` | follow what a template of the config file says, in place of targets | none |
+| `--no-filter` | drop the filter of the template, or of `[defaults]`, so that only the filter flags apply | off |
 | `--context <name>` | the kubeconfig context of the cluster | the current context |
 | `--since <duration>` | history per container at start: `30s`, `5m`, `1h` | none |
 | `--tail <n>` | last n lines per container at start | 20, unless `--since` is given |
@@ -145,9 +146,11 @@ Gossip keeps watching until something matches.
 | `--raw` | print the raw line, with no prefix, parsing or colour | off |
 | `--no-color` | no colours | colours when stdout is a terminal |
 
-The filter flags combine with "and", and they are about lines: events pass
-them, and `--no-events` is what leaves events out. A line that has no level
-does not pass `--level`.
+The filter flags (`--level`, `--grep`, `--match`, `--field`) combine with
+"and", and they are about lines: events pass them, and `--no-events` is what
+leaves events out. A line that has no level always passes `--level`: unknown is
+not the same as unimportant, and a plain-text panic must not vanish under
+`--level warn`.
 
 #### Lines
 
@@ -162,6 +165,9 @@ The format of every line is detected on its own:
   `INFO`, `DEBUG` or `TRACE`, also after a timestamp or a bracketed module.
 - A line that starts with whitespace, with `at ` or with `Caused by:` joins
   the line before it, so that a stack trace is one record.
+- A Rust panic is one record too. The line `thread '<name>' panicked at ...`
+  opens a block, and every line after it joins that record until a blank
+  line, a JSON or logfmt line, the next panic, or two seconds later.
 
 #### Events
 
@@ -284,8 +290,20 @@ What is used is decided in layers: a flag on the command line, then the
 template, then `[defaults]`, then the built-in defaults. `[defaults]` takes
 every key of a template except `targets`, and applies to `gossip follow` with
 or without a template. `since` and `tail` are one setting: the layer that
-gives either one decides both. A filter flag (`--level`, `--grep`, `--match`,
-`--field`) beside a template takes the place of the template's filter.
+gives either one decides both.
+
+The filter is the one thing a flag does not override. A filter flag (`--level`,
+`--grep`, `--match`, `--field`) beside a template narrows the template's
+filter: a line must pass both. `--no-filter` drops the template's filter
+first, so that the flags are the whole filter:
+
+```bash
+gossip follow --template dev-api --grep timeout
+```
+
+```bash
+gossip follow --template dev-api --no-filter --level error
+```
 
 An unknown key is an error that names the line, so that a typo in a template
 does not silently follow the wrong thing.
@@ -318,10 +336,23 @@ A rule compares a field of a record with a value.
 | `matches` | the regular expression finds a match in the field |
 | `exists` | the record has the field; takes no value |
 
-A rule on a field the record does not have is false, except `!=`. In the
-config file a filter is exactly what is written: unlike the filter flags, it
-applies to events too, which is why the example above names `kind == event`.
-Notices from Gossip always pass.
+A rule on a field the record does not have is false, with two exceptions:
+`!=` is the opposite of `==`, and a record with no level passes `level >=`.
+In the config file a filter is exactly what is written: unlike the filter
+flags, it applies to events too, which is why the example above names
+`kind == event`. Notices from Gossip always pass.
+
+## Known limits
+
+- **Open files.** Every followed container holds a connection of its own, and
+  so does every watch. Following a few hundred containers at once can reach
+  the limit on open files, which is 256 by default on macOS. Opening a stream
+  then fails with "too many open files" and is tried again, with a notice each
+  time. Raise the limit in the shell before starting:
+
+  ```bash
+  ulimit -n 4096
+  ```
 
 ## Development
 

@@ -748,6 +748,38 @@ async fn continuation_lines_arrive_as_one_record() {
 }
 
 #[tokio::test]
+async fn a_panic_that_is_written_with_a_pause_is_still_one_record() {
+    let fake = FakeCluster::start().await;
+    set_pod(&fake, POD, 0, running(), None);
+    fake.start_run(NS, POD, "api");
+    let mut session = Session::start(&fake.cluster(), vec![target("flowcpt")], None, options());
+    expect_quiet(&mut session).await;
+
+    // The message comes at once; resolving the symbols of the backtrace
+    // takes a moment, longer than a line is otherwise kept back.
+    fake.log(
+        NS,
+        POD,
+        "api",
+        at(0),
+        "thread 'main' panicked at src/main.rs:5:5:",
+    );
+    fake.log(NS, POD, "api", at(0), "boom");
+    fake.log(NS, POD, "api", at(1), "stack backtrace:");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    fake.log(NS, POD, "api", at(250), "   0: rust_begin_unwind");
+    fake.log(NS, POD, "api", at(251), "   1: flowcpt_api::main");
+
+    let records = take(&mut session, 1).await;
+    assert_eq!(
+        records[0].message,
+        "thread 'main' panicked at src/main.rs:5:5:\nboom\nstack backtrace:\n   0: rust_begin_unwind\n   1: flowcpt_api::main"
+    );
+    assert_eq!(records[0].time, at(0));
+    expect_quiet(&mut session).await;
+}
+
+#[tokio::test]
 async fn the_format_option_is_applied_per_container() {
     let fake = FakeCluster::start().await;
     let statuses = vec![
