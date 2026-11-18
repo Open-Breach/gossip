@@ -1,6 +1,6 @@
 # Gossip — SPEC
 
-Status: draft, 2026-11-18. Nothing of this is implemented yet.
+Status: prototype built (PRs 1 to 8), hand checks against the cluster pending.
 
 Gossip is a Rust command-line tool that follows the logs of a set of Kubernetes workloads, keeps following them across pod restarts and rollouts, merges the cluster's own events into the same stream, and understands JSON log lines. Prototype: one cluster at a time, a core library plus a CLI; a GUI comes later on the same core.
 
