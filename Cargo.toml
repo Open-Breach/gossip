@@ -9,4 +9,12 @@ license = "Apache-2.0"
 repository = "https://github.com/Open-Breach/gossip"
 
 [workspace.dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["std", "clock", "serde"] }
 clap = { version = "4.6.8", features = ["derive"] }
+directories = "6.0.0"
+globset = { version = "0.4.21", default-features = false }
+regex = "1.13.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+toml = "1.2.1"
