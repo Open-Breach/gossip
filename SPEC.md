@@ -93,6 +93,7 @@ The core is an async library on `tokio` and `kube-rs`. Its public surface is sma
 - A bare namespace, or `namespace/*`, follows every pod in it, whatever owns them. Deployments are the common case, not the only one.
 - The workload level takes the name of a Deployment, StatefulSet, DaemonSet, Job or CronJob. The name is looked up across those kinds; when two kinds share a name, a prefix picks one: `flowcpt/cronjob:nightly-sync`. A Deployment resolves through its ReplicaSets, a CronJob through its Jobs, the others through their `spec.selector`, to the pods carrying those labels.
 - Resolution is live: the core runs a `kube_runtime::watcher` on pods in every namespace a target names, filtered by the labels when the target is a workload, and re-matches on every pod event. A new pod that matches gets a stream opened; a pod that is gone gets its stream closed. A CronJob's runs are picked up this way, each run a new pod with its lines and its `Completed` event.
+- Besides the pods, the core watches what a workload target resolves through: the kinds its name is looked up in (the one object when the name is exact, the whole kind for a glob), ReplicaSets for deployments and Jobs for cron jobs. A label-filtered pod watch alone cannot see a workload that is created later, or the next run of a CronJob, whose pods carry labels of their own. A workload target therefore needs `list` and `watch` on those kinds; a bare namespace needs pods only. With events on (4.5), every namespace also watches its ReplicaSets and Jobs, to know which workload is above a pod.
 - When a target matches nothing at start, the session says so in a record of kind `notice` and keeps watching; it does not fail.
 
 ### 4.4 Log streams and reconnection
@@ -101,6 +102,7 @@ The core is an async library on `tokio` and `kube-rs`. Its public surface is sma
 - Start-up history: `--since` (duration) or `--tail` (lines) per container, default `--tail 20`.
 - The stream ends when the container ends. The core reopens it when the pod shows a new container start (restart count went up, or a new pod replaced the old one), with `since` set to the time of the last line it saw, so nothing is lost and nothing is repeated.
 - A dropped connection (API server hiccup, laptop sleep) is retried with exponential backoff, 1 s to 30 s, forever. Each retry writes a `notice` record.
+- A connection can also die without a word: a NAT that forgets it, a laptop that slept. A log stream never writes, so silence is the only sign. A stream that has been silent for 90 s is opened again from the last line it saw. If it was alive this changes nothing and nothing is said; if lines had been held up, a `notice` says so.
 - A container that is still `Waiting` (image pull, crash loop) has no stream; its state comes through as events (4.5) and as a `notice` when it changes.
 - A container whose restart count is above zero at start, or that is `Waiting` in a crash loop, first gets the tail of its previous run (`previous: true`, same `--tail` / `--since`), its records marked `previous` and rendered dimmed, then the current run if there is one. That is the output of the run that crashed, which is what one starts Gossip for; without it one would wait through the back-off to watch it crash again.
 
@@ -108,6 +110,7 @@ The core is an async library on `tokio` and `kube-rs`. Its public surface is sma
 
 - A watcher on `Event` objects (`events.k8s.io/v1`) in every namespace a target names, kept to events whose `regarding` object is a followed pod, or the deployment or replica set above it.
 - Each event becomes a record of kind `event` with `reason` (`Scheduled`, `Pulling`, `Started`, `Killing`, `BackOff`, `Unhealthy`, `Evicted`, ...), `message`, `type` (Normal or Warning) and a count.
+- Kubernetes has no event for a container that exits. The core makes one from the pod status: when a followed container ends a run with an exit code other than zero, a record of kind `event` with reason `Exited`, type Warning and the exit code in its message.
 - On by default; `--no-events` (CLI) or `events = false` (template) turns it off.
 
 ### 4.6 Line parser
@@ -115,7 +118,7 @@ The core is an async library on `tokio` and `kube-rs`. Its public surface is sma
 - The format is detected per line, not per stream, because even a JSON service prints plain text now and then (a Rust panic, a sidecar, an init container). The recognisers run in this order and the first that accepts the line wins; the record notes which one in `format`.
 - JSON: a line that starts with `{` and parses as a JSON object becomes a record with `fields`: a flat map of its top-level keys. Well-known keys are normalised into the record's own fields: `level` (`level`, `severity`, `lvl`), `message` (`message`, `msg`), `timestamp` (`timestamp`, `ts`, `time`), `target`. The rest stays in `fields` as it came, nested objects as JSON strings. The output of `tracing-subscriber`'s JSON formatter with `flatten_event(true)` is the first format it must handle.
 - logfmt: a line made of `key=value` pairs, values quoted when they hold spaces (`time=2026-11-18T14:02:11Z level=info msg="request done" status=200`), becomes a record with the same `fields` and the same normalisation of the well-known keys. This is what most Go tooling in a cluster writes (ingress controllers, cert-manager, many operators). A line is logfmt only when every token is a pair; one bare word and it is text.
-- Text: any other line is a record of kind `text` with the raw line as `message`. A level is guessed from a leading `ERROR`, `WARN`, `INFO`, `DEBUG`, `TRACE` token when present, also when a timestamp or a bracketed module comes first.
+- Text: any other line is a record whose `format` is `text` (4.7), with the raw line as `message`. A level is guessed from a leading `ERROR`, `WARN`, `INFO`, `DEBUG`, `TRACE` token when present, also when a timestamp or a bracketed module comes first.
 - Continuation: a line that starts with whitespace, or with `at ` or `Caused by:`, is appended to the previous record of the same container instead of becoming its own (a Rust panic's backtrace, a Java stack trace, a multi-line JSON pretty-print). The record's `message` grows by a newline and the line; its level and fields stay those of the first line. A continuation older than 2 s after the first line, or with no previous record, is text on its own.
 - Panic block: the continuation rule has a second trigger. A line that starts with `thread '<name>' panicked at` opens a block (the first line of a Rust panic; toolchains since 1.91 put the id of the thread in brackets after the name, `thread 'main' (238) panicked at`). Every following line of the same container is appended to that record, as a continuation is, until a blank line, the next line that parses as JSON or logfmt, the next line that opens a block of its own, or the 2 s limit. The line that ends a block is a record of its own. So a panic arrives as one record with its message and its backtrace, although the message and `stack backtrace:` start at the margin.
 - `format` option, per template or per container (`format = "auto" | "json" | "logfmt" | "text"`, default `auto`): forces one recogniser for streams where detection is wrong, such as a text line that happens to start with `{`. `text` also turns the continuation rule off, panic blocks included.
@@ -138,10 +141,12 @@ pub struct Record {
     pub message: String,
     pub fields: BTreeMap<String, Value>,
     pub raw: String,
+    pub previous: bool,              // a line of the run before the current one (4.4)
+    pub truncated: bool,             // the line was longer than 1 MiB and was cut (4.6)
 }
 ```
 
-In words: every record knows where it came from, when, what kind of thing it is, a level when one is known, a message, the structured fields when there are any, and the raw line for a `--raw` output.
+In words: every record knows where it came from, when, what kind of thing it is, a level when one is known, a message, the structured fields when there are any, and the raw line for a `--raw` output. Two marks complete it: `previous` for a line of the run before the current one, and `truncated` for a line that was cut.
 
 ### 4.8 Filters
 
@@ -278,7 +283,7 @@ since = "5m"
 
 ## 8. Notes for the implementer
 
-- Crates: `kube` with features `client`, `runtime`, `rustls-tls`, and `k8s-openapi` with the feature of the newest Kubernetes version the crate offers at the time of writing (it picks the API type definitions compiled in, not which clusters can be reached; everything Gossip uses has been stable for years); `tokio`, `futures`, `serde` / `serde_json`, `toml`, `clap` (derive), `chrono`, `globset`, `regex`, `owo-colors` or `anstyle` for colour, `anyhow` and `thiserror`. Check versions at the time of writing; do not pin from memory. Rust edition 2024, latest stable toolchain.
+- Crates: `kube` with features `client`, `runtime`, `rustls-tls`, plus `ring` (rustls needs a crypto backend, and `kube` makes one pick it) and `http-proxy` and `socks5` (without them `kube` refuses to build a client as soon as `HTTPS_PROXY` is set or the kubeconfig has a `proxy-url`, where `kubectl` just uses the proxy), and `k8s-openapi` with the feature of the newest Kubernetes version the crate offers at the time of writing (it picks the API type definitions compiled in, not which clusters can be reached; everything Gossip uses has been stable for years); `tokio`, `futures`, `serde` / `serde_json`, `toml`, `clap` (derive), `chrono`, `globset`, `regex`, `owo-colors` or `anstyle` for colour, `anyhow` and `thiserror`. Check versions at the time of writing; do not pin from memory. Rust edition 2024, latest stable toolchain.
 - `kube::Config::infer()` reads `KUBECONFIG` and the current context; `Config::from_kubeconfig` with `KubeConfigOptions { context: Some(name), .. }` picks another one. AKS contexts use an exec plugin (`kubelogin`), which `kube` runs by itself.
 - `Api::<Pod>::namespaced(client, ns).log_stream(name, &LogParams { follow: true, timestamps: true, container: Some(c), since_seconds / tail_lines, .. })` gives an `AsyncBufRead`; split it on newlines with `tokio::io::AsyncBufReadExt::lines`. The kubelet puts an RFC 3339 timestamp and a space in front of every line when `timestamps` is set.
 - Use `kube_runtime::watcher` with `watcher::Config::default().labels(selector)` for pods and `WatchStreamExt::default_backoff()` for the retries on the watch itself; the log streams need their own retry loop since they are plain HTTP responses.
