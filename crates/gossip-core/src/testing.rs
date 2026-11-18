@@ -3,15 +3,16 @@
 //!
 //! It listens on a local port and speaks just enough of the Kubernetes API
 //! for `kube` to list and watch against it: collections of objects that a
-//! test fills and changes, with label and field selectors. It stores
-//! whatever JSON a test gives it and knows nothing about what the objects
-//! mean. It is a reading aid for the code under test, not a model of a
+//! test fills and changes, with label and field selectors, and the logs of
+//! containers, which a test writes line by line. It stores whatever a test
+//! gives it and knows nothing about what the objects mean. It is a reading aid for the code under test, not a model of a
 //! cluster; the real thing is checked by hand.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
+use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -77,6 +78,31 @@ struct Shared {
     forbidden: BTreeSet<String>,
     /// Every request so far, as `path?query`.
     requests: Vec<String>,
+    /// The logs of containers, by namespace, pod and container.
+    logs: HashMap<(String, String, String), ContainerLog>,
+    /// How many of the next log requests are answered with a 500.
+    failing_log_requests: usize,
+}
+
+/// The log of one container: its runs, the last one being the current one.
+#[derive(Default)]
+struct ContainerLog {
+    runs: Vec<Vec<(DateTime<Utc>, String)>>,
+    /// The current run has ended; its log is complete.
+    ended: bool,
+    /// The container waits to be started again, as in a crash loop. The
+    /// kubelet then serves the run that ended as the previous one, and as
+    /// the current one too.
+    backing_off: bool,
+    /// The open streams that follow the current run.
+    followers: Vec<mpsc::UnboundedSender<Chunk>>,
+}
+
+/// A piece of a response that is sent as it comes.
+enum Chunk {
+    Line(String),
+    /// Cut the connection without ending the response in good order.
+    Break,
 }
 
 #[derive(Default)]
@@ -96,7 +122,7 @@ struct Change {
 
 struct Watcher {
     filter: Filter,
-    lines: mpsc::UnboundedSender<String>,
+    lines: mpsc::UnboundedSender<Chunk>,
 }
 
 impl FakeCluster {
@@ -203,6 +229,102 @@ impl FakeCluster {
     pub fn requests(&self) -> Vec<String> {
         self.shared.lock().unwrap().requests.clone()
     }
+
+    /// Writes a line to the log of the current run of a container.
+    pub fn log(
+        &self,
+        namespace: &str,
+        pod: &str,
+        container: &str,
+        time: DateTime<Utc>,
+        line: &str,
+    ) {
+        let mut shared = self.shared.lock().unwrap();
+        let log = shared
+            .logs
+            .entry(log_key(namespace, pod, container))
+            .or_default();
+        if log.runs.is_empty() {
+            log.runs.push(Vec::new());
+        }
+        log.runs
+            .last_mut()
+            .expect("there is a run")
+            .push((time, line.to_string()));
+        let sent = log_line(time, line);
+        log.followers
+            .retain(|follower| follower.send(Chunk::Line(sent.clone())).is_ok());
+    }
+
+    /// Ends the current run of a container: the streams that follow it end
+    /// in good order.
+    pub fn end_run(&self, namespace: &str, pod: &str, container: &str) {
+        let mut shared = self.shared.lock().unwrap();
+        let log = shared
+            .logs
+            .entry(log_key(namespace, pod, container))
+            .or_default();
+        log.ended = true;
+        log.followers.clear();
+    }
+
+    /// Ends the current run of a container and leaves it waiting to be
+    /// started again, as in a crash loop.
+    pub fn back_off(&self, namespace: &str, pod: &str, container: &str) {
+        self.end_run(namespace, pod, container);
+        let mut shared = self.shared.lock().unwrap();
+        let log = shared
+            .logs
+            .entry(log_key(namespace, pod, container))
+            .or_default();
+        log.backing_off = true;
+    }
+
+    /// Starts a new run of a container; the one before becomes the
+    /// previous run.
+    pub fn start_run(&self, namespace: &str, pod: &str, container: &str) {
+        let mut shared = self.shared.lock().unwrap();
+        let log = shared
+            .logs
+            .entry(log_key(namespace, pod, container))
+            .or_default();
+        log.runs.push(Vec::new());
+        log.ended = false;
+        log.backing_off = false;
+        log.followers.clear();
+    }
+
+    /// Cuts every open log stream, as a dropped connection would.
+    pub fn break_log_streams(&self) {
+        let mut shared = self.shared.lock().unwrap();
+        for log in shared.logs.values_mut() {
+            for follower in log.followers.drain(..) {
+                let _ = follower.send(Chunk::Break);
+            }
+        }
+    }
+
+    /// Answers the next `count` log requests with a 500.
+    pub fn fail_log_requests(&self, count: usize) {
+        self.shared.lock().unwrap().failing_log_requests = count;
+    }
+}
+
+fn log_key(namespace: &str, pod: &str, container: &str) -> (String, String, String) {
+    (
+        namespace.to_string(),
+        pod.to_string(),
+        container.to_string(),
+    )
+}
+
+/// A log line as the kubelet sends it with `timestamps`: the time, a space,
+/// the line.
+fn log_line(time: DateTime<Utc>, line: &str) -> String {
+    format!(
+        "{} {line}",
+        time.to_rfc3339_opts(SecondsFormat::Nanos, true)
+    )
 }
 
 impl Drop for FakeCluster {
@@ -211,8 +333,8 @@ impl Drop for FakeCluster {
     }
 }
 
-fn watch_line(kind: &str, object: &Value) -> String {
-    json!({ "type": kind, "object": object }).to_string()
+fn watch_line(kind: &str, object: &Value) -> Chunk {
+    Chunk::Line(json!({ "type": kind, "object": object }).to_string())
 }
 
 /// What a list or a watch asks for: a name, labels, or both.
@@ -320,7 +442,7 @@ fn parse_label_selector(selector: &str) -> Vec<Requirement> {
 enum Answer {
     Json(u16, Value),
     /// Lines that are sent as they come, until the sender is dropped.
-    Lines(mpsc::UnboundedReceiver<String>),
+    Lines(mpsc::UnboundedReceiver<Chunk>),
 }
 
 fn status(code: u16, reason: &str, message: &str) -> Answer {
@@ -365,6 +487,9 @@ fn route(shared: &Mutex<Shared>, target: &str) -> Answer {
     }
 
     let last = path.rsplit('/').next().unwrap_or_default();
+    if last == "log" {
+        return route_log(&mut shared, &path, &query);
+    }
     if !RESOURCES.contains(&last) {
         // One object: the path is its collection and its name.
         let (collection, name) = path.rsplit_once('/').unwrap_or_default();
@@ -425,6 +550,85 @@ fn route(shared: &Mutex<Shared>, target: &str) -> Answer {
         }
     }
     collection.watchers.push(Watcher { filter, lines });
+    Answer::Lines(receiver)
+}
+
+/// The log of a container: `/api/v1/namespaces/{namespace}/pods/{pod}/log`.
+fn route_log(shared: &mut Shared, path: &str, query: &HashMap<String, String>) -> Answer {
+    if shared.failing_log_requests > 0 {
+        shared.failing_log_requests -= 1;
+        return status(500, "InternalError", "the kubelet does not answer");
+    }
+    let segments: Vec<&str> = path.split('/').collect();
+    let [.., namespace, "pods", pod, "log"] = segments[..] else {
+        return status(404, "NotFound", "no such path");
+    };
+    let container = query
+        .get("container")
+        .map(String::as_str)
+        .unwrap_or_default();
+    let flag = |name: &str| query.get(name).map(String::as_str) == Some("true");
+
+    let waiting = || {
+        status(
+            400,
+            "BadRequest",
+            &format!(
+                "container \"{container}\" in pod \"{pod}\" is waiting to start: ContainerCreating"
+            ),
+        )
+    };
+    let Some(log) = shared.logs.get_mut(&log_key(namespace, pod, container)) else {
+        return waiting();
+    };
+    let run = if log.backing_off && !log.runs.is_empty() {
+        log.runs.len() - 1
+    } else if flag("previous") {
+        if log.runs.len() < 2 {
+            return status(
+                400,
+                "BadRequest",
+                &format!(
+                    "previous terminated container \"{container}\" in pod \"{pod}\" not found"
+                ),
+            );
+        }
+        log.runs.len() - 2
+    } else if log.runs.is_empty() {
+        return waiting();
+    } else {
+        log.runs.len() - 1
+    };
+
+    // The lines since a time, then the last so many of them.
+    let since = query
+        .get("sinceTime")
+        .and_then(|time| DateTime::parse_from_rfc3339(time).ok())
+        .map(|time| time.with_timezone(&Utc))
+        .or_else(|| {
+            let seconds: i64 = query.get("sinceSeconds")?.parse().ok()?;
+            Some(Utc::now() - TimeDelta::seconds(seconds))
+        });
+    let mut lines: Vec<&(DateTime<Utc>, String)> = log.runs[run]
+        .iter()
+        .filter(|(time, _)| since.is_none_or(|since| *time >= since))
+        .collect();
+    if let Some(tail) = query
+        .get("tailLines")
+        .and_then(|tail| tail.parse::<usize>().ok())
+    {
+        let skip = lines.len().saturating_sub(tail);
+        lines.drain(..skip);
+    }
+
+    let (sender, receiver) = mpsc::unbounded_channel();
+    for (time, line) in lines {
+        let _ = sender.send(Chunk::Line(log_line(*time, line)));
+    }
+    let is_current = run == log.runs.len() - 1;
+    if flag("follow") && is_current && !log.ended {
+        log.followers.push(sender);
+    }
     Answer::Lines(receiver)
 }
 
@@ -506,12 +710,13 @@ async fn serve(mut stream: TcpStream, shared: Arc<Mutex<Shared>>) {
                 loop {
                     tokio::select! {
                         line = lines.recv() => match line {
-                            Some(line) => {
+                            Some(Chunk::Line(line)) => {
                                 let chunk = format!("{:x}\r\n{line}\n\r\n", line.len() + 1);
                                 if stream.write_all(chunk.as_bytes()).await.is_err() {
                                     return;
                                 }
                             }
+                            Some(Chunk::Break) => return,
                             None => {
                                 let _ = stream.write_all(b"0\r\n\r\n").await;
                                 return;
@@ -584,6 +789,38 @@ pub fn pod_object(
         .collect();
     json!({
         "metadata": metadata(namespace, name, labels, controller),
+        "spec": { "containers": specs },
+        "status": { "phase": "Running", "containerStatuses": statuses }
+    })
+}
+
+/// The status of a container as a pod reports it: `state` and `last_state`
+/// are objects such as `{ "running": {} }` or
+/// `{ "waiting": { "reason": "CrashLoopBackOff" } }`.
+pub fn container_status(
+    name: &str,
+    restarts: i32,
+    state: Value,
+    last_state: Option<Value>,
+) -> Value {
+    let mut status = json!({
+        "name": name, "ready": false, "restartCount": restarts, "image": "", "imageID": "",
+        "state": state
+    });
+    if let Some(last_state) = last_state {
+        status["lastState"] = last_state;
+    }
+    status
+}
+
+/// A pod whose containers are in the states given, one status per container.
+pub fn pod_with_statuses(namespace: &str, name: &str, statuses: Vec<Value>) -> Value {
+    let specs: Vec<Value> = statuses
+        .iter()
+        .map(|status| json!({ "name": status["name"] }))
+        .collect();
+    json!({
+        "metadata": metadata(namespace, name, &[], None),
         "spec": { "containers": specs },
         "status": { "phase": "Running", "containerStatuses": statuses }
     })
