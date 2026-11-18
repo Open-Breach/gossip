@@ -139,7 +139,7 @@ Gossip keeps watching until something matches.
 | `--grep <text>` | only lines whose message contains the text | none |
 | `--match <regex>` | only lines whose message matches the regular expression | none |
 | `--field <key=value>` | only lines whose field has the value; repeatable | none |
-| `--fields <a,b,c>` | show only these fields of a line, in this order | all, longest last |
+| `--fields <a,b,c>` | show only these fields of a line, in this order | all but `timestamp` and `target`, longest last |
 | `--long-names` | keep pod names whole | shortened when every pod is a deployment's |
 | `--no-emoji` | mark events with `EVNT` instead of an emoji | emoji when stdout is a terminal and the locale is UTF-8 |
 | `--output text\|json` | the rendering | `text` |
@@ -158,7 +158,13 @@ The format of every line is detected on its own:
 
 - A JSON object becomes a level (`level`, `severity` or `lvl`), a message
   (`message` or `msg`) and fields. The application's own timestamp is kept as
-  the field `timestamp`.
+  the field `timestamp`. A nested object is kept as one field, as JSON text.
+- The fields of a `tracing` span are fields of the line. `tracing-subscriber`'s
+  JSON formatter writes them under `span`, and the chain of spans around it
+  under `spans`; Gossip merges the keys of `span` into the fields, where a
+  field of the line itself wins over a span field of the same name, and drops
+  `spans`, which repeats them. So `--field tenant_id=t_123` finds a tenant
+  whose id was recorded on the request's span.
 - A logfmt line (`level=info msg="request done" status=200`) is read the same
   way.
 - Anything else is text. Its level is guessed from a leading `ERROR`, `WARN`,
@@ -196,6 +202,19 @@ the pod reports. Events from before Gossip started are left out, unless
 
 The text output is one line per record: the time in the local zone, the pod
 and the container in a colour per pod, the level, the fields, and the message.
+The fields are all of them, the longest last, without `timestamp` and
+`target`: the time is at the front of the line already, and `target` is rarely
+what one reads for. `--fields` names the ones to show and their order, those
+two included, and `--output json` always has every field.
+
+```bash
+gossip follow fc-stg/fc-api --fields http.method,http.route,http.status_code,tenant_id,request_id,time.busy
+```
+
+```text
+20:39:01.188 6c9d8f7b5-x2k9p api  INFO  http.method=GET http.route=/api/v1/sources http.status_code=200 tenant_id=3K6ehNLhnRsPfWhzjugmea request_id=32e49c93-4c57-43a0-9439-c554e5fff1f6 time.busy=5.53ms  close
+```
+
 Lines of the run before the current one are dimmed. Notices from Gossip itself
 (a pod appeared or went away, a stream was reopened, a target matches nothing)
 start with `--`.
@@ -283,7 +302,7 @@ A template holds what `follow` takes:
 | `events` | `false` leaves the cluster's events out |
 | `format` | `"auto"`, `"json"`, `"logfmt"` or `"text"` for every container, or a table by container name; `"text"` shows lines untouched and does not join continuation lines |
 | `filter` | a filter, see below |
-| `fields` | the fields of a line to show, in this order |
+| `fields` | the list of fields of a line to show, in this order; `[]` shows the message only; left out, all but `timestamp` and `target` |
 | `output` | `"text"` or `"json"` |
 
 What is used is decided in layers: a flag on the command line, then the

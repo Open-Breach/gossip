@@ -7,7 +7,7 @@
 //! before it. And a line that starts a Rust panic opens a block: the lines
 //! after it belong to it until a blank line or a JSON or logfmt line.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
 use std::sync::LazyLock;
@@ -37,6 +37,14 @@ static PANIC_START: LazyLock<Regex> = LazyLock::new(|| {
 /// The key under which the application's own timestamp is kept in the fields
 /// of a line, whichever of `timestamp`, `ts` or `time` the line used.
 pub const TIMESTAMP_FIELD: &str = "timestamp";
+
+/// The key of the field that names where in the code a line was logged.
+pub const TARGET_FIELD: &str = "target";
+
+/// Where `tracing-subscriber` puts the fields of the current span, and where
+/// it puts the chain of spans around it.
+const SPAN_KEY: &str = "span";
+const SPANS_KEY: &str = "spans";
 
 const LEVEL_KEYS: [&str; 3] = ["level", "severity", "lvl"];
 const MESSAGE_KEYS: [&str; 2] = ["message", "msg"];
@@ -171,7 +179,7 @@ impl LineParser {
             return self.keep(text_line(time, line, truncated), true);
         }
         let parsed = match structured {
-            Some((format, fields)) => structured_line(time, line, truncated, format, fields),
+            Some(structured) => structured_line(time, line, truncated, structured),
             // Also a continuation that is too old or has nothing to join:
             // text on its own.
             None => text_line(time, line, truncated),
@@ -243,11 +251,32 @@ fn is_continuation(line: &str) -> bool {
         || line.starts_with("Caused by:")
 }
 
-/// The fields of a line that a recogniser the choice allows accepts as JSON
-/// or logfmt.
-fn structured(choice: FormatChoice, line: &str) -> Option<(Format, BTreeMap<String, Value>)> {
-    let json = || parse_json(line).map(|fields| (Format::Json, fields));
-    let logfmt = || parse_logfmt(line).map(|fields| (Format::Logfmt, fields));
+/// What a recogniser read off a line.
+struct Structured {
+    format: Format,
+    /// The top-level keys of the line.
+    fields: BTreeMap<String, Value>,
+    /// The fields of the span the line was logged in, for a JSON line that
+    /// has them under `span`.
+    span: BTreeMap<String, Value>,
+}
+
+/// A line as JSON or logfmt, when a recogniser the choice allows accepts it.
+fn structured(choice: FormatChoice, line: &str) -> Option<Structured> {
+    let json = || {
+        parse_json(line).map(|(fields, span)| Structured {
+            format: Format::Json,
+            fields,
+            span,
+        })
+    };
+    let logfmt = || {
+        parse_logfmt(line).map(|fields| Structured {
+            format: Format::Logfmt,
+            fields,
+            span: BTreeMap::new(),
+        })
+    };
     match choice {
         FormatChoice::Auto => json().or_else(logfmt),
         FormatChoice::Json => json(),
@@ -260,10 +289,27 @@ fn structured_line(
     time: DateTime<Utc>,
     line: &str,
     truncated: bool,
-    format: Format,
-    mut fields: BTreeMap<String, Value>,
+    structured: Structured,
 ) -> ParsedLine {
+    let Structured {
+        format,
+        mut fields,
+        span,
+    } = structured;
+    // The keys the line itself has. Each of them wins over a span field of
+    // the same name, also the ones that move out of the fields as the level
+    // or the message: those are read from the line, never from its span.
+    let own: BTreeSet<String> = if span.is_empty() {
+        BTreeSet::new()
+    } else {
+        fields.keys().cloned().collect()
+    };
     let (level, message) = normalise(&mut fields);
+    for (key, value) in span {
+        if !own.contains(&key) {
+            fields.entry(key).or_insert(value);
+        }
+    }
     ParsedLine {
         time,
         format,
@@ -324,22 +370,38 @@ fn normalise(fields: &mut BTreeMap<String, Value>) -> (Option<Level>, String) {
 /// The JSON recogniser: a line that starts with `{` and is one JSON object.
 /// Its top-level keys become the fields; nested objects and arrays are kept
 /// as JSON text.
-fn parse_json(line: &str) -> Option<BTreeMap<String, Value>> {
+///
+/// One nested object is opened: `span`, where `tracing-subscriber` puts the
+/// fields of the current span. Its keys are handed back apart, to be merged
+/// into the fields of the line. `spans`, the chain of spans around it,
+/// repeats them and is dropped.
+fn parse_json(line: &str) -> Option<(BTreeMap<String, Value>, BTreeMap<String, Value>)> {
     if !line.starts_with('{') {
         return None;
     }
-    let object: serde_json::Map<String, Value> = serde_json::from_str(line).ok()?;
-    let fields = object
-        .into_iter()
-        .map(|(key, value)| {
-            let value = match value {
-                Value::Object(_) | Value::Array(_) => Value::String(value.to_string()),
-                scalar => scalar,
-            };
-            (key, value)
-        })
-        .collect();
-    Some(fields)
+    let mut object: serde_json::Map<String, Value> = serde_json::from_str(line).ok()?;
+    let span = match object.remove(SPAN_KEY) {
+        Some(Value::Object(span)) => span.into_iter().map(flat).collect(),
+        // Not what `tracing` writes: a field like any other.
+        Some(other) => {
+            object.insert(SPAN_KEY.to_string(), other);
+            BTreeMap::new()
+        }
+        None => BTreeMap::new(),
+    };
+    if matches!(object.get(SPANS_KEY), Some(Value::Array(_))) {
+        object.remove(SPANS_KEY);
+    }
+    Some((object.into_iter().map(flat).collect(), span))
+}
+
+/// A field with a nested object or array as its value gets it as JSON text.
+fn flat((key, value): (String, Value)) -> (String, Value) {
+    let value = match value {
+        Value::Object(_) | Value::Array(_) => Value::String(value.to_string()),
+        scalar => scalar,
+    };
+    (key, value)
 }
 
 /// The logfmt recogniser: a line made of `key=value` pairs and nothing else.
@@ -523,15 +585,106 @@ mod tests {
         // The level and the message have moved out of the fields.
         assert!(!parsed.fields.contains_key("level"));
         assert!(!parsed.fields.contains_key("message"));
-        // Nested objects and arrays are kept as JSON text.
+        // The fields of the span are fields of the line; the chain of spans
+        // around it, which repeats them, is gone.
+        assert_eq!(parsed.fields["method"], json!("POST"));
+        assert_eq!(parsed.fields["name"], json!("request"));
+        assert!(!parsed.fields.contains_key("span"));
+        assert!(!parsed.fields.contains_key("spans"));
+    }
+
+    /// A line of the real api, logged with `tracing-subscriber`'s JSON
+    /// formatter when a request span closes.
+    const SPAN_LINE: &str = r#"{"timestamp":"2026-11-18T20:39:01.187944Z","level":"INFO","message":"close","time.busy":"5.53ms","time.idle":"36.3ms","target":"flowcpt_telemetry","span":{"http.method":"GET","http.route":"/api/v1/sources","http.status_code":200,"request_id":"32e49c93-4c57-43a0-9439-c554e5fff1f6","tenant_id":"3K6ehNLhnRsPfWhzjugmea","user_id":"auth0|6a86204723ca712d0c11f85a","otel.name":"GET /api/v1/sources"},"spans":[{"http.method":"GET","http.route":"/api/v1/sources","request_id":"32e49c93-4c57-43a0-9439-c554e5fff1f6","tenant_id":"3K6ehNLhnRsPfWhzjugmea"}]}"#;
+
+    #[test]
+    fn the_fields_of_the_span_are_merged_into_the_fields_of_the_line() {
+        let parsed = one(FormatChoice::Auto, SPAN_LINE);
+        assert_eq!(parsed.format, Format::Json);
+        assert_eq!(parsed.level, Some(Level::Info));
+        assert_eq!(parsed.message, "close");
         assert_eq!(
-            parsed.fields["span"],
-            json!(r#"{"method":"POST","name":"request"}"#)
+            parsed.fields,
+            BTreeMap::from(
+                [
+                    ("http.method", json!("GET")),
+                    ("http.route", json!("/api/v1/sources")),
+                    ("http.status_code", json!(200)),
+                    ("otel.name", json!("GET /api/v1/sources")),
+                    ("request_id", json!("32e49c93-4c57-43a0-9439-c554e5fff1f6")),
+                    ("target", json!("flowcpt_telemetry")),
+                    ("tenant_id", json!("3K6ehNLhnRsPfWhzjugmea")),
+                    ("time.busy", json!("5.53ms")),
+                    ("time.idle", json!("36.3ms")),
+                    ("timestamp", json!("2026-11-18T20:39:01.187944Z")),
+                    ("user_id", json!("auth0|6a86204723ca712d0c11f85a")),
+                ]
+                .map(|(key, value)| (key.to_string(), value))
+            )
         );
-        assert_eq!(
-            parsed.fields["spans"],
-            json!(r#"[{"method":"POST","name":"request"}]"#)
+        // The raw line is the line as it came.
+        assert_eq!(parsed.raw, SPAN_LINE);
+    }
+
+    #[test]
+    fn a_field_of_the_line_wins_over_a_span_field_of_the_same_name() {
+        let parsed = one(
+            FormatChoice::Auto,
+            r#"{"message":"m","tenant_id":"of the event","span":{"tenant_id":"of the span","name":"request"}}"#,
         );
+        assert_eq!(parsed.fields["tenant_id"], json!("of the event"));
+        assert_eq!(parsed.fields["name"], json!("request"));
+    }
+
+    #[test]
+    fn the_level_and_the_message_are_read_from_the_line_never_from_its_span() {
+        // The line has a level and no message; the span has fields that
+        // happen to carry the well-known names.
+        let parsed = one(
+            FormatChoice::Auto,
+            r#"{"level":"INFO","time":"14:02:11","span":{"level":"gold","message":"of the span","msg":"x","timestamp":"t"}}"#,
+        );
+        assert_eq!(parsed.level, Some(Level::Info));
+        assert_eq!(parsed.message, "");
+        // What the line has wins, also under the name it was moved to.
+        assert_eq!(parsed.fields["timestamp"], json!("14:02:11"));
+        assert!(!parsed.fields.contains_key("level"));
+        // The rest of the span are fields like any other.
+        assert_eq!(parsed.fields["message"], json!("of the span"));
+        assert_eq!(parsed.fields["msg"], json!("x"));
+    }
+
+    #[test]
+    fn only_the_span_is_opened_and_only_one_level_deep() {
+        let parsed = one(
+            FormatChoice::Auto,
+            r#"{"message":"m","error":{"kind":"io","code":5},"tags":["a","b"],"span":{"name":"request","user":{"id":7},"path":["a","b"]}}"#,
+        );
+        // Any other nested object, and any array, is kept as JSON text.
+        assert_eq!(parsed.fields["error"], json!(r#"{"code":5,"kind":"io"}"#));
+        assert_eq!(parsed.fields["tags"], json!(r#"["a","b"]"#));
+        // Also inside the span.
+        assert_eq!(parsed.fields["name"], json!("request"));
+        assert_eq!(parsed.fields["user"], json!(r#"{"id":7}"#));
+        assert_eq!(parsed.fields["path"], json!(r#"["a","b"]"#));
+        assert!(!parsed.fields.contains_key("span"));
+    }
+
+    #[test]
+    fn a_span_or_spans_that_is_not_what_tracing_writes_stays_a_field() {
+        let parsed = one(
+            FormatChoice::Auto,
+            r#"{"message":"m","span":"2 m","spans":3}"#,
+        );
+        assert_eq!(parsed.fields["span"], json!("2 m"));
+        assert_eq!(parsed.fields["spans"], json!(3));
+
+        // The chain is dropped also when there is no current span beside it.
+        let parsed = one(
+            FormatChoice::Auto,
+            r#"{"message":"m","spans":[{"name":"request"}]}"#,
+        );
+        assert!(parsed.fields.is_empty());
     }
 
     #[test]

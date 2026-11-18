@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 
 use anstyle::{AnsiColor, Style};
 use chrono::{DateTime, Local, Utc};
+use gossip_core::parser::{TARGET_FIELD, TIMESTAMP_FIELD};
 use gossip_core::record::{event_field, value_text};
 use gossip_core::resolver::EXITED;
 use gossip_core::{Kind, Level, Record, Value};
@@ -39,7 +40,9 @@ pub enum Zone {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextOptions {
     pub colour: bool,
-    /// Which fields of a line are shown, in this order; all of them when none.
+    /// Which fields of a line are shown, in this order, and none of them
+    /// for an empty list. Without a list all of them are shown but the
+    /// [`QUIET_FIELDS`], longest last.
     pub fields: Option<Vec<String>>,
     /// Keep pod names whole.
     pub long_names: bool,
@@ -47,6 +50,11 @@ pub struct TextOptions {
     pub emoji: bool,
     pub zone: Zone,
 }
+
+/// The fields that are not shown unless they are asked for by name: the
+/// line's own timestamp, because the time is on the record already, and
+/// where in the code it was logged, which is rarely what one reads for.
+pub const QUIET_FIELDS: [&str; 2] = [TIMESTAMP_FIELD, TARGET_FIELD];
 
 /// Renders records as text, one line per record:
 ///
@@ -207,7 +215,7 @@ impl TextRenderer {
     }
 
     /// The fields to show, as key and value: the ones asked for in the order
-    /// asked, or all of them with the longest last.
+    /// asked, or all of them but the quiet ones, with the longest last.
     fn fields(&self, fields: &BTreeMap<String, Value>) -> Vec<(String, String)> {
         match &self.options.fields {
             Some(wanted) => wanted
@@ -221,6 +229,7 @@ impl TextRenderer {
             None => {
                 let mut all: Vec<(String, String)> = fields
                     .iter()
+                    .filter(|(key, _)| !QUIET_FIELDS.contains(&key.as_str()))
                     .map(|(key, value)| (key.clone(), field_text(value)))
                     .collect();
                 all.sort_by_key(|(key, value)| key.chars().count() + value.chars().count());
@@ -593,7 +602,7 @@ mod tests {
         let record = with_fields(
             line(POD, "api", Some(Level::Info), "done"),
             &[
-                ("target", json!("flowcpt_api::payments")),
+                ("module", json!("flowcpt_api::payments")),
                 ("status", json!(200)),
                 ("ok", json!(true)),
                 ("note", json!("two words")),
@@ -602,7 +611,7 @@ mod tests {
         );
         assert_eq!(
             TextRenderer::new(plain()).render(&record),
-            "14:02:11.482 flowcpt-api-7d9f-xk2p1 api  INFO  ok=true empty=\"\" status=200 note=\"two words\" target=flowcpt_api::payments  done"
+            "14:02:11.482 flowcpt-api-7d9f-xk2p1 api  INFO  ok=true empty=\"\" status=200 note=\"two words\" module=flowcpt_api::payments  done"
         );
 
         let chosen = TextOptions {
@@ -620,6 +629,44 @@ mod tests {
         };
         assert_eq!(
             TextRenderer::new(none).render(&record),
+            "14:02:11.482 flowcpt-api-7d9f-xk2p1 api  INFO  done"
+        );
+    }
+
+    #[test]
+    fn the_timestamp_and_the_target_are_shown_only_when_asked_for_by_name() {
+        let record = with_fields(
+            line(POD, "api", Some(Level::Info), "done"),
+            &[
+                ("timestamp", json!("2026-11-18T14:02:11.482Z")),
+                ("target", json!("flowcpt_api::payments")),
+                ("status", json!(200)),
+            ],
+        );
+        assert_eq!(
+            TextRenderer::new(plain()).render(&record),
+            "14:02:11.482 flowcpt-api-7d9f-xk2p1 api  INFO  status=200  done"
+        );
+
+        let named = TextOptions {
+            fields: Some(vec!["target".into(), "status".into(), "timestamp".into()]),
+            ..plain()
+        };
+        assert_eq!(
+            TextRenderer::new(named).render(&record),
+            "14:02:11.482 flowcpt-api-7d9f-xk2p1 api  INFO  target=flowcpt_api::payments status=200 timestamp=2026-11-18T14:02:11.482Z  done"
+        );
+
+        // A line with nothing but the two is a line with its message only.
+        let record = with_fields(
+            line(POD, "api", Some(Level::Info), "done"),
+            &[
+                ("timestamp", json!("2026-11-18T14:02:11.482Z")),
+                ("target", json!("flowcpt_api::payments")),
+            ],
+        );
+        assert_eq!(
+            TextRenderer::new(plain()).render(&record),
             "14:02:11.482 flowcpt-api-7d9f-xk2p1 api  INFO  done"
         );
     }

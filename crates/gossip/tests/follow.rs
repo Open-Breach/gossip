@@ -275,6 +275,159 @@ async fn the_field_flag_keeps_only_that_tenants_lines() {
     follow.expect_quiet().await;
 }
 
+/// Two lines as `tracing-subscriber`'s JSON formatter writes them when the
+/// span of a request closes: the fields of the span under `span`, the chain
+/// of spans around it under `spans`. The first is a line of the real api.
+const SPAN_LINES: [&str; 2] = [
+    r#"{"timestamp":"2026-11-18T20:39:01.187944Z","level":"INFO","message":"close","time.busy":"5.53ms","time.idle":"36.3ms","target":"flowcpt_telemetry","span":{"http.method":"GET","http.route":"/api/v1/sources","http.status_code":200,"request_id":"32e49c93-4c57-43a0-9439-c554e5fff1f6","tenant_id":"3K6ehNLhnRsPfWhzjugmea","user_id":"auth0|6a86204723ca712d0c11f85a","otel.name":"GET /api/v1/sources"},"spans":[{"http.method":"GET","http.route":"/api/v1/sources","request_id":"32e49c93-4c57-43a0-9439-c554e5fff1f6","tenant_id":"3K6ehNLhnRsPfWhzjugmea"}]}"#,
+    r#"{"timestamp":"2026-11-18T20:39:01.412307Z","level":"WARN","message":"close","time.busy":"1.21ms","time.idle":"9.04ms","target":"flowcpt_telemetry","span":{"http.method":"POST","http.route":"/api/v1/flows","http.status_code":404,"request_id":"9d0e7a55-0b0e-4c0c-8a4f-2f1f3f2b6c11","tenant_id":"8Hq2mVxWc4TzPb7LdYn3Ka","otel.name":"POST /api/v1/flows"},"spans":[{"http.method":"POST","http.route":"/api/v1/flows","request_id":"9d0e7a55-0b0e-4c0c-8a4f-2f1f3f2b6c11","tenant_id":"8Hq2mVxWc4TzPb7LdYn3Ka"}]}"#,
+];
+
+/// One pod with one container that wrote the two lines above.
+fn seed_span_lines(fake: &FakeCluster) {
+    fake.apply(&pods(NS), pod_object(NS, "fc-api-0", &[], None, &["api"]));
+    for (index, line) in SPAN_LINES.iter().enumerate() {
+        fake.log(
+            NS,
+            "fc-api-0",
+            "api",
+            at(1_000 + index as i64 * 1_000),
+            line,
+        );
+    }
+}
+
+/// The fields a request is read by, in the order they are read in.
+const REQUEST_FIELDS: &str =
+    "http.method,http.route,http.status_code,tenant_id,request_id,time.busy";
+
+#[tokio::test]
+async fn the_fields_of_a_tracing_span_are_shown_as_fields_of_the_line() {
+    let fake = FakeCluster::start().await;
+    seed_span_lines(&fake);
+
+    // As it comes: every field of the line and of its span, longest last,
+    // without the timestamp and the target, and no `span` or `spans`.
+    let mut follow = Follow::start(&fake, "span", &["flowcpt", "--no-color"]);
+    assert_eq!(
+        follow.lines(2).await,
+        [
+            "14:00:01.000 fc-api-0 api  INFO  http.method=GET time.busy=5.53ms time.idle=36.3ms http.status_code=200 http.route=/api/v1/sources otel.name=\"GET /api/v1/sources\" tenant_id=3K6ehNLhnRsPfWhzjugmea user_id=auth0|6a86204723ca712d0c11f85a request_id=32e49c93-4c57-43a0-9439-c554e5fff1f6  close",
+            "14:00:02.000 fc-api-0 api  WARN  http.method=POST time.busy=1.21ms time.idle=9.04ms http.status_code=404 http.route=/api/v1/flows otel.name=\"POST /api/v1/flows\" tenant_id=8Hq2mVxWc4TzPb7LdYn3Ka request_id=9d0e7a55-0b0e-4c0c-8a4f-2f1f3f2b6c11  close",
+        ]
+    );
+
+    // With the fields named: method, route, status, tenant, request id,
+    // busy time, then the message.
+    let mut follow = Follow::start(
+        &fake,
+        "span-fields",
+        &["flowcpt", "--no-color", "--fields", REQUEST_FIELDS],
+    );
+    assert_eq!(
+        follow.lines(2).await,
+        [
+            "14:00:01.000 fc-api-0 api  INFO  http.method=GET http.route=/api/v1/sources http.status_code=200 tenant_id=3K6ehNLhnRsPfWhzjugmea request_id=32e49c93-4c57-43a0-9439-c554e5fff1f6 time.busy=5.53ms  close",
+            "14:00:02.000 fc-api-0 api  WARN  http.method=POST http.route=/api/v1/flows http.status_code=404 tenant_id=8Hq2mVxWc4TzPb7LdYn3Ka request_id=9d0e7a55-0b0e-4c0c-8a4f-2f1f3f2b6c11 time.busy=1.21ms  close",
+        ]
+    );
+
+    // The timestamp and the target are there for whoever names them.
+    let mut follow = Follow::start(
+        &fake,
+        "span-quiet",
+        &[
+            "flowcpt",
+            "--no-color",
+            "--tail",
+            "1",
+            "--fields",
+            "target,timestamp",
+        ],
+    );
+    assert_eq!(
+        follow.line().await,
+        "14:00:02.000 fc-api-0 api  WARN  target=flowcpt_telemetry timestamp=2026-11-18T20:39:01.412307Z  close"
+    );
+}
+
+#[tokio::test]
+async fn the_field_flag_sees_the_fields_of_a_tracing_span() {
+    let fake = FakeCluster::start().await;
+    seed_span_lines(&fake);
+
+    let mut follow = Follow::start(
+        &fake,
+        "span-tenant",
+        &[
+            "flowcpt",
+            "--no-color",
+            "--fields",
+            "http.route",
+            "--field",
+            "tenant_id=3K6ehNLhnRsPfWhzjugmea",
+        ],
+    );
+    assert_eq!(
+        follow.line().await,
+        "14:00:01.000 fc-api-0 api  INFO  http.route=/api/v1/sources  close"
+    );
+    follow.expect_quiet().await;
+
+    // Also one with a dot in its name and a number as its value.
+    let mut follow = Follow::start(
+        &fake,
+        "span-status",
+        &[
+            "flowcpt",
+            "--no-color",
+            "--fields",
+            "http.route",
+            "--field",
+            "http.status_code=404",
+        ],
+    );
+    assert_eq!(
+        follow.line().await,
+        "14:00:02.000 fc-api-0 api  WARN  http.route=/api/v1/flows  close"
+    );
+    follow.expect_quiet().await;
+}
+
+#[tokio::test]
+async fn a_tracing_span_as_json_is_flat_and_raw_is_the_line_as_it_came() {
+    let fake = FakeCluster::start().await;
+    seed_span_lines(&fake);
+
+    let mut follow = Follow::start(
+        &fake,
+        "span-json",
+        &["flowcpt", "--output", "json", "--tail", "1"],
+    );
+    let record: serde_json::Value = serde_json::from_str(&follow.line().await).unwrap();
+    // Every field, the timestamp and the target too: hiding them is a matter
+    // of the text output only.
+    assert_eq!(
+        record["fields"],
+        serde_json::json!({
+            "http.method": "POST",
+            "http.route": "/api/v1/flows",
+            "http.status_code": 404,
+            "otel.name": "POST /api/v1/flows",
+            "request_id": "9d0e7a55-0b0e-4c0c-8a4f-2f1f3f2b6c11",
+            "target": "flowcpt_telemetry",
+            "tenant_id": "8Hq2mVxWc4TzPb7LdYn3Ka",
+            "time.busy": "1.21ms",
+            "time.idle": "9.04ms",
+            "timestamp": "2026-11-18T20:39:01.412307Z"
+        })
+    );
+    assert_eq!(record["raw"], SPAN_LINES[1]);
+
+    let mut follow = Follow::start(&fake, "span-raw", &["flowcpt", "--raw"]);
+    assert_eq!(follow.lines(2).await, SPAN_LINES);
+}
+
 #[tokio::test]
 async fn the_level_flag_hides_info_lines_and_keeps_lines_with_no_level() {
     let fake = FakeCluster::start().await;
@@ -691,6 +844,10 @@ filter = { all = [
 [templates.plain]
 targets = ["flowcpt"]
 fields = []
+
+[templates.requests]
+targets = ["flowcpt"]
+fields = ["http.method", "http.route", "http.status_code", "tenant_id", "request_id", "time.busy"]
 "#;
 
 #[tokio::test]
@@ -734,6 +891,62 @@ async fn a_template_behaves_as_the_flags_spelt_out_in_it() {
         "14:00:02.000 redis-0 api  WARN  request_id=8b1d  payment intent expired"
     );
     assert_eq!(from_template, from_flags);
+}
+
+#[tokio::test]
+async fn the_fields_of_a_template_are_the_fields_shown_in_that_order() {
+    let fake = FakeCluster::start().await;
+    seed_span_lines(&fake);
+
+    let mut follow = Follow::start_with_config(
+        &fake,
+        "template-fields",
+        TEMPLATES,
+        &["--template", "requests", "--no-color"],
+    );
+    assert_eq!(
+        follow.lines(2).await,
+        [
+            "14:00:01.000 fc-api-0 api  INFO  http.method=GET http.route=/api/v1/sources http.status_code=200 tenant_id=3K6ehNLhnRsPfWhzjugmea request_id=32e49c93-4c57-43a0-9439-c554e5fff1f6 time.busy=5.53ms  close",
+            "14:00:02.000 fc-api-0 api  WARN  http.method=POST http.route=/api/v1/flows http.status_code=404 tenant_id=8Hq2mVxWc4TzPb7LdYn3Ka request_id=9d0e7a55-0b0e-4c0c-8a4f-2f1f3f2b6c11 time.busy=1.21ms  close",
+        ]
+    );
+
+    // An empty list is the message only.
+    let mut follow = Follow::start_with_config(
+        &fake,
+        "template-no-fields",
+        TEMPLATES,
+        &["--template", "plain", "--no-color"],
+    );
+    assert_eq!(
+        follow.lines(2).await,
+        [
+            "14:00:01.000 fc-api-0 api  INFO  close",
+            "14:00:02.000 fc-api-0 api  WARN  close",
+        ]
+    );
+
+    // And --fields beside a template takes the place of its list.
+    let mut follow = Follow::start_with_config(
+        &fake,
+        "template-fields-flag",
+        TEMPLATES,
+        &[
+            "--template",
+            "requests",
+            "--no-color",
+            "--fields",
+            "time.idle",
+        ],
+    );
+    assert_eq!(
+        follow.lines(2).await,
+        [
+            "14:00:01.000 fc-api-0 api  INFO  time.idle=36.3ms  close",
+            "14:00:02.000 fc-api-0 api  WARN  time.idle=9.04ms  close",
+        ]
+    );
 }
 
 #[tokio::test]

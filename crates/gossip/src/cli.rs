@@ -128,7 +128,8 @@ pub struct FollowArgs {
     #[arg(long)]
     pub no_color: bool,
 
-    /// Show only these fields of a line, in this order: a,b,c.
+    /// Show only these fields of a line, in this order: a,b,c. Without it
+    /// all of them, longest last, but `timestamp` and `target`.
     #[arg(long, value_name = "KEYS", value_delimiter = ',')]
     pub fields: Option<Vec<String>>,
 
