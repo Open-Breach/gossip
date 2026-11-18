@@ -395,6 +395,24 @@ async fn the_field_flag_sees_the_fields_of_a_tracing_span() {
         "14:00:02.000 fc-api-0 api  WARN  http.route=/api/v1/flows  close"
     );
     follow.expect_quiet().await;
+
+    // A field that is hidden by default is hidden from the eye only: a
+    // filter sees it.
+    let mut follow = Follow::start(
+        &fake,
+        "span-hidden",
+        &[
+            "flowcpt",
+            "--no-color",
+            "--field",
+            "otel.name=POST /api/v1/flows",
+        ],
+    );
+    assert_eq!(
+        follow.line().await,
+        "14:00:02.000 fc-api-0 api  WARN  http.method=POST http.route=/api/v1/flows http.status_code=404 tenant_id=8Hq2mVxWc4TzPb7LdYn3Ka request_id=9d0e7a55-0b0e-4c0c-8a4f-2f1f3f2b6c11 time.busy=1.21ms  close"
+    );
+    follow.expect_quiet().await;
 }
 
 /// What `tracing-subscriber` writes for a line logged in a span inside the
