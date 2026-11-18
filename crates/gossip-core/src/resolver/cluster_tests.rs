@@ -37,6 +37,7 @@ fn short(event: &ResolverEvent) -> String {
         ResolverEvent::Container(ContainerEvent::Removed { id }) => {
             format!("-{}/{}", id.pod, id.container)
         }
+        ResolverEvent::Cluster(event) => format!("event {}: {}", event.reason, event.message),
         ResolverEvent::Notice(notice) => notice.message.clone(),
     }
 }
@@ -109,7 +110,12 @@ fn seed(fake: &FakeCluster) {
 async fn a_deployment_is_followed_through_a_rollout() {
     let fake = FakeCluster::start().await;
     seed(&fake);
-    let mut resolver = Resolver::start(&fake.cluster(), vec![target("flowcpt/flowcpt-api")], None);
+    let mut resolver = Resolver::start(
+        &fake.cluster(),
+        vec![target("flowcpt/flowcpt-api")],
+        None,
+        None,
+    );
 
     expect(
         &mut resolver,
@@ -207,7 +213,12 @@ async fn a_target_that_matches_nothing_says_so_and_keeps_watching() {
             Some(owner("Deployment", "flowcpt-api")),
         ),
     );
-    let mut resolver = Resolver::start(&fake.cluster(), vec![target("flowcpt/flowcpt-api")], None);
+    let mut resolver = Resolver::start(
+        &fake.cluster(),
+        vec![target("flowcpt/flowcpt-api")],
+        None,
+        None,
+    );
     expect(
         &mut resolver,
         &["target flowcpt/flowcpt-api matches nothing yet; still watching"],
@@ -240,7 +251,12 @@ async fn a_bare_namespace_follows_every_pod_and_the_container_option_narrows_it(
     let fake = FakeCluster::start().await;
     seed(&fake);
     let containers = Pattern::new("{api,redis}").unwrap();
-    let mut resolver = Resolver::start(&fake.cluster(), vec![target("flowcpt")], Some(containers));
+    let mut resolver = Resolver::start(
+        &fake.cluster(),
+        vec![target("flowcpt")],
+        Some(containers),
+        None,
+    );
     expect(
         &mut resolver,
         &[
@@ -278,7 +294,7 @@ async fn a_namespace_glob_follows_the_namespaces_it_matches_as_they_come() {
             pod_object(name, &format!("{name}-pod"), &[], None, &["main"]),
         );
     }
-    let mut resolver = Resolver::start(&fake.cluster(), vec![target("flowcpt*")], None);
+    let mut resolver = Resolver::start(&fake.cluster(), vec![target("flowcpt*")], None, None);
     expect(
         &mut resolver,
         &["+flowcpt-pod/main!", "+flowcpt-stg-pod/main!"],
@@ -303,7 +319,7 @@ async fn a_namespace_glob_follows_the_namespaces_it_matches_as_they_come() {
 async fn a_namespace_glob_that_matches_no_namespace_says_so() {
     let fake = FakeCluster::start().await;
     fake.apply(&namespaces(), namespace_object("monitoring"));
-    let mut resolver = Resolver::start(&fake.cluster(), vec![target("flowcpt*/api")], None);
+    let mut resolver = Resolver::start(&fake.cluster(), vec![target("flowcpt*/api")], None, None);
     expect(
         &mut resolver,
         &["target flowcpt*/api matches nothing yet; still watching"],
@@ -318,6 +334,7 @@ async fn every_run_of_a_cron_job_is_picked_up() {
     let mut resolver = Resolver::start(
         &fake.cluster(),
         vec![target("flowcpt/cronjob:nightly-sync")],
+        None,
         None,
     );
     expect(
@@ -353,7 +370,7 @@ async fn a_watch_that_is_refused_is_noticed_and_the_rest_goes_on() {
     let fake = FakeCluster::start().await;
     seed(&fake);
     fake.forbid(&cron_jobs(NS));
-    let mut resolver = Resolver::start(&fake.cluster(), vec![target("flowcpt/redis")], None);
+    let mut resolver = Resolver::start(&fake.cluster(), vec![target("flowcpt/redis")], None, None);
     expect(
         &mut resolver,
         &[
@@ -369,7 +386,7 @@ async fn a_watch_that_is_refused_is_noticed_and_the_rest_goes_on() {
 async fn dropping_the_resolver_stops_its_watches() {
     let fake = FakeCluster::start().await;
     seed(&fake);
-    let mut resolver = Resolver::start(&fake.cluster(), vec![target("flowcpt")], None);
+    let mut resolver = Resolver::start(&fake.cluster(), vec![target("flowcpt")], None, None);
     expect(
         &mut resolver,
         &[

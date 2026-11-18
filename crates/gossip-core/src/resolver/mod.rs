@@ -20,10 +20,12 @@ use std::fmt::Debug;
 use std::pin::{Pin, pin};
 use std::task::{Context, Poll};
 
+use chrono::{DateTime, Utc};
 use futures::{Stream, StreamExt};
 use k8s_openapi::api::apps::v1::{DaemonSet, Deployment, ReplicaSet, StatefulSet};
 use k8s_openapi::api::batch::v1::{CronJob, Job};
 use k8s_openapi::api::core::v1::{Namespace, Pod};
+use k8s_openapi::api::events::v1::Event as KubeEvent;
 use kube::api::Api;
 use kube::runtime::WatchStreamExt;
 use kube::runtime::watcher::{self, Event, watcher};
@@ -33,9 +35,10 @@ use tokio::sync::mpsc;
 use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 
 pub use self::model::{
-    ContainerRole, ContainerState, ContainerView, OwnerKind, OwnerRef, PodView, WorkloadView,
+    ContainerRole, ContainerState, ContainerView, EventView, Exit, OwnerKind, OwnerRef, PodView,
+    WorkloadView,
 };
-pub use self::state::{ContainerEvent, ContainerId};
+pub use self::state::{ClusterEvent, ContainerEvent, ContainerId, EXITED};
 use self::state::{Input, NamespaceState, Output, WatchSpec};
 use crate::cluster::Cluster;
 use crate::error::describe;
@@ -56,6 +59,8 @@ pub struct Notice {
 pub enum ResolverEvent {
     /// A container to follow, a new state of one, or one that is gone.
     Container(ContainerEvent),
+    /// A cluster event about a followed pod or a workload above it.
+    Cluster(ClusterEvent),
     Notice(Notice),
 }
 
@@ -69,11 +74,17 @@ pub struct Resolver {
 
 impl Resolver {
     /// Starts resolving the targets against a cluster. `containers` keeps
-    /// only the containers whose name matches. Must be called inside a
-    /// tokio runtime.
-    pub fn start(cluster: &Cluster, targets: Vec<Target>, containers: Option<Pattern>) -> Resolver {
+    /// only the containers whose name matches. With `events_since`, the
+    /// cluster events about what is followed are reported too, from that
+    /// time on. Must be called inside a tokio runtime.
+    pub fn start(
+        cluster: &Cluster,
+        targets: Vec<Target>,
+        containers: Option<Pattern>,
+        events_since: Option<DateTime<Utc>>,
+    ) -> Resolver {
         let (tx, events) = mpsc::channel(256);
-        let task = tokio::spawn(run(cluster.client(), targets, containers, tx));
+        let task = tokio::spawn(run(cluster.client(), targets, containers, events_since, tx));
         Resolver { events, task }
     }
 
@@ -164,6 +175,7 @@ async fn run(
     client: Client,
     targets: Vec<Target>,
     containers: Option<Pattern>,
+    events_since: Option<DateTime<Utc>>,
     tx: mpsc::Sender<ResolverEvent>,
 ) {
     let (control_tx, mut control_rx) = mpsc::channel::<Control>(64);
@@ -187,12 +199,17 @@ async fn run(
             .filter(|(_, target)| target.namespace.matches(namespace))
             .map(|(index, target)| (index, target.clone()))
             .collect();
-        tasks.spawn(run_namespace(
-            client.clone(),
-            namespace.to_string(),
+        let state = NamespaceState::new(
+            namespace,
             matching,
             containers.clone(),
             initial,
+            events_since,
+        );
+        tasks.spawn(run_namespace(
+            client.clone(),
+            namespace.to_string(),
+            state,
             tx.clone(),
             control_tx.clone(),
         ))
@@ -297,16 +314,13 @@ async fn watch_namespaces(client: Client, control: mpsc::Sender<Control>) {
 async fn run_namespace(
     client: Client,
     namespace: String,
-    targets: Vec<(usize, Target)>,
-    containers: Option<Pattern>,
-    initial: bool,
+    (mut state, mut outputs): (NamespaceState, Vec<Output>),
     tx: mpsc::Sender<ResolverEvent>,
     control: mpsc::Sender<Control>,
 ) {
     let (input_tx, mut input_rx) = mpsc::channel::<Input>(256);
     let mut tasks = JoinSet::new();
     let mut watches: HashMap<WatchSpec, AbortHandle> = HashMap::new();
-    let (mut state, mut outputs) = NamespaceState::new(&namespace, targets, containers, initial);
 
     loop {
         for output in outputs.drain(..) {
@@ -335,6 +349,7 @@ async fn run_namespace(
                     continue;
                 }
                 Output::Container(event) => ResolverEvent::Container(event),
+                Output::Cluster(event) => ResolverEvent::Cluster(event),
                 Output::Notice { pod, message } => ResolverEvent::Notice(Notice {
                     namespace: namespace.clone(),
                     pod,
@@ -382,6 +397,13 @@ fn spawn_watch(
                 tx,
             ))
         }
+        WatchSpec::Events => tasks.spawn(watch::<KubeEvent, EventView>(
+            api(client, namespace),
+            watcher::Config::default(),
+            spec,
+            Input::Cluster,
+            tx,
+        )),
         WatchSpec::Owners { kind, name } => {
             let config = match name {
                 Some(name) => watcher::Config::default().fields(&format!("metadata.name={name}")),

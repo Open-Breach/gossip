@@ -782,6 +782,7 @@ mod tests {
             restart_count,
             state,
             has_previous: restart_count > 0,
+            last_exit: None,
         };
         let running = ContainerState::Running { started_at: None };
         let crash_loop = ContainerState::Waiting {

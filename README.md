@@ -11,12 +11,12 @@ plans.
 
 Two commands work against a cluster: `gossip list` shows what is in it, and
 `gossip follow` follows the logs of a set of targets across restarts and
-rollouts. Cluster events in the stream and templates from a config file are
-not built yet.
+rollouts, with the cluster's own events about those pods in the same stream.
+Templates from a config file are not built yet.
 
 | Crate | Kind | Holds today |
 | --- | --- | --- |
-| `crates/gossip-core` | library | cluster access, discovery, target resolution, log streams with reconnection, the session that merges them, the line parser, filters; and, not yet used by the command line, the config file |
+| `crates/gossip-core` | library | cluster access, discovery, target resolution, log streams with reconnection, cluster events, the session that merges them, the line parser, filters; and, not yet used by the command line, the config file |
 | `crates/gossip` | binary `gossip` | `gossip list`, `gossip follow` |
 
 Gossip is a client only: it reads from the cluster and never creates, changes
@@ -61,14 +61,15 @@ gossip follow flowcpt/flowcpt-api
 
 ```
 14:02:11.482 7d9f-xk2p1 api  WARN  request_id=8b1c tenant_id=t_123  payment intent expired
+14:02:11.490 7d9f-xk2p1 💀         Killing: Container api failed liveness probe, will be restarted
 14:02:12.007 7d9f-m4q8z api  INFO  request_id=8b1d tenant_id=t_456  request done
-14:02:13.650 -- pod flowcpt-api-7d9f-xk2p1 went away
-14:02:14.120 -- pod flowcpt-api-7d9f-q9w2x appeared; following api
-14:02:14.903 7d9f-q9w2x api  INFO  version=0.14.2  starting
+14:02:13.004 7d9f-xk2p1 🚀         Started: Started container api
+14:02:13.210 7d9f-xk2p1 api  INFO  version=0.14.2  starting
 ```
 
 Follow prints the last lines of every container the targets select, then new
-lines as they arrive, merged into one stream ordered by time. It keeps going
+lines as they arrive, merged with the cluster's events about those pods into
+one stream ordered by time. It keeps going
 when a pod restarts, is replaced or is rolled out: a new pod is picked up
 without any action, and a stream that breaks is opened again from the last
 line seen, so that no line is lost and none is printed twice. Stop it with
@@ -99,6 +100,7 @@ Gossip keeps watching until something matches.
 | `--context <name>` | the kubeconfig context of the cluster | the current context |
 | `--since <duration>` | history per container at start: `30s`, `5m`, `1h` | none |
 | `--tail <n>` | last n lines per container at start | 20, unless `--since` is given |
+| `--no-events` | leave the cluster's events out | events on |
 | `--container <glob>` | only containers whose name matches | all |
 | `--level <level>` | only lines at this level or above: `trace`, `debug`, `info`, `warn`, `error` | all |
 | `--grep <text>` | only lines whose message contains the text | none |
@@ -106,12 +108,14 @@ Gossip keeps watching until something matches.
 | `--field <key=value>` | only lines whose field has the value; repeatable | none |
 | `--fields <a,b,c>` | show only these fields of a line, in this order | all, longest last |
 | `--long-names` | keep pod names whole | shortened when every pod is a deployment's |
+| `--no-emoji` | mark events with `EVNT` instead of an emoji | emoji when stdout is a terminal and the locale is UTF-8 |
 | `--output text\|json` | the rendering | `text` |
 | `--raw` | print the raw line, with no prefix, parsing or colour | off |
 | `--no-color` | no colours | colours when stdout is a terminal |
 
-The filter flags combine with "and". A line that has no level does not pass
-`--level`.
+The filter flags combine with "and", and they are about lines: events pass
+them, and `--no-events` is what leaves events out. A line that has no level
+does not pass `--level`.
 
 #### Lines
 
@@ -127,6 +131,29 @@ The format of every line is detected on its own:
 - A line that starts with whitespace, with `at ` or with `Caused by:` joins
   the line before it, so that a stack trace is one record.
 
+#### Events
+
+The cluster's events about the followed pods, and about the workloads above
+them (replica set, deployment, stateful set, daemon set, job, cron job), are
+merged into the stream at the time they happened. An event carries an emoji in
+place of the container, one per reason:
+
+| Emoji | Reasons |
+| --- | --- |
+| 📍 | `Scheduled` |
+| 📦 | `Pulling`, `Pulled` |
+| 🚀 | `Started` |
+| 💀 | `Killing`, and `Exited`: a container that ended with an exit code other than zero |
+| 🔥 | `BackOff`: a crash loop or an image pull back-off |
+| ⚠️ | `Unhealthy` and every other warning |
+| 🧹 | `Evicted`, `Preempted` |
+| ℹ️ | any other reason |
+
+Normal events are dimmed and warnings take the warning colour. Kubernetes has
+no event for a container that exits, so Gossip makes `Exited` itself from what
+the pod reports. Events from before Gossip started are left out, unless
+`--since` reaches back to them.
+
 #### Output
 
 The text output is one line per record: the time in the local zone, the pod
@@ -135,7 +162,8 @@ Lines of the run before the current one are dimmed. Notices from Gossip itself
 (a pod appeared or went away, a stream was reopened, a target matches nothing)
 start with `--`.
 
-`--output json` prints one record per line as JSON, for `jq`:
+`--output json` prints one record per line as JSON, for `jq`. An event is a
+record of kind `event` with its `reason`, `type` and `count` among the fields:
 
 ```bash
 gossip follow flowcpt/flowcpt-api --output json | jq 'select(.level == "error") | .message'

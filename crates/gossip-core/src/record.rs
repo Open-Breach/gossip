@@ -75,6 +75,18 @@ impl Record {
     }
 }
 
+/// The keys of the fields a record of kind `event` carries.
+pub mod event_field {
+    /// Why it happened, in one word: `Scheduled`, `Killing`, `BackOff`, ...
+    pub const REASON: &str = "reason";
+    /// `Normal` or `Warning`.
+    pub const TYPE: &str = "type";
+    /// How often it has happened.
+    pub const COUNT: &str = "count";
+    /// The object it is about, as kind and name: `Deployment/flowcpt-api`.
+    pub const REGARDING: &str = "regarding";
+}
+
 /// The text of a field value, as filters compare it and as it is shown:
 /// a string without its quotes, anything else as JSON writes it.
 pub fn value_text(value: &Value) -> Cow<'_, str> {

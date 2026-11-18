@@ -44,7 +44,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
     cluster.check().await?;
     println!("-- resolving against the cluster {}", cluster.name());
 
-    let mut resolver = Resolver::start(&cluster, targets, containers);
+    let mut resolver = Resolver::start(&cluster, targets, containers, None);
     while let Some(event) = resolver.next().await {
         match event {
             ResolverEvent::Container(ContainerEvent::Added { id, view, initial }) => println!(
@@ -62,6 +62,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
             ),
             ResolverEvent::Container(ContainerEvent::Removed { id }) => {
                 println!("- {}/{}/{}", id.namespace, id.pod, id.container);
+            }
+            ResolverEvent::Cluster(event) => {
+                println!("! {} {}: {}", event.regarding, event.reason, event.message);
             }
             ResolverEvent::Notice(notice) => println!("-- {}", notice.message),
         }

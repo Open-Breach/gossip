@@ -53,6 +53,6 @@ pub use error::Error;
 pub use filter::{Field, Filter, FilterError, Op, Rule};
 pub use parser::{FormatChoice, LineParser, ParsedLine};
 pub use record::{Format, Kind, Level, Record, Value};
-pub use resolver::{ContainerEvent, ContainerId, Resolver, ResolverEvent};
+pub use resolver::{ClusterEvent, ContainerEvent, ContainerId, Resolver, ResolverEvent};
 pub use session::{Session, SessionOptions};
 pub use target::{Pattern, Target, TargetError, WorkloadKind, WorkloadSelector};

@@ -5,7 +5,8 @@ use std::collections::BTreeMap;
 
 use anstyle::{AnsiColor, Style};
 use chrono::{DateTime, Local, Utc};
-use gossip_core::record::value_text;
+use gossip_core::record::{event_field, value_text};
+use gossip_core::resolver::EXITED;
 use gossip_core::{Kind, Level, Record, Value};
 
 /// The colours a pod prefix can take. Red and yellow are left to the levels.
@@ -42,6 +43,8 @@ pub struct TextOptions {
     pub fields: Option<Vec<String>>,
     /// Keep pod names whole.
     pub long_names: bool,
+    /// Mark events with an emoji per reason; with `EVNT` otherwise.
+    pub emoji: bool,
     pub zone: Zone,
 }
 
@@ -80,6 +83,10 @@ impl TextRenderer {
         if record.kind == Kind::Notice {
             let quiet = Style::new().dimmed();
             return self.paint(quiet, &format!("{time} -- {}", record.message));
+        }
+
+        if record.kind == Kind::Event {
+            return self.render_event(record, &time);
         }
 
         let pod = self.pod_name(&record.pod);
@@ -128,6 +135,52 @@ impl TextRenderer {
             self.paint(dim, cut),
         );
         line.trim_end().to_string()
+    }
+
+    /// An event: a mark in place of the container, then reason and message.
+    ///
+    /// ```text
+    /// 14:02:11.490 flowcpt-api-7d9f-xk2p1 💀         Killing: Container api failed liveness probe
+    /// ```
+    fn render_event(&mut self, record: &Record, time: &str) -> String {
+        let field = |key: &str| record.fields.get(key).map(value_text).unwrap_or_default();
+        let reason = field(event_field::REASON);
+        let warning = record.level == Some(Level::Warn);
+
+        // An event about a workload has no pod; it is shown under what it
+        // is about, as in `deployment/flowcpt-api`.
+        let subject = if record.pod.is_empty() {
+            let regarding = field(event_field::REGARDING);
+            match regarding.split_once('/') {
+                Some((kind, name)) => format!("{}/{name}", kind.to_lowercase()),
+                None => regarding.into_owned(),
+            }
+        } else {
+            self.pod_name(&record.pod)
+        };
+        self.pod_width = self.pod_width.max(subject.chars().count());
+
+        // An emoji is two cells wide in most terminals.
+        let (mark, mark_width) = if self.options.emoji {
+            (event_emoji(&reason, warning), 2)
+        } else {
+            ("EVNT", 4)
+        };
+        self.container_width = self.container_width.max(mark_width);
+        let line = format!(
+            "{time} {subject:<pod_width$} {mark}{padding}  {level} {reason}: {message}",
+            pod_width = self.pod_width,
+            padding = " ".repeat(self.container_width - mark_width),
+            level = " ".repeat(5),
+            message = record.message,
+        );
+        // Normal events are dimmed; warnings take the warning colour.
+        let style = if warning {
+            level_style(Some(Level::Warn))
+        } else {
+            Style::new().dimmed()
+        };
+        self.paint(style, &line)
     }
 
     fn time(&self, time: DateTime<Utc>) -> String {
@@ -182,6 +235,25 @@ impl TextRenderer {
         } else {
             text.to_string()
         }
+    }
+}
+
+/// The emoji of an event, one per reason, so that the eye reads the life of
+/// a pod without reading words.
+fn event_emoji(reason: &str, warning: bool) -> &'static str {
+    match reason {
+        "Scheduled" => "📍",
+        "Pulling" | "Pulled" => "📦",
+        "Started" => "🚀",
+        // `Exited` is the end of a run with an exit code other than zero.
+        "Killing" => "💀",
+        reason if reason == EXITED => "💀",
+        // A crash loop and an image pull back-off.
+        "BackOff" => "🔥",
+        "Evicted" | "Preempted" => "🧹",
+        // `Unhealthy`, and every other warning.
+        _ if warning => "⚠️",
+        _ => "ℹ️",
     }
 }
 
@@ -266,8 +338,183 @@ mod tests {
             colour: false,
             fields: None,
             long_names: true,
+            emoji: true,
             zone: Zone::Utc,
         }
+    }
+
+    fn event(pod: &str, regarding: &str, reason: &str, warning: bool, message: &str) -> Record {
+        Record {
+            cluster: "aks-vulcan-01".into(),
+            namespace: "flowcpt".into(),
+            pod: pod.into(),
+            container: None,
+            time: Utc.with_ymd_and_hms(2026, 11, 18, 14, 2, 11).unwrap()
+                + chrono::TimeDelta::milliseconds(490),
+            kind: Kind::Event,
+            format: Format::Text,
+            level: Some(if warning { Level::Warn } else { Level::Info }),
+            message: message.into(),
+            fields: BTreeMap::from([
+                ("reason".to_string(), json!(reason)),
+                (
+                    "type".to_string(),
+                    json!(if warning { "Warning" } else { "Normal" }),
+                ),
+                ("count".to_string(), json!(1)),
+                ("regarding".to_string(), json!(regarding)),
+            ]),
+            raw: format!("{reason}: {message}"),
+            previous: false,
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn an_event_carries_an_emoji_in_place_of_the_container() {
+        let mut renderer = TextRenderer::new(plain());
+        // The four lines of the example of the spec, section 5.3.
+        let warn = with_fields(
+            line(POD, "api", Some(Level::Warn), "payment intent expired"),
+            &[("tenant_id", json!("t_123"))],
+        );
+        let killing = event(
+            POD,
+            &format!("Pod/{POD}"),
+            "Killing",
+            false,
+            "Container api failed liveness probe, will be restarted",
+        );
+        let started = event(
+            POD,
+            &format!("Pod/{POD}"),
+            "Started",
+            false,
+            "Started container api",
+        );
+        let info = line(
+            POD,
+            "api",
+            Some(Level::Info),
+            "starting  version=0.14.2 environment=staging",
+        );
+        let lines = [
+            renderer.render(&warn),
+            renderer.render(&killing),
+            renderer.render(&started),
+            renderer.render(&info),
+        ];
+        assert_eq!(
+            lines,
+            [
+                "14:02:11.482 flowcpt-api-7d9f-xk2p1 api  WARN  tenant_id=t_123  payment intent expired",
+                "14:02:11.490 flowcpt-api-7d9f-xk2p1 💀         Killing: Container api failed liveness probe, will be restarted",
+                "14:02:11.490 flowcpt-api-7d9f-xk2p1 🚀         Started: Started container api",
+                "14:02:11.482 flowcpt-api-7d9f-xk2p1 api  INFO  starting  version=0.14.2 environment=staging",
+            ]
+        );
+    }
+
+    #[test]
+    fn without_emoji_an_event_is_marked_evnt_in_the_same_column() {
+        let mut renderer = TextRenderer::new(TextOptions {
+            emoji: false,
+            ..plain()
+        });
+        let killing = event(
+            POD,
+            &format!("Pod/{POD}"),
+            "Killing",
+            false,
+            "Stopping container api",
+        );
+        assert_eq!(
+            renderer.render(&killing),
+            "14:02:11.490 flowcpt-api-7d9f-xk2p1 EVNT        Killing: Stopping container api"
+        );
+        // The column is four wide from here on, so the lines stay aligned.
+        assert_eq!(
+            renderer.render(&line(POD, "api", Some(Level::Info), "ready")),
+            "14:02:11.482 flowcpt-api-7d9f-xk2p1 api   INFO  ready"
+        );
+    }
+
+    #[test]
+    fn the_emoji_of_every_reason() {
+        for (reason, warning, emoji) in [
+            ("Scheduled", false, "📍"),
+            ("Pulling", false, "📦"),
+            ("Pulled", false, "📦"),
+            ("Started", false, "🚀"),
+            ("Killing", false, "💀"),
+            ("Exited", true, "💀"),
+            ("BackOff", true, "🔥"),
+            ("Unhealthy", true, "⚠️"),
+            ("FailedScheduling", true, "⚠️"),
+            ("Evicted", true, "🧹"),
+            ("Preempted", false, "🧹"),
+            ("Created", false, "ℹ️"),
+            ("ScalingReplicaSet", false, "ℹ️"),
+        ] {
+            assert_eq!(event_emoji(reason, warning), emoji, "{reason}");
+        }
+    }
+
+    #[test]
+    fn an_event_about_a_workload_is_shown_under_what_it_is_about() {
+        let scaled = event(
+            "",
+            "Deployment/flowcpt-api",
+            "ScalingReplicaSet",
+            false,
+            "Scaled up replica set flowcpt-api-7d9f to 2",
+        );
+        assert_eq!(
+            TextRenderer::new(plain()).render(&scaled),
+            "14:02:11.490 deployment/flowcpt-api ℹ️        ScalingReplicaSet: Scaled up replica set flowcpt-api-7d9f to 2"
+        );
+        // It does not stop pod names from being shortened.
+        let mut renderer = TextRenderer::new(TextOptions {
+            long_names: false,
+            ..plain()
+        });
+        renderer.render(&scaled);
+        assert!(
+            renderer
+                .render(&line(POD, "api", None, "x"))
+                .contains(" 7d9f-xk2p1 "),
+        );
+    }
+
+    #[test]
+    fn normal_events_are_dimmed_and_warnings_take_the_warning_colour() {
+        let coloured = TextOptions {
+            colour: true,
+            ..plain()
+        };
+        let started = event(
+            POD,
+            &format!("Pod/{POD}"),
+            "Started",
+            false,
+            "Started container api",
+        );
+        let dim = Style::new().dimmed();
+        let text = TextRenderer::new(coloured.clone()).render(&started);
+        assert!(text.starts_with(&dim.render().to_string()), "{text:?}");
+        assert!(text.ends_with(&dim.render_reset().to_string()), "{text:?}");
+
+        let back_off = event(
+            POD,
+            &format!("Pod/{POD}"),
+            "BackOff",
+            true,
+            "Back-off restarting failed container",
+        );
+        let yellow = Style::new().fg_color(Some(AnsiColor::Yellow.into()));
+        let text = TextRenderer::new(coloured).render(&back_off);
+        assert!(text.starts_with(&yellow.render().to_string()), "{text:?}");
+        assert!(text.contains("🔥"), "{text:?}");
     }
 
     fn line(pod: &str, container: &str, level: Option<Level>, message: &str) -> Record {
