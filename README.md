@@ -14,8 +14,36 @@ not built yet.
 
 | Crate | Kind | Holds today |
 | --- | --- | --- |
-| `crates/gossip-core` | library | cluster access and discovery; and, not yet used by the command line, targets, records, the line parser, filters and the config file |
+| `crates/gossip-core` | library | cluster access and discovery, and live target resolution; and, not yet used by the command line, records, the line parser, filters and the config file |
 | `crates/gossip` | binary `gossip` | `gossip list` |
+
+Target resolution is in the core and has no command yet. A target is a path
+`namespace[/workload[/pod[/container]]]` whose names may be globs; the core
+turns a set of targets into the containers to follow and keeps that set up to
+date by watching the cluster. An example program shows it at work:
+
+```bash
+cargo run -p gossip-core --example resolve -- flowcpt/flowcpt-api
+```
+
+```
+-- resolving against the cluster aks-vulcan-01
++ flowcpt/flowcpt-api-7d9f-xk2p1/api  running, 0 restarts  (at start)
+-- pod flowcpt-api-5c8b-abcde appeared; following api
++ flowcpt/flowcpt-api-5c8b-abcde/api  running, 0 restarts
+- flowcpt/flowcpt-api-7d9f-xk2p1/api
+-- pod flowcpt-api-7d9f-xk2p1 went away
+```
+
+| Target | Follows |
+| --- | --- |
+| `flowcpt` or `flowcpt/*` | every pod of the namespace, whatever owns it |
+| `flowcpt/flowcpt-api` | the pods of the workload of that name: a Deployment, StatefulSet, DaemonSet, Job or CronJob |
+| `flowcpt/cronjob:nightly-sync` | the same, of one kind only; the prefixes are `deployment`, `statefulset`, `daemonset`, `job`, `cronjob` |
+| `flowcpt/flowcpt-*` | every workload whose name matches the glob |
+| `flowcpt/-/flowcpt-api-7d9f-xk2p1` | one pod, given directly |
+| `monitoring/prometheus/*/exporter` | one container of every pod of a workload |
+| `flowcpt*` | every namespace whose name matches, also ones created later |
 
 Gossip is a client only: it reads from the cluster and never creates, changes
 or deletes anything in it. It reaches the cluster through the kubeconfig
