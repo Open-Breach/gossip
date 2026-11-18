@@ -41,7 +41,7 @@ Five words carry the whole design. The core library is written in these terms an
 | Filter | A rule `field operator value`, or several joined with `and` / `or`. Applied to records before they are shown. | `level >= WARN and tenant_id == t_123` |
 | Template | A named, saved combination of targets, filters and options in the config file. `gossip follow --template dev-api` runs it. | `dev-api`, `staging-all` |
 
-A target is written as a path: `namespace[/deployment[/pod[/container]]]`. A `*` matches any name at that level; `flowcpt/*` is every deployment of the namespace, `flowcpt` alone means the same. A pod given directly bypasses the deployment level: `flowcpt/-/flowcpt-api-7d9f-xk2p1`.
+A target is written as a path (the second level is any workload, Deployment to CronJob, see 4.3): `namespace[/workload[/pod[/container]]]`. A `*` matches any name at that level; `flowcpt/*` is every deployment of the namespace, `flowcpt` alone means the same. A pod given directly bypasses the deployment level: `flowcpt/-/flowcpt-api-7d9f-xk2p1`.
 
 ## 3. Architecture
 
@@ -89,9 +89,10 @@ The core is an async library on `tokio` and `kube-rs`. Its public surface is sma
 
 ### 4.3 Target resolution
 
-- A target `namespace[/deployment[/pod[/container]]]` with globs resolves to a set of (namespace, pod, container) triples.
-- A deployment resolves through its `spec.selector` to the pods carrying those labels.
-- Resolution is live: the core runs a `kube_runtime::watcher` on pods in every namespace a target names, filtered by the labels when the target is a deployment, and re-matches on every pod event. A new pod that matches gets a stream opened; a pod that is gone gets its stream closed.
+- A target `namespace[/workload[/pod[/container]]]` with globs resolves to a set of (namespace, pod, container) triples.
+- A bare namespace, or `namespace/*`, follows every pod in it, whatever owns them. Deployments are the common case, not the only one.
+- The workload level takes the name of a Deployment, StatefulSet, DaemonSet, Job or CronJob. The name is looked up across those kinds; when two kinds share a name, a prefix picks one: `flowcpt/cronjob:nightly-sync`. A Deployment resolves through its ReplicaSets, a CronJob through its Jobs, the others through their `spec.selector`, to the pods carrying those labels.
+- Resolution is live: the core runs a `kube_runtime::watcher` on pods in every namespace a target names, filtered by the labels when the target is a workload, and re-matches on every pod event. A new pod that matches gets a stream opened; a pod that is gone gets its stream closed. A CronJob's runs are picked up this way, each run a new pod with its lines and its `Completed` event.
 - When a target matches nothing at start, the session says so in a record of kind `notice` and keeps watching; it does not fail.
 
 ### 4.4 Log streams and reconnection
@@ -101,6 +102,7 @@ The core is an async library on `tokio` and `kube-rs`. Its public surface is sma
 - The stream ends when the container ends. The core reopens it when the pod shows a new container start (restart count went up, or a new pod replaced the old one), with `since` set to the time of the last line it saw, so nothing is lost and nothing is repeated.
 - A dropped connection (API server hiccup, laptop sleep) is retried with exponential backoff, 1 s to 30 s, forever. Each retry writes a `notice` record.
 - A container that is still `Waiting` (image pull, crash loop) has no stream; its state comes through as events (4.5) and as a `notice` when it changes.
+- A container whose restart count is above zero at start, or that is `Waiting` in a crash loop, first gets the tail of its previous run (`previous: true`, same `--tail` / `--since`), its records marked `previous` and rendered dimmed, then the current run if there is one. That is the output of the run that crashed, which is what one starts Gossip for; without it one would wait through the back-off to watch it crash again.
 
 ### 4.5 Events
 
@@ -110,8 +112,12 @@ The core is an async library on `tokio` and `kube-rs`. Its public surface is sma
 
 ### 4.6 Line parser
 
-- A line that starts with `{` and parses as a JSON object becomes a record with `fields`: a flat map of its top-level keys. Well-known keys are normalised into the record's own fields: `level` (`level`, `severity`, `lvl`), `message` (`message`, `msg`), `timestamp` (`timestamp`, `ts`, `time`), `target`. The rest stays in `fields` as it came, nested objects as JSON strings. The output of `tracing-subscriber`'s JSON formatter with `flatten_event(true)` is the first format it must handle.
-- Any other line is a record of kind `text` with the raw line as `message`. A level is guessed from a leading `ERROR`, `WARN`, `INFO`, `DEBUG`, `TRACE` token when present.
+- The format is detected per line, not per stream, because even a JSON service prints plain text now and then (a Rust panic, a sidecar, an init container). The recognisers run in this order and the first that accepts the line wins; the record notes which one in `format`.
+- JSON: a line that starts with `{` and parses as a JSON object becomes a record with `fields`: a flat map of its top-level keys. Well-known keys are normalised into the record's own fields: `level` (`level`, `severity`, `lvl`), `message` (`message`, `msg`), `timestamp` (`timestamp`, `ts`, `time`), `target`. The rest stays in `fields` as it came, nested objects as JSON strings. The output of `tracing-subscriber`'s JSON formatter with `flatten_event(true)` is the first format it must handle.
+- logfmt: a line made of `key=value` pairs, values quoted when they hold spaces (`time=2026-11-18T14:02:11Z level=info msg="request done" status=200`), becomes a record with the same `fields` and the same normalisation of the well-known keys. This is what most Go tooling in a cluster writes (ingress controllers, cert-manager, many operators). A line is logfmt only when every token is a pair; one bare word and it is text.
+- Text: any other line is a record of kind `text` with the raw line as `message`. A level is guessed from a leading `ERROR`, `WARN`, `INFO`, `DEBUG`, `TRACE` token when present, also when a timestamp or a bracketed module comes first.
+- Continuation: a line that starts with whitespace, or with `at ` or `Caused by:`, is appended to the previous record of the same container instead of becoming its own (a Rust panic's backtrace, a Java stack trace, a multi-line JSON pretty-print). The record's `message` grows by a newline and the line; its level and fields stay those of the first line. A continuation older than 2 s after the first line, or with no previous record, is text on its own.
+- `format` option, per template or per container (`format = "auto" | "json" | "logfmt" | "text"`, default `auto`): forces one recogniser for streams where detection is wrong, such as a text line that happens to start with `{`. `text` also turns the continuation rule off.
 - Lines longer than 1 MiB are cut and marked.
 
 ### 4.7 Records
@@ -125,7 +131,8 @@ pub struct Record {
     pub pod: String,
     pub container: Option<String>,   // none for events on a deployment
     pub time: DateTime<Utc>,         // kubelet time for lines, event time for events
-    pub kind: Kind,                  // Json, Text, Event, Notice
+    pub kind: Kind,                  // Line, Event, Notice
+    pub format: Format,              // Json, Logfmt, Text; Text for events and notices
     pub level: Option<Level>,        // Trace..Error; events map Warning to Warn
     pub message: String,
     pub fields: BTreeMap<String, Value>,
@@ -191,13 +198,14 @@ Text output, one line per record:
 
 ```
 14:02:11.482 flowcpt-api-7d9f-xk2p1 api  WARN  tenant_id=t_123 request_id=8b1c  payment intent expired
-14:02:11.490 flowcpt-api-7d9f-xk2p1      EVENT Killing: Container api failed liveness probe, will be restarted
-14:02:13.004 flowcpt-api-7d9f-xk2p1      EVENT Started: Started container api
+14:02:11.490 flowcpt-api-7d9f-xk2p1 💀         Killing: Container api failed liveness probe, will be restarted
+14:02:13.004 flowcpt-api-7d9f-xk2p1 🚀         Started: Started container api
 14:02:13.210 flowcpt-api-7d9f-xk2p1 api  INFO  starting  version=0.14.2 environment=staging
 ```
 
 - Time in the local zone, pod and container as a prefix in a colour per pod (stable for the life of the pod), the level coloured, then the fields of a JSON line that are not the message, then the message.
-- Events in one distinct colour with the `EVENT` tag, Warning events in the warning colour.
+- Events carry an emoji in place of the container column, one per reason, so the eye reads the pod's life without reading words: 📍 `Scheduled`, 📦 `Pulling` and `Pulled`, 🚀 `Started`, 💀 `Killing` and a container exit with a non-zero code, 🔥 `BackOff` (crash loop and image pull back-off), ⚠️ `Unhealthy` and other Warning events, 🧹 `Evicted` and `Preempted`, ℹ️ any other reason. Normal events are dimmed; Warning events take the warning colour.
+- `--no-emoji` replaces the emoji with the four-letter tag `EVNT` in the same column. The fallback is automatic when stdout is not a terminal or the locale is not UTF-8. Emoji are two cells wide in most terminals; the prefix column is measured with that in mind so the lines stay aligned.
 - Notices from the core (reconnecting, target matches nothing, a pod went away) in the quiet colour with a `--` prefix.
 - `--fields <a,b,c>` limits which JSON fields are shown; without it all of them, longest last.
 - Pod names are shortened to the replica-set hash and pod suffix (`7d9f-xk2p1`) when every followed pod belongs to a deployment; `--long-names` keeps them whole.
@@ -239,7 +247,7 @@ since = "5m"
 ```
 
 - `[defaults]` fills in anything a template or the command line leaves out.
-- A template holds everything `follow` takes: `context`, `targets`, `container`, `since`, `tail`, `events`, `filter`, `fields`, `output`.
+- A template holds everything `follow` takes: `context`, `targets`, `container`, `since`, `tail`, `events`, `format`, `filter`, `fields`, `output`. `format` may also be given per container as a table, `format = { api = "json", envoy = "text" }`.
 - A filter is either a rule (`field`, `op`, `value`) or one of `all`, `any`, `not` over filters, nested as deep as needed. This is the same `Filter` value the flags build, so a template can be as simple as one rule or as complex as the GUI will later make it.
 - `gossip templates` lists the templates with their targets; `gossip templates show <name>` prints one.
 - Unknown keys are an error with the line number, so a typo in a template does not silently follow the wrong thing.
@@ -254,15 +262,16 @@ since = "5m"
 5. Scale a deployment from 0 while following a target that matched nothing: a notice says so at start, and the lines appear when the pod comes up.
 6. Put the laptop to sleep for a minute while following: the stream resumes by itself with a reconnect notice and the lines missed in between (within the kubelet's retention).
 7. A JSON line from `tracing-subscriber`'s JSON formatter is rendered as level, fields and message; `--field tenant_id=t_123` keeps only that tenant's lines; `--level warn` hides info lines; events still show.
-8. `--no-events` shows no event records; `--raw` prints lines byte for byte.
-9. `gossip follow --template dev-api` behaves as the flags spelt out in the template; a flag beside it overrides.
-10. `--output json` lines parse with `jq` and carry every field of the record.
-11. Following a namespace with 20 pods for an hour does not grow memory beyond the reorder buffer and the line buffers; CPU is idle between lines.
-12. `cargo test`, `cargo clippy --workspace -- -D warnings` and `cargo fmt --check` are clean. The core's tests cover target parsing and globs, the line parser on JSON and plain lines, filter evaluation, and the reorder buffer; the resolver and the streams are tested against a `kube` mock client or a recorded API.
+8. A logfmt line from an ingress controller is rendered as level, fields and message like a JSON line; a Rust panic with its backtrace arrives as one record whose message holds every line; `format = "text"` on a container shows its lines untouched.
+9. `--no-events` shows no event records; `--raw` prints lines byte for byte.
+10. `gossip follow --template dev-api` behaves as the flags spelt out in the template; a flag beside it overrides.
+11. `--output json` lines parse with `jq` and carry every field of the record.
+12. Following a namespace with 20 pods for an hour does not grow memory beyond the reorder buffer and the line buffers; CPU is idle between lines.
+13. `cargo test`, `cargo clippy --workspace -- -D warnings` and `cargo fmt --check` are clean. The core's tests cover target parsing and globs, the line parser on JSON, logfmt and plain lines and the continuation rule, filter evaluation, and the reorder buffer; the resolver and the streams are tested by hand against the dev cluster for the prototype, with no integration tests against a cluster in CI yet.
 
 ## 8. Notes for the implementer
 
-- Crates: `kube` with features `client`, `runtime`, `rustls-tls`, and `k8s-openapi` with the feature of the newest Kubernetes version the cluster runs; `tokio`, `futures`, `serde` / `serde_json`, `toml`, `clap` (derive), `chrono`, `globset`, `regex`, `owo-colors` or `anstyle` for colour, `anyhow` and `thiserror`. Check versions at the time of writing; do not pin from memory.
+- Crates: `kube` with features `client`, `runtime`, `rustls-tls`, and `k8s-openapi` with the feature of the newest Kubernetes version the crate offers at the time of writing (it picks the API type definitions compiled in, not which clusters can be reached; everything Gossip uses has been stable for years); `tokio`, `futures`, `serde` / `serde_json`, `toml`, `clap` (derive), `chrono`, `globset`, `regex`, `owo-colors` or `anstyle` for colour, `anyhow` and `thiserror`. Check versions at the time of writing; do not pin from memory. Rust edition 2024, latest stable toolchain.
 - `kube::Config::infer()` reads `KUBECONFIG` and the current context; `Config::from_kubeconfig` with `KubeConfigOptions { context: Some(name), .. }` picks another one. AKS contexts use an exec plugin (`kubelogin`), which `kube` runs by itself.
 - `Api::<Pod>::namespaced(client, ns).log_stream(name, &LogParams { follow: true, timestamps: true, container: Some(c), since_seconds / tail_lines, .. })` gives an `AsyncBufRead`; split it on newlines with `tokio::io::AsyncBufReadExt::lines`. The kubelet puts an RFC 3339 timestamp and a space in front of every line when `timestamps` is set.
 - Use `kube_runtime::watcher` with `watcher::Config::default().labels(selector)` for pods and `WatchStreamExt::default_backoff()` for the retries on the watch itself; the log streams need their own retry loop since they are plain HTTP responses.
@@ -272,3 +281,9 @@ since = "5m"
 - The resolver must handle a deployment whose selector matches pods of another, older replica set during a rollout: both sets are followed, that is correct.
 - Keep the core free of `println!` and of terminal colour; rendering is the CLI's. Everything the core wants to tell the user is a `Notice` record.
 - Namespace the config under `directories::ProjectDirs::from("", "", "gossip")` so the path is right on Linux, macOS and Windows.
+
+## 9. Project
+
+- Public, open source under Apache-2.0, in the GitHub organisation Open-Breach, like Rick.
+- Distribution and packaging are not decided for the prototype; `cargo install --path .` is enough for now.
+- Open for later, by design: following several clusters at once, the GUI, integration tests on a kind cluster in CI.
