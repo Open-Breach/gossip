@@ -12,6 +12,8 @@
 //!
 //! - [`cluster`]: the contexts of the kubeconfig, and a client for one.
 //! - [`discovery`]: the namespaces, deployments and pods of a cluster.
+//! - [`resolver`]: from targets to the containers to follow, kept up to date
+//!   by watching the cluster.
 //!
 //! And the logic that needs no cluster:
 //!
@@ -32,7 +34,10 @@ pub mod error;
 pub mod filter;
 pub mod parser;
 pub mod record;
+pub mod resolver;
 pub mod target;
+#[cfg(test)]
+pub(crate) mod testing;
 
 pub use cluster::{Cluster, ContextInfo};
 pub use config::{Config, ConfigError, Defaults, FormatSetting, Output, Settings, Template};
@@ -42,4 +47,5 @@ pub use error::Error;
 pub use filter::{Field, Filter, FilterError, Op, Rule};
 pub use parser::{FormatChoice, LineParser, ParsedLine};
 pub use record::{Format, Kind, Level, Record, Value};
+pub use resolver::{ContainerEvent, ContainerId, Resolver, ResolverEvent};
 pub use target::{Pattern, Target, TargetError, WorkloadKind, WorkloadSelector};

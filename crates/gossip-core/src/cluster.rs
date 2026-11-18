@@ -94,6 +94,15 @@ impl Cluster {
     pub(crate) fn client(&self) -> Client {
         self.client.clone()
     }
+
+    /// A cluster handle around a client that a test has built.
+    #[cfg(test)]
+    pub(crate) fn from_client(name: &str, client: Client) -> Cluster {
+        Cluster {
+            name: name.to_string(),
+            client,
+        }
+    }
 }
 
 impl std::fmt::Debug for Cluster {
