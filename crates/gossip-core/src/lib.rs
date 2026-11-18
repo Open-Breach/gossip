@@ -14,6 +14,8 @@
 //! - [`discovery`]: the namespaces, deployments and pods of a cluster.
 //! - [`resolver`]: from targets to the containers to follow, kept up to date
 //!   by watching the cluster.
+//! - [`session`]: follows the containers of a set of targets and merges
+//!   their lines into one stream of records, ordered by time.
 //!
 //! And the logic that needs no cluster:
 //!
@@ -24,6 +26,7 @@
 //!   line and joins continuation lines.
 //! - [`filter`]: filters, trees of rules applied to records.
 //! - [`config`]: the config file with its defaults and templates.
+//! - [`merge`]: the reorder buffer that orders records of many sources.
 //! - [`duration`]: durations as the command line and the config write them.
 
 pub mod cluster;
@@ -32,12 +35,15 @@ pub mod discovery;
 pub mod duration;
 pub mod error;
 pub mod filter;
+mod logs;
+pub mod merge;
 pub mod parser;
 pub mod record;
 pub mod resolver;
+pub mod session;
 pub mod target;
-#[cfg(test)]
-pub(crate) mod testing;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 
 pub use cluster::{Cluster, ContextInfo};
 pub use config::{Config, ConfigError, Defaults, FormatSetting, Output, Settings, Template};
@@ -48,4 +54,5 @@ pub use filter::{Field, Filter, FilterError, Op, Rule};
 pub use parser::{FormatChoice, LineParser, ParsedLine};
 pub use record::{Format, Kind, Level, Record, Value};
 pub use resolver::{ContainerEvent, ContainerId, Resolver, ResolverEvent};
+pub use session::{Session, SessionOptions};
 pub use target::{Pattern, Target, TargetError, WorkloadKind, WorkloadSelector};

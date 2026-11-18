@@ -96,7 +96,7 @@ impl Cluster {
     }
 
     /// A cluster handle around a client that a test has built.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn from_client(name: &str, client: Client) -> Cluster {
         Cluster {
             name: name.to_string(),

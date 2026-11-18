@@ -13,9 +13,15 @@ path = "src/main.rs"
 [dependencies]
 gossip-core.workspace = true
 
+anstyle.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+gossip-core = { workspace = true, features = ["testing"] }
+
+tokio = { workspace = true, features = ["io-util", "process"] }

@@ -20,5 +20,9 @@ thiserror.workspace = true
 tokio.workspace = true
 toml.workspace = true
 
+[features]
+# A stand-in API server for tests, also for the tests of front ends.
+testing = ["tokio/io-util", "tokio/net"]
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["io-util", "net"] }
