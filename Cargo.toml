@@ -9,12 +9,28 @@ license = "Apache-2.0"
 repository = "https://github.com/Open-Breach/gossip"
 
 [workspace.dependencies]
+gossip-core = { path = "crates/gossip-core", version = "0.1.0" }
+
+anyhow = "1.0.104"
 chrono = { version = "0.4.45", default-features = false, features = ["std", "clock", "serde"] }
 clap = { version = "4.6.8", features = ["derive"] }
 directories = "6.0.0"
 globset = { version = "0.4.21", default-features = false }
+k8s-openapi = { version = "0.29.0", features = ["v1_37"] }
+kube = { version = "5.1.0", default-features = false, features = [
+    "client",
+    "runtime",
+    "rustls-tls",
+    # The TLS backend of rustls has to be picked: ring or aws-lc-rs.
+    "ring",
+    # Without these two, kube refuses to build a client as soon as HTTPS_PROXY
+    # is set or the kubeconfig names a proxy-url, where kubectl just uses it.
+    "http-proxy",
+    "socks5",
+] }
 regex = "1.13.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 toml = "1.2.1"
