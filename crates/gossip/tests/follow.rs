@@ -297,57 +297,60 @@ fn seed_span_lines(fake: &FakeCluster) {
     }
 }
 
-/// The fields a request is read by, in the order they are read in.
-const REQUEST_FIELDS: &str =
-    "http.method,http.route,http.status_code,tenant_id,request_id,time.busy";
-
 #[tokio::test]
 async fn the_fields_of_a_tracing_span_are_shown_as_fields_of_the_line() {
     let fake = FakeCluster::start().await;
     seed_span_lines(&fake);
+    fake.log(NS, "fc-api-0", "api", at(3_000), NESTED_SPAN_LINE);
 
-    // As it comes: every field of the line and of its span, longest last,
-    // without the timestamp and the target, and no `span` or `spans`.
+    // As it comes: method, route, status, tenant, user, request id and busy
+    // time, each when the line has it, then the other fields by name, then
+    // the message. No `span` or `spans`, and none of the hidden fields: the
+    // timestamp, the target, `otel.name`, `time.idle`, the name of the span.
     let mut follow = Follow::start(&fake, "span", &["flowcpt", "--no-color"]);
     assert_eq!(
-        follow.lines(2).await,
+        follow.lines(3).await,
         [
-            "14:00:01.000 fc-api-0 api  INFO  http.method=GET time.busy=5.53ms time.idle=36.3ms http.status_code=200 http.route=/api/v1/sources otel.name=\"GET /api/v1/sources\" tenant_id=3K6ehNLhnRsPfWhzjugmea user_id=auth0|6a86204723ca712d0c11f85a request_id=32e49c93-4c57-43a0-9439-c554e5fff1f6  close",
-            "14:00:02.000 fc-api-0 api  WARN  http.method=POST time.busy=1.21ms time.idle=9.04ms http.status_code=404 http.route=/api/v1/flows otel.name=\"POST /api/v1/flows\" tenant_id=8Hq2mVxWc4TzPb7LdYn3Ka request_id=9d0e7a55-0b0e-4c0c-8a4f-2f1f3f2b6c11  close",
+            "14:00:01.000 fc-api-0 api  INFO  http.method=GET http.route=/api/v1/sources http.status_code=200 tenant_id=3K6ehNLhnRsPfWhzjugmea user_id=auth0|6a86204723ca712d0c11f85a request_id=32e49c93-4c57-43a0-9439-c554e5fff1f6 time.busy=5.53ms  close",
+            "14:00:02.000 fc-api-0 api  WARN  http.method=POST http.route=/api/v1/flows http.status_code=404 tenant_id=8Hq2mVxWc4TzPb7LdYn3Ka request_id=9d0e7a55-0b0e-4c0c-8a4f-2f1f3f2b6c11 time.busy=1.21ms  close",
+            "14:00:03.000 fc-api-0 api  INFO  http.method=GET http.route=/api/v1/sources tenant_id=3K6ehNLhnRsPfWhzjugmea request_id=32e49c93-4c57-43a0-9439-c554e5fff1f6 rows=3 table=sources  sources loaded",
         ]
     );
 
-    // With the fields named: method, route, status, tenant, request id,
-    // busy time, then the message.
+    // A list of names replaces all of that: these and no others, in the
+    // order given, a hidden field like any other.
     let mut follow = Follow::start(
         &fake,
         "span-fields",
-        &["flowcpt", "--no-color", "--fields", REQUEST_FIELDS],
-    );
-    assert_eq!(
-        follow.lines(2).await,
-        [
-            "14:00:01.000 fc-api-0 api  INFO  http.method=GET http.route=/api/v1/sources http.status_code=200 tenant_id=3K6ehNLhnRsPfWhzjugmea request_id=32e49c93-4c57-43a0-9439-c554e5fff1f6 time.busy=5.53ms  close",
-            "14:00:02.000 fc-api-0 api  WARN  http.method=POST http.route=/api/v1/flows http.status_code=404 tenant_id=8Hq2mVxWc4TzPb7LdYn3Ka request_id=9d0e7a55-0b0e-4c0c-8a4f-2f1f3f2b6c11 time.busy=1.21ms  close",
-        ]
-    );
-
-    // The timestamp and the target are there for whoever names them.
-    let mut follow = Follow::start(
-        &fake,
-        "span-quiet",
         &[
             "flowcpt",
             "--no-color",
-            "--tail",
-            "1",
             "--fields",
-            "target,timestamp",
+            "time.idle,target,http.route,timestamp",
         ],
     );
     assert_eq!(
-        follow.line().await,
-        "14:00:02.000 fc-api-0 api  WARN  target=flowcpt_telemetry timestamp=2026-11-18T20:39:01.412307Z  close"
+        follow.lines(3).await,
+        [
+            "14:00:01.000 fc-api-0 api  INFO  time.idle=36.3ms target=flowcpt_telemetry http.route=/api/v1/sources timestamp=2026-11-18T20:39:01.187944Z  close",
+            "14:00:02.000 fc-api-0 api  WARN  time.idle=9.04ms target=flowcpt_telemetry http.route=/api/v1/flows timestamp=2026-11-18T20:39:01.412307Z  close",
+            "14:00:03.000 fc-api-0 api  INFO  target=flowcpt_api::sources http.route=/api/v1/sources timestamp=2026-11-18T20:39:01.180112Z  sources loaded",
+        ]
+    );
+
+    // `all` is every field, the hidden ones too, in the default order.
+    let mut follow = Follow::start(
+        &fake,
+        "span-all",
+        &["flowcpt", "--no-color", "--fields", "all"],
+    );
+    assert_eq!(
+        follow.lines(3).await,
+        [
+            "14:00:01.000 fc-api-0 api  INFO  http.method=GET http.route=/api/v1/sources http.status_code=200 tenant_id=3K6ehNLhnRsPfWhzjugmea user_id=auth0|6a86204723ca712d0c11f85a request_id=32e49c93-4c57-43a0-9439-c554e5fff1f6 time.busy=5.53ms otel.name=\"GET /api/v1/sources\" target=flowcpt_telemetry time.idle=36.3ms timestamp=2026-11-18T20:39:01.187944Z  close",
+            "14:00:02.000 fc-api-0 api  WARN  http.method=POST http.route=/api/v1/flows http.status_code=404 tenant_id=8Hq2mVxWc4TzPb7LdYn3Ka request_id=9d0e7a55-0b0e-4c0c-8a4f-2f1f3f2b6c11 time.busy=1.21ms otel.name=\"POST /api/v1/flows\" target=flowcpt_telemetry time.idle=9.04ms timestamp=2026-11-18T20:39:01.412307Z  close",
+            "14:00:03.000 fc-api-0 api  INFO  http.method=GET http.route=/api/v1/sources tenant_id=3K6ehNLhnRsPfWhzjugmea request_id=32e49c93-4c57-43a0-9439-c554e5fff1f6 name=load_sources rows=3 table=sources target=flowcpt_api::sources timestamp=2026-11-18T20:39:01.180112Z  sources loaded",
+        ]
     );
 }
 
@@ -880,7 +883,11 @@ fields = []
 
 [templates.requests]
 targets = ["flowcpt"]
-fields = ["http.method", "http.route", "http.status_code", "tenant_id", "request_id", "time.busy"]
+fields = ["request_id", "http.status_code", "time.idle", "http.route"]
+
+[templates.everything]
+targets = ["flowcpt"]
+fields = ["all"]
 "#;
 
 #[tokio::test]
@@ -931,6 +938,8 @@ async fn the_fields_of_a_template_are_the_fields_shown_in_that_order() {
     let fake = FakeCluster::start().await;
     seed_span_lines(&fake);
 
+    // These and no others, in the order of the list, which is not the
+    // default order, and with a field in it that is hidden by default.
     let mut follow = Follow::start_with_config(
         &fake,
         "template-fields",
@@ -940,9 +949,21 @@ async fn the_fields_of_a_template_are_the_fields_shown_in_that_order() {
     assert_eq!(
         follow.lines(2).await,
         [
-            "14:00:01.000 fc-api-0 api  INFO  http.method=GET http.route=/api/v1/sources http.status_code=200 tenant_id=3K6ehNLhnRsPfWhzjugmea request_id=32e49c93-4c57-43a0-9439-c554e5fff1f6 time.busy=5.53ms  close",
-            "14:00:02.000 fc-api-0 api  WARN  http.method=POST http.route=/api/v1/flows http.status_code=404 tenant_id=8Hq2mVxWc4TzPb7LdYn3Ka request_id=9d0e7a55-0b0e-4c0c-8a4f-2f1f3f2b6c11 time.busy=1.21ms  close",
+            "14:00:01.000 fc-api-0 api  INFO  request_id=32e49c93-4c57-43a0-9439-c554e5fff1f6 http.status_code=200 time.idle=36.3ms http.route=/api/v1/sources  close",
+            "14:00:02.000 fc-api-0 api  WARN  request_id=9d0e7a55-0b0e-4c0c-8a4f-2f1f3f2b6c11 http.status_code=404 time.idle=9.04ms http.route=/api/v1/flows  close",
         ]
+    );
+
+    // The one word `all` is every field, as with the flag.
+    let mut follow = Follow::start_with_config(
+        &fake,
+        "template-all",
+        TEMPLATES,
+        &["--template", "everything", "--no-color", "--tail", "1"],
+    );
+    assert_eq!(
+        follow.line().await,
+        "14:00:02.000 fc-api-0 api  WARN  http.method=POST http.route=/api/v1/flows http.status_code=404 tenant_id=8Hq2mVxWc4TzPb7LdYn3Ka request_id=9d0e7a55-0b0e-4c0c-8a4f-2f1f3f2b6c11 time.busy=1.21ms otel.name=\"POST /api/v1/flows\" target=flowcpt_telemetry time.idle=9.04ms timestamp=2026-11-18T20:39:01.412307Z  close"
     );
 
     // An empty list is the message only.

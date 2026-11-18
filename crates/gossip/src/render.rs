@@ -5,10 +5,11 @@ use std::collections::BTreeMap;
 
 use anstyle::{AnsiColor, Style};
 use chrono::{DateTime, Local, Utc};
-use gossip_core::parser::{TARGET_FIELD, TIMESTAMP_FIELD};
 use gossip_core::record::{event_field, value_text};
 use gossip_core::resolver::EXITED;
 use gossip_core::{Kind, Level, Record, Value};
+
+use crate::fields::FieldChoice;
 
 /// The colours a pod prefix can take. Red and yellow are left to the levels.
 const POD_COLOURS: [AnsiColor; 10] = [
@@ -40,21 +41,14 @@ pub enum Zone {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextOptions {
     pub colour: bool,
-    /// Which fields of a line are shown, in this order, and none of them
-    /// for an empty list. Without a list all of them are shown but the
-    /// [`QUIET_FIELDS`], longest last.
-    pub fields: Option<Vec<String>>,
+    /// Which fields of a line are shown, and in which order.
+    pub fields: FieldChoice,
     /// Keep pod names whole.
     pub long_names: bool,
     /// Mark events with an emoji per reason; with `EVNT` otherwise.
     pub emoji: bool,
     pub zone: Zone,
 }
-
-/// The fields that are not shown unless they are asked for by name: the
-/// line's own timestamp, because the time is on the record already, and
-/// where in the code it was logged, which is rarely what one reads for.
-pub const QUIET_FIELDS: [&str; 2] = [TIMESTAMP_FIELD, TARGET_FIELD];
 
 /// Renders records as text, one line per record:
 ///
@@ -214,28 +208,14 @@ impl TextRenderer {
         }
     }
 
-    /// The fields to show, as key and value: the ones asked for in the order
-    /// asked, or all of them but the quiet ones, with the longest last.
+    /// The fields to show, as key and value, in the order to show them in.
     fn fields(&self, fields: &BTreeMap<String, Value>) -> Vec<(String, String)> {
-        match &self.options.fields {
-            Some(wanted) => wanted
-                .iter()
-                .filter_map(|key| {
-                    fields
-                        .get(key)
-                        .map(|value| (key.clone(), field_text(value)))
-                })
-                .collect(),
-            None => {
-                let mut all: Vec<(String, String)> = fields
-                    .iter()
-                    .filter(|(key, _)| !QUIET_FIELDS.contains(&key.as_str()))
-                    .map(|(key, value)| (key.clone(), field_text(value)))
-                    .collect();
-                all.sort_by_key(|(key, value)| key.chars().count() + value.chars().count());
-                all
-            }
-        }
+        self.options
+            .fields
+            .of(fields)
+            .into_iter()
+            .map(|(key, value)| (key.clone(), field_text(value)))
+            .collect()
     }
 
     fn paint(&self, style: Style, text: &str) -> String {
@@ -345,7 +325,7 @@ mod tests {
     fn plain() -> TextOptions {
         TextOptions {
             colour: false,
-            fields: None,
+            fields: FieldChoice::Default,
             long_names: true,
             emoji: true,
             zone: Zone::Utc,
@@ -565,7 +545,7 @@ mod tests {
         // The example of the spec, section 5.3.
         assert_eq!(
             TextRenderer::new(plain()).render(&record),
-            "14:02:11.482 flowcpt-api-7d9f-xk2p1 api  WARN  request_id=8b1c tenant_id=t_123  payment intent expired"
+            "14:02:11.482 flowcpt-api-7d9f-xk2p1 api  WARN  tenant_id=t_123 request_id=8b1c  payment intent expired"
         );
     }
 
@@ -597,8 +577,12 @@ mod tests {
         );
     }
 
+    fn named(names: &[&str]) -> FieldChoice {
+        FieldChoice::Named(names.iter().map(|name| name.to_string()).collect())
+    }
+
     #[test]
-    fn fields_are_shown_longest_last_unless_asked_for_by_name() {
+    fn fields_are_shown_in_the_default_order_unless_asked_for_by_name() {
         let record = with_fields(
             line(POD, "api", Some(Level::Info), "done"),
             &[
@@ -607,24 +591,28 @@ mod tests {
                 ("ok", json!(true)),
                 ("note", json!("two words")),
                 ("empty", json!("")),
+                ("request_id", json!("8b1c")),
+                ("tenant_id", json!("t_123")),
+                ("http.method", json!("GET")),
             ],
         );
+        // What a request is read by first, then the rest by name.
         assert_eq!(
             TextRenderer::new(plain()).render(&record),
-            "14:02:11.482 flowcpt-api-7d9f-xk2p1 api  INFO  ok=true empty=\"\" status=200 note=\"two words\" module=flowcpt_api::payments  done"
+            "14:02:11.482 flowcpt-api-7d9f-xk2p1 api  INFO  http.method=GET tenant_id=t_123 request_id=8b1c empty=\"\" module=flowcpt_api::payments note=\"two words\" ok=true status=200  done"
         );
 
         let chosen = TextOptions {
-            fields: Some(vec!["status".into(), "missing".into(), "ok".into()]),
+            fields: named(&["status", "missing", "ok", "tenant_id"]),
             ..plain()
         };
         assert_eq!(
             TextRenderer::new(chosen).render(&record),
-            "14:02:11.482 flowcpt-api-7d9f-xk2p1 api  INFO  status=200 ok=true  done"
+            "14:02:11.482 flowcpt-api-7d9f-xk2p1 api  INFO  status=200 ok=true tenant_id=t_123  done"
         );
 
         let none = TextOptions {
-            fields: Some(vec![]),
+            fields: named(&[]),
             ..plain()
         };
         assert_eq!(
@@ -634,12 +622,13 @@ mod tests {
     }
 
     #[test]
-    fn the_timestamp_and_the_target_are_shown_only_when_asked_for_by_name() {
+    fn a_hidden_field_is_shown_only_when_it_is_asked_for() {
         let record = with_fields(
             line(POD, "api", Some(Level::Info), "done"),
             &[
                 ("timestamp", json!("2026-11-18T14:02:11.482Z")),
                 ("target", json!("flowcpt_api::payments")),
+                ("name", json!("request")),
                 ("status", json!(200)),
             ],
         );
@@ -648,16 +637,27 @@ mod tests {
             "14:02:11.482 flowcpt-api-7d9f-xk2p1 api  INFO  status=200  done"
         );
 
-        let named = TextOptions {
-            fields: Some(vec!["target".into(), "status".into(), "timestamp".into()]),
+        // By name.
+        let by_name = TextOptions {
+            fields: named(&["target", "status", "timestamp"]),
             ..plain()
         };
         assert_eq!(
-            TextRenderer::new(named).render(&record),
+            TextRenderer::new(by_name).render(&record),
             "14:02:11.482 flowcpt-api-7d9f-xk2p1 api  INFO  target=flowcpt_api::payments status=200 timestamp=2026-11-18T14:02:11.482Z  done"
         );
 
-        // A line with nothing but the two is a line with its message only.
+        // Or all of them at once, in the default order.
+        let all = TextOptions {
+            fields: FieldChoice::All,
+            ..plain()
+        };
+        assert_eq!(
+            TextRenderer::new(all).render(&record),
+            "14:02:11.482 flowcpt-api-7d9f-xk2p1 api  INFO  name=request status=200 target=flowcpt_api::payments timestamp=2026-11-18T14:02:11.482Z  done"
+        );
+
+        // A line with nothing but hidden fields is its message only.
         let record = with_fields(
             line(POD, "api", Some(Level::Info), "done"),
             &[

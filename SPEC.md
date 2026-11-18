@@ -213,14 +213,23 @@ Text output, one line per record:
 14:02:11.482 flowcpt-api-7d9f-xk2p1 api  WARN  tenant_id=t_123 request_id=8b1c  payment intent expired
 14:02:11.490 flowcpt-api-7d9f-xk2p1 💀         Killing: Container api failed liveness probe, will be restarted
 14:02:13.004 flowcpt-api-7d9f-xk2p1 🚀         Started: Started container api
-14:02:13.210 flowcpt-api-7d9f-xk2p1 api  INFO  starting  version=0.14.2 environment=staging
+14:02:13.210 flowcpt-api-7d9f-xk2p1 api  INFO  environment=staging version=0.14.2  starting
+```
+
+A request line of a service that logs with `tracing` (4.6), with no flags:
+
+```
+14:00:01.000 fc-api-0 api  INFO  http.method=GET http.route=/api/v1/sources http.status_code=200 tenant_id=3K6ehNLhnRsPfWhzjugmea user_id=auth0|6a86204723ca712d0c11f85a request_id=32e49c93-4c57-43a0-9439-c554e5fff1f6 time.busy=5.53ms  close
 ```
 
 - Time in the local zone, pod and container as a prefix in a colour per pod (stable for the life of the pod), the level coloured, then the fields of a JSON line that are not the message, then the message.
 - Events carry an emoji in place of the container column, one per reason, so the eye reads the pod's life without reading words: 📍 `Scheduled`, 📦 `Pulling` and `Pulled`, 🚀 `Started`, 💀 `Killing` and a container exit with a non-zero code, 🔥 `BackOff` (crash loop and image pull back-off), ⚠️ `Unhealthy` and other Warning events, 🧹 `Evicted` and `Preempted`, ℹ️ any other reason. Normal events are dimmed; Warning events take the warning colour.
 - `--no-emoji` replaces the emoji with the four-letter tag `EVNT` in the same column. The fallback is automatic when stdout is not a terminal or the locale is not UTF-8. Emoji are two cells wide in most terminals; the prefix column is measured with that in mind so the lines stay aligned.
 - Notices from the core (reconnecting, target matches nothing, a pod went away) in the quiet colour with a `--` prefix.
-- `--fields <a,b,c>` names the fields shown, in that order. Without it all of them are shown, longest last, except `timestamp` and `target`: the time is on the record already, and where in the code a line was logged is rarely what one reads for. Both are shown when named. This is a matter of the text output only; the record and the JSON output keep every field.
+- The fields of a line, without `--fields`: first the well-known ones in this fixed order, each only when the line has it: `http.method`, `http.route`, `http.status_code`, `tenant_id`, `user_id`, `request_id`, `time.busy`. Then every other field in alphabetical order.
+- Hidden by default: `timestamp` and `target`, because the time is on the record already and where in the code a line was logged is rarely what one reads for; and `otel.name`, `otel.kind`, `otel.status_code`, `http.target`, `http.scheme`, `http.flavor`, `http.host`, `http.user_agent`, `http.client_ip`, `time.idle`, `name` and `spans`, because they repeat the route or the status, or are noise on every line.
+- `--fields <a,b,c>` replaces all of this with the fields named, in that order, a hidden one like any other. `--fields all` shows every field, the hidden ones too, in the default order.
+- The well-known and the hidden names are one table in the CLI crate, the only place to change them. All of this is a matter of the text output: the record and the JSON output keep every field.
 - Pod names are shortened to the replica-set hash and pod suffix (`7d9f-xk2p1`) when every followed pod belongs to a deployment; `--long-names` keeps them whole.
 
 JSON output (`--output json`): one record per line as JSON, every field of 4.7, for `jq` and for the GUI later.
