@@ -10,9 +10,9 @@ gossip follow flowcpt/flowcpt-api
 ```
 
 ```
-14:02:11.482 7d9f-xk2p1 api  WARN  request_id=8b1c tenant_id=t_123  payment intent expired
+14:02:11.482 7d9f-xk2p1 api  WARN  tenant_id=t_123 request_id=8b1c  payment intent expired
 14:02:11.490 7d9f-xk2p1 💀         Killing: Container api failed liveness probe, will be restarted
-14:02:12.007 7d9f-m4q8z api  INFO  request_id=8b1d tenant_id=t_456  request done
+14:02:12.007 7d9f-m4q8z api  INFO  tenant_id=t_456 request_id=8b1d  request done
 14:02:13.004 7d9f-xk2p1 🚀         Started: Started container api
 14:02:13.210 7d9f-xk2p1 api  INFO  version=0.14.2  starting
 ```
@@ -139,7 +139,7 @@ Gossip keeps watching until something matches.
 | `--grep <text>` | only lines whose message contains the text | none |
 | `--match <regex>` | only lines whose message matches the regular expression | none |
 | `--field <key=value>` | only lines whose field has the value; repeatable | none |
-| `--fields <a,b,c>` | show only these fields of a line, in this order | all, longest last |
+| `--fields <a,b,c>` | show only these fields of a line, in this order; `all` shows every field | the request's fields first, the rest by name, the noisy ones hidden: see [Output](#output) |
 | `--long-names` | keep pod names whole | shortened when every pod is a deployment's |
 | `--no-emoji` | mark events with `EVNT` instead of an emoji | emoji when stdout is a terminal and the locale is UTF-8 |
 | `--output text\|json` | the rendering | `text` |
@@ -158,7 +158,15 @@ The format of every line is detected on its own:
 
 - A JSON object becomes a level (`level`, `severity` or `lvl`), a message
   (`message` or `msg`) and fields. The application's own timestamp is kept as
-  the field `timestamp`.
+  the field `timestamp`. A nested object is kept as one field, as JSON text.
+- The fields of a `tracing` span are fields of the line. `tracing-subscriber`'s
+  JSON formatter writes the fields of the current span under `span`, and the
+  chain of spans the line was logged in under `spans`. Gossip merges the keys
+  of all of them into the fields and keeps neither `span` nor `spans`. A field
+  of the line itself wins over a span field of the same name, and an inner
+  span over an outer one. So `--field tenant_id=t_123` finds a tenant whose
+  id was recorded on the request's span, also for a line logged in a span
+  inside that one. The name of the innermost span is the field `name`.
 - A logfmt line (`level=info msg="request done" status=200`) is read the same
   way.
 - Anything else is text. Its level is guessed from a leading `ERROR`, `WARN`,
@@ -196,6 +204,43 @@ the pod reports. Events from before Gossip started are left out, unless
 
 The text output is one line per record: the time in the local zone, the pod
 and the container in a colour per pod, the level, the fields, and the message.
+Which fields, and in which order:
+
+1. First the fields a request is read by, always in this order, each only
+   when the line has it: `http.method`, `http.route`, `http.status_code`,
+   `tenant_id`, `user_id`, `request_id`, `time.busy`.
+2. Then every other field in alphabetical order.
+3. Hidden: `timestamp` and `target`, since the time is at the front of the
+   line already and where in the code a line was logged is rarely what one
+   reads for; and `otel.name`, `otel.kind`, `otel.status_code`, `http.target`,
+   `http.scheme`, `http.flavor`, `http.host`, `http.user_agent`,
+   `http.client_ip`, `time.idle`, `name` and `spans`, which repeat the route or
+   the status or are noise on every line.
+
+```bash
+gossip follow fc-stg/fc-api
+```
+
+```text
+14:00:01.000 fc-api-0 api  INFO  http.method=GET http.route=/api/v1/sources http.status_code=200 tenant_id=3K6ehNLhnRsPfWhzjugmea user_id=auth0|6a86204723ca712d0c11f85a request_id=32e49c93-4c57-43a0-9439-c554e5fff1f6 time.busy=5.53ms  close
+```
+
+`--fields` replaces all of this with the fields it names, in the order it
+names them, a hidden one like any other. `--fields all` shows every field,
+the hidden ones too, in the order above. `--output json` always has every
+field.
+
+```bash
+gossip follow fc-stg/fc-api --fields tenant_id,http.route,time.idle
+```
+
+```bash
+gossip follow fc-stg/fc-api --fields all
+```
+
+The names live in one table, `KNOWN_FIELDS` in `crates/gossip/src/fields.rs`,
+which is the only place to change them.
+
 Lines of the run before the current one are dimmed. Notices from Gossip itself
 (a pod appeared or went away, a stream was reopened, a target matches nothing)
 start with `--`.
@@ -283,7 +328,7 @@ A template holds what `follow` takes:
 | `events` | `false` leaves the cluster's events out |
 | `format` | `"auto"`, `"json"`, `"logfmt"` or `"text"` for every container, or a table by container name; `"text"` shows lines untouched and does not join continuation lines |
 | `filter` | a filter, see below |
-| `fields` | the fields of a line to show, in this order |
+| `fields` | the list of fields of a line to show, in this order; `[]` shows the message only and `["all"]` every field; left out, the default of [Output](#output) |
 | `output` | `"text"` or `"json"` |
 
 What is used is decided in layers: a flag on the command line, then the

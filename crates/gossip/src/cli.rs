@@ -128,7 +128,9 @@ pub struct FollowArgs {
     #[arg(long)]
     pub no_color: bool,
 
-    /// Show only these fields of a line, in this order: a,b,c.
+    /// Show only these fields of a line, in this order: a,b,c. `all` shows
+    /// every field. Without it: the fields a request is read by first, the
+    /// rest in alphabetical order, and the noisy ones hidden.
     #[arg(long, value_name = "KEYS", value_delimiter = ',')]
     pub fields: Option<Vec<String>>,
 

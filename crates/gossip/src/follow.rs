@@ -9,6 +9,7 @@ use gossip_core::{
 };
 
 use crate::cli::FollowArgs;
+use crate::fields::FieldChoice;
 use crate::render::{TextOptions, TextRenderer, Zone, json_line};
 
 pub async fn run(args: FollowArgs) -> anyhow::Result<()> {
@@ -148,7 +149,7 @@ impl Printer {
         } else {
             Mode::Text(TextRenderer::new(TextOptions {
                 colour: stdout_is_terminal && !args.no_color,
-                fields: settings.fields.clone(),
+                fields: FieldChoice::from_setting(settings.fields.as_deref()),
                 long_names: args.long_names,
                 // Emoji only where they will show: a terminal that says
                 // it speaks UTF-8.

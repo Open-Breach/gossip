@@ -153,7 +153,8 @@ pub struct Template {
     pub format: Option<FormatSetting>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<Filter>,
-    /// Which fields of a line the text output shows.
+    /// The fields of a line the text output shows, in this order; none of
+    /// them for an empty list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fields: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
