@@ -50,7 +50,7 @@ pub mod testing;
 
 pub use cluster::{Cluster, ContextInfo};
 pub use columns::{Column, ColumnSetting, Columns, ColumnsError, ColumnsSetting, Cut};
-pub use config::{Config, ConfigError, Defaults, FormatSetting, Output, Settings, Template};
+pub use config::{Config, ConfigError, Defaults, FormatSetting, Output, SessionSpec, Settings};
 pub use discovery::{ContainerInfo, DeploymentInfo, NamespaceInfo, PodInfo};
 pub use duration::{DurationError, format_duration, parse_duration};
 pub use error::Error;
@@ -58,5 +58,5 @@ pub use filter::{Field, Filter, FilterError, Op, Rule};
 pub use parser::{FormatChoice, LineParser, ParsedLine};
 pub use record::{Format, Kind, Level, Record, Value};
 pub use resolver::{ClusterEvent, ContainerEvent, ContainerId, Resolver, ResolverEvent};
-pub use session::{Session, SessionOptions};
+pub use session::{Session, SessionHandle, SessionOptions, TargetStatus};
 pub use target::{Pattern, Target, TargetError, WorkloadKind, WorkloadSelector};

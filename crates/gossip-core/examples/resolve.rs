@@ -67,6 +67,11 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 println!("! {} {}: {}", event.regarding, event.reason, event.message);
             }
             ResolverEvent::Notice(notice) => println!("-- {}", notice.message),
+            ResolverEvent::Matched { namespace, pods } => {
+                let total: usize = pods.values().sum();
+                println!("= {namespace}: {total} pods followed");
+            }
+            ResolverEvent::Settled => println!("-- everything that was there is listed"),
         }
     }
     Ok(())

@@ -3,7 +3,7 @@
 use std::io::Write;
 
 use anyhow::bail;
-use gossip_core::{ColumnsSetting, Config, Filter, FormatSetting, Template, format_duration};
+use gossip_core::{ColumnsSetting, Config, Filter, FormatSetting, SessionSpec, format_duration};
 
 use crate::cli::{TemplatesArgs, TemplatesCommand};
 use crate::table::Table;
@@ -27,7 +27,7 @@ pub fn run(args: &TemplatesArgs, out: &mut impl Write) -> anyhow::Result<()> {
 }
 
 /// The template of this name, or an error that says which ones there are.
-pub fn find<'a>(config: &'a Config, name: &str) -> anyhow::Result<&'a Template> {
+pub fn find<'a>(config: &'a Config, name: &str) -> anyhow::Result<&'a SessionSpec> {
     if let Some(template) = config.templates.get(name) {
         return Ok(template);
     }
@@ -53,7 +53,7 @@ fn list(config: &Config) -> Table {
 
 /// One template as it stands in the config file: text that can be pasted
 /// back into it.
-fn show(name: &str, template: &Template) -> String {
+fn show(name: &str, template: &SessionSpec) -> String {
     let mut text = format!("[templates.{}]\n", key(name));
     let mut line = |key: &str, value: String| {
         text.push_str(&format!("{key} = {value}\n"));

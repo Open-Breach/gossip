@@ -39,7 +39,25 @@ fn short(event: &ResolverEvent) -> String {
         }
         ResolverEvent::Cluster(event) => format!("event {}: {}", event.reason, event.message),
         ResolverEvent::Notice(notice) => notice.message.clone(),
+        ResolverEvent::Matched { namespace, pods } => {
+            let counts: Vec<String> = pods
+                .iter()
+                .map(|(target, pods)| format!("{target}:{pods}"))
+                .collect();
+            format!("matched {namespace} {}", counts.join(" "))
+        }
+        ResolverEvent::Settled => "settled".to_string(),
     }
+}
+
+/// Whether an event is one of the reports about the resolution itself: how
+/// many pods each target follows, and that the first picture is complete.
+/// The tests of what is followed leave them out; they have tests of their own.
+fn is_report(event: &ResolverEvent) -> bool {
+    matches!(
+        event,
+        ResolverEvent::Matched { .. } | ResolverEvent::Settled
+    )
 }
 
 /// Waits for exactly these events, in any order.
@@ -47,6 +65,7 @@ async fn expect(resolver: &mut Resolver, expected: &[&str]) {
     let mut seen = Vec::new();
     while seen.len() < expected.len() {
         match timeout(Duration::from_secs(10), resolver.next()).await {
+            Ok(Some(event)) if is_report(&event) => {}
             Ok(Some(event)) => seen.push(short(&event)),
             Ok(None) => panic!("the resolver stopped after {seen:?}"),
             Err(_) => panic!("waited for {expected:?} and got only {seen:?}"),
@@ -60,8 +79,25 @@ async fn expect(resolver: &mut Resolver, expected: &[&str]) {
 
 /// Checks that the resolver has nothing more to report for a moment.
 async fn expect_quiet(resolver: &mut Resolver) {
-    if let Ok(event) = timeout(Duration::from_millis(300), resolver.next()).await {
-        panic!("expected nothing more, got {:?}", event.as_ref().map(short));
+    let quiet = tokio::time::Instant::now() + Duration::from_millis(300);
+    while let Ok(event) = tokio::time::timeout_at(quiet, resolver.next()).await {
+        match event {
+            Some(event) if is_report(&event) => {}
+            other => panic!("expected nothing more, got {:?}", other.as_ref().map(short)),
+        }
+    }
+}
+
+/// Waits for the next report about the resolution itself, leaving out
+/// everything else.
+async fn next_report(resolver: &mut Resolver) -> String {
+    loop {
+        match timeout(Duration::from_secs(10), resolver.next()).await {
+            Ok(Some(event)) if is_report(&event) => return short(&event),
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("the resolver stopped"),
+            Err(_) => panic!("no report came in time"),
+        }
     }
 }
 
@@ -406,4 +442,53 @@ async fn dropping_the_resolver_stops_its_watches() {
     fake.apply(&pods(NS), pod_object(NS, "late", &[], None, &["main"]));
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(fake.requests().len(), before);
+}
+
+#[tokio::test]
+async fn the_resolver_says_how_many_pods_each_target_follows_and_when_it_has_listed_them() {
+    let fake = FakeCluster::start().await;
+    seed(&fake);
+    let targets = vec![
+        target("flowcpt/flowcpt-api"),
+        target("flowcpt/nope"),
+        target("flowcpt/redis"),
+    ];
+    let mut resolver = Resolver::start(&fake.cluster(), targets, None, None);
+
+    // The counts change while the watches list; the last one before the
+    // resolver has settled is the first full picture. The target in the
+    // middle matches nothing and is left out.
+    let mut reports = Vec::new();
+    loop {
+        let report = next_report(&mut resolver).await;
+        if report == "settled" {
+            break;
+        }
+        reports.push(report);
+    }
+    assert_eq!(
+        reports.last().map(String::as_str),
+        Some("matched flowcpt 0:2 2:1")
+    );
+
+    // A pod that comes and one that goes change the count; settling is said
+    // once.
+    let api = [("app", "flowcpt-api")];
+    let set = owner("ReplicaSet", "flowcpt-api-7d9f");
+    fake.apply(
+        &pods(NS),
+        pod_object(NS, "flowcpt-api-7d9f-q7w2x", &api, Some(set), &["api"]),
+    );
+    assert_eq!(next_report(&mut resolver).await, "matched flowcpt 0:3 2:1");
+    fake.delete(&pods(NS), "redis-0");
+    assert_eq!(next_report(&mut resolver).await, "matched flowcpt 0:3");
+}
+
+#[tokio::test]
+async fn a_resolver_with_nothing_to_resolve_settles_at_once() {
+    let fake = FakeCluster::start().await;
+    seed(&fake);
+    let mut resolver = Resolver::start(&fake.cluster(), Vec::new(), None, None);
+    assert_eq!(next_report(&mut resolver).await, "settled");
+    expect_quiet(&mut resolver).await;
 }

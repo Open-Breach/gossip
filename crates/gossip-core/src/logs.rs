@@ -11,6 +11,7 @@
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Utc};
@@ -129,11 +130,16 @@ fn refusal(error: &kube::Error) -> Refusal {
 /// Follows one container until it is let go: `status` is the state the pod
 /// reports for it, and following ends when the sender of `status` is dropped.
 /// `initial` says the container was there when the session started.
+///
+/// A container that is let go is read a little longer, for the last lines
+/// of a pod that went away. With `dismissed` set before `status` is dropped,
+/// it is not: whoever follows it wants no more of it.
 pub(crate) async fn follow(
     context: Arc<Followers>,
     id: ContainerId,
     initial: bool,
     status: watch::Receiver<ContainerView>,
+    dismissed: Arc<AtomicBool>,
 ) {
     let api = Api::namespaced(context.client.clone(), &id.namespace);
     let format = context.formats.for_container(&id.container);
@@ -142,6 +148,7 @@ pub(crate) async fn follow(
         id,
         api,
         status,
+        dismissed,
         format,
         position: None,
         history_pending: false,
@@ -161,6 +168,8 @@ struct Follower {
     id: ContainerId,
     api: Api<Pod>,
     status: watch::Receiver<ContainerView>,
+    /// The container was let go on purpose, not because it went away.
+    dismissed: Arc<AtomicBool>,
     format: crate::parser::FormatChoice,
     /// The last line seen of the container's log.
     position: Option<Position>,
@@ -505,7 +514,14 @@ impl Follower {
                 }
                 changed = self.status.changed(), if closing_at.is_none() => {
                     if changed.is_err() {
-                        closing_at = Some(Instant::now() + CLOSING_GRACE);
+                        // A pod that went away may still have its last lines
+                        // to give; one that was let go on purpose is done.
+                        let grace = if self.dismissed.load(Ordering::Relaxed) {
+                            Duration::ZERO
+                        } else {
+                            CLOSING_GRACE
+                        };
+                        closing_at = Some(Instant::now() + grace);
                     }
                 }
                 _ = sleep_until(closing_at.unwrap_or(opened)), if closing_at.is_some() => {

@@ -74,6 +74,12 @@ pub enum Output {
     Settled {
         matched: BTreeSet<usize>,
     },
+    /// How many pods of the namespace each target has followed containers
+    /// in, by the index of the target. Sent whenever that changes; a target
+    /// with none is left out.
+    Matched {
+        pods: BTreeMap<usize, usize>,
+    },
 }
 
 /// One container of one pod.
@@ -203,6 +209,8 @@ pub struct NamespaceState {
     seen_events: HashMap<String, (i32, Option<DateTime<Utc>>)>,
     /// Events about nothing that is followed, so far.
     pending_events: VecDeque<EventView>,
+    /// The pods each target follows, as last reported.
+    followed_pods: BTreeMap<usize, usize>,
 }
 
 impl NamespaceState {
@@ -285,6 +293,7 @@ impl NamespaceState {
             events_since,
             seen_events: HashMap::new(),
             pending_events: VecDeque::new(),
+            followed_pods: BTreeMap::new(),
         };
         let mut out: Vec<Output> = state
             .owner_watches
@@ -446,6 +455,7 @@ impl NamespaceState {
         self.reconcile_containers(out);
         self.reconcile_events(out);
         self.note_ambiguous_names(out);
+        self.report_followed_pods(out);
 
         let all_live = |watches: &BTreeMap<WatchSpec, Progress>| {
             watches.values().all(|progress| progress.live)
@@ -720,6 +730,31 @@ impl NamespaceState {
             }
         }
         matched
+    }
+
+    /// Says how many pods each target follows, when that has changed.
+    fn report_followed_pods(&mut self, out: &mut Vec<Output>) {
+        let mut pods = BTreeMap::new();
+        for (index, target) in &self.targets {
+            let count = self
+                .pods
+                .values()
+                .filter(|entry| {
+                    entry
+                        .followed
+                        .keys()
+                        .any(|container| self.selects_container(target, container))
+                        && self.selects_pod(target, &entry.view)
+                })
+                .count();
+            if count > 0 {
+                pods.insert(*index, count);
+            }
+        }
+        if pods != self.followed_pods {
+            self.followed_pods = pods.clone();
+            out.push(Output::Matched { pods });
+        }
     }
 
     /// Says so when a plain name is the name of workloads of several kinds.
@@ -1305,6 +1340,68 @@ mod tests {
         assert_eq!(changes(&out), ["+a/api!", "+a/envoy!", "+b/envoy!"]);
         // The third target selects nothing.
         assert_eq!(settled(&out), Some(vec![0, 1]));
+    }
+
+    /// The pods each target follows, as the last report in `out` has them.
+    fn matched(out: &[Output]) -> Option<Vec<(usize, usize)>> {
+        out.iter().rev().find_map(|output| match output {
+            Output::Matched { pods } => Some(pods.iter().map(|(k, v)| (*k, *v)).collect()),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn the_pods_each_target_follows_are_counted_and_said_when_the_count_changes() {
+        let (mut state, out) = state(&["flowcpt/-/a/api", "flowcpt/-/*/envoy", "flowcpt/-/zzz"]);
+        assert_eq!(matched(&out), None);
+        let out = list_pods(
+            &mut state,
+            &pods(None),
+            vec![
+                pod("a", &[], None, &["api", "envoy", "other"]),
+                pod("b", &[], None, &["api", "envoy"]),
+            ],
+        );
+        // The first target follows one pod, the second both; the third
+        // follows none and is left out.
+        assert_eq!(matched(&out), Some(vec![(0, 1), (1, 2)]));
+
+        // A new state of a container is no new count.
+        let out = apply_pod(
+            &mut state,
+            &pods(None),
+            pod("b", &[], None, &["api", "envoy"]),
+        );
+        assert_eq!(matched(&out), None);
+
+        // A pod that comes and a pod that goes are.
+        let out = apply_pod(&mut state, &pods(None), pod("c", &[], None, &["envoy"]));
+        assert_eq!(matched(&out), Some(vec![(0, 1), (1, 3)]));
+        let out = delete_pod(
+            &mut state,
+            &pods(None),
+            pod("a", &[], None, &["api", "envoy", "other"]),
+        );
+        assert_eq!(matched(&out), Some(vec![(1, 2)]));
+    }
+
+    #[test]
+    fn a_pod_is_counted_for_a_target_only_through_the_containers_that_are_followed() {
+        // The container option keeps the sidecar out, so the target that
+        // selects nothing but the sidecar follows no pod.
+        let (mut state, _) = NamespaceState::new(
+            NS,
+            targets(&["flowcpt", "flowcpt/-/*/envoy"]),
+            Some(Pattern::new("api").unwrap()),
+            true,
+            None,
+        );
+        let out = list_pods(
+            &mut state,
+            &pods(None),
+            vec![pod("a", &[], None, &["api", "envoy"])],
+        );
+        assert_eq!(matched(&out), Some(vec![(0, 1)]));
     }
 
     // ---- a deployment --------------------------------------------------

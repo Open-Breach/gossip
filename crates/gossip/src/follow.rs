@@ -5,7 +5,7 @@ use std::io::{self, IsTerminal, Write};
 
 use anyhow::{Context, bail};
 use gossip_core::{
-    Cluster, Config, Filter, Kind, Output, Record, Session, SessionOptions, Settings, Template,
+    Cluster, Config, Filter, Kind, Output, Record, Session, SessionOptions, SessionSpec, Settings,
 };
 
 use crate::cli::FollowArgs;
@@ -50,7 +50,7 @@ pub async fn run(args: FollowArgs) -> anyhow::Result<()> {
 /// narrow the filter of the config file: a record must pass both. With
 /// `--no-filter` the filter of the config file is dropped first.
 fn settings(args: &FollowArgs, config: &Config) -> anyhow::Result<Settings> {
-    let asked = Template {
+    let asked = SessionSpec {
         context: args.context.clone(),
         targets: args.targets.clone(),
         container: args.container.clone(),
@@ -65,7 +65,7 @@ fn settings(args: &FollowArgs, config: &Config) -> anyhow::Result<Settings> {
     };
     let template = match &args.template {
         Some(name) => crate::templates::find(config, name)?.clone(),
-        None => Template::default(),
+        None => SessionSpec::default(),
     };
     let mut settings = asked.or(template).or(config.base()).resolve();
     // What is left in `filter` is the filter of the config file: the
