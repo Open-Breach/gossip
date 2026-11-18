@@ -132,8 +132,10 @@ pub struct ClusterEvent {
 pub const EXITED: &str = "Exited";
 
 /// How many events that are about nothing followed are kept, in case what
-/// they are about is reported a moment later.
-const PENDING_EVENTS: usize = 256;
+/// they are about is reported a moment later. The events of a namespace
+/// are listed before its pods are known, so this must hold the history of
+/// a busy namespace.
+const PENDING_EVENTS: usize = 4096;
 
 /// How far a watch has come.
 #[derive(Debug, Default)]
@@ -141,6 +143,11 @@ struct Progress {
     /// It has listed what there is, or failed trying; either way the
     /// namespace does not wait for it any longer.
     live: bool,
+    /// It has listed what there is at least once.
+    listed: bool,
+    /// For a pod watch: it was started while the namespace was first being
+    /// looked at, so what its first list holds was there at the start.
+    at_start: bool,
     /// The keys seen so far while it lists.
     listing: Option<HashSet<String>>,
 }
@@ -155,6 +162,12 @@ struct PodEntry {
     /// The latest end of a run known for each followed container, so that
     /// each end is told once.
     exits: BTreeMap<String, Exit>,
+    /// The pod was there when the session started: it came with the first
+    /// list of a watch that was started at the start.
+    at_start: bool,
+    /// The containers it had when it was first seen. One that is added to
+    /// a pod later is new, also in a pod that was there at the start.
+    first_containers: BTreeSet<String>,
 }
 
 /// The resolver's state for one namespace.
@@ -165,19 +178,25 @@ pub struct NamespaceState {
     targets: Vec<(usize, Target)>,
     /// Only containers whose name matches are followed.
     containers: Option<Pattern>,
-    /// Whether what is found before the namespace settles counts as having
-    /// been there when the session started.
+    /// Whether what the first lists hold counts as having been there when
+    /// the session started.
     initial_allowed: bool,
     owner_watches: BTreeMap<WatchSpec, Progress>,
     pod_watches: BTreeMap<WatchSpec, Progress>,
     owners: BTreeMap<(OwnerKind, String), WorkloadView>,
     pods: HashMap<String, PodEntry>,
     settled: bool,
+    /// Every owner watch has listed what there is, so whatever pod watch is
+    /// started from now on is about something that came later.
+    started: bool,
     /// The last failure of each watch, to say it once and not on every retry.
     failures: HashMap<WatchSpec, String>,
     /// The kinds a target's name was found in, when a notice said so.
     ambiguous: BTreeMap<usize, BTreeSet<WorkloadKind>>,
-    /// Whether cluster events are followed, and from which time on.
+    /// Whether cluster events are followed, and how far back: of the events
+    /// that are there when the watch first lists them, those not older than
+    /// this are told. What happens after that list is always told, whatever
+    /// the clocks say.
     events_since: Option<DateTime<Utc>>,
     /// The count and time of every event that was dealt with, by its uid,
     /// so that an event is told again only when it happens again.
@@ -260,6 +279,7 @@ impl NamespaceState {
             owners: BTreeMap::new(),
             pods: HashMap::new(),
             settled: false,
+            started: false,
             failures: HashMap::new(),
             ambiguous: BTreeMap::new(),
             events_since,
@@ -351,6 +371,7 @@ impl NamespaceState {
                     });
                 }
                 progress.live = true;
+                progress.listed = true;
             }
             Event::Apply(owner) => {
                 self.owners.insert((kind, owner.name.clone()), owner);
@@ -365,12 +386,22 @@ impl NamespaceState {
         let Some(progress) = self.pod_watches.get_mut(spec) else {
             return;
         };
-        let upsert = |pods: &mut HashMap<String, PodEntry>, pod: PodView| {
+        // What the first list of a watch started at the start holds was
+        // there when the session started. A list that failed and is tried
+        // again is still the first.
+        let first_list = progress.at_start && !progress.listed;
+        let upsert = |pods: &mut HashMap<String, PodEntry>, pod: PodView, at_start: bool| {
             let entry = pods.entry(pod_key(&pod)).or_insert_with(|| PodEntry {
+                first_containers: pod
+                    .containers
+                    .iter()
+                    .map(|container| container.name.clone())
+                    .collect(),
                 view: pod.clone(),
                 seen_by: BTreeSet::new(),
                 followed: BTreeMap::new(),
                 exits: BTreeMap::new(),
+                at_start,
             });
             entry.view = pod;
             entry.seen_by.insert(spec.clone());
@@ -381,7 +412,7 @@ impl NamespaceState {
                 if let Some(listing) = &mut progress.listing {
                     listing.insert(pod_key(&pod));
                 }
-                upsert(&mut self.pods, pod);
+                upsert(&mut self.pods, pod, first_list);
             }
             Event::InitDone => {
                 if let Some(listed) = progress.listing.take() {
@@ -392,8 +423,9 @@ impl NamespaceState {
                     }
                 }
                 progress.live = true;
+                progress.listed = true;
             }
-            Event::Apply(pod) => upsert(&mut self.pods, pod),
+            Event::Apply(pod) => upsert(&mut self.pods, pod, false),
             Event::Delete(pod) => {
                 if let Some(entry) = self.pods.get_mut(&pod_key(&pod)) {
                     entry.seen_by.remove(spec);
@@ -406,6 +438,11 @@ impl NamespaceState {
     /// known now.
     fn reconcile(&mut self, out: &mut Vec<Output>) {
         self.reconcile_pod_watches(out);
+        // The pod watches started up to here belong to the start; later
+        // ones are for workloads that came while the session ran.
+        if !self.started && self.owner_watches.values().all(|progress| progress.listed) {
+            self.started = true;
+        }
         self.reconcile_containers(out);
         self.reconcile_events(out);
         self.note_ambiguous_names(out);
@@ -439,7 +476,11 @@ impl NamespaceState {
         }
         for spec in desired {
             if !self.pod_watches.contains_key(&spec) {
-                self.pod_watches.insert(spec.clone(), Progress::default());
+                let progress = Progress {
+                    at_start: self.initial_allowed && !self.started,
+                    ..Progress::default()
+                };
+                self.pod_watches.insert(spec.clone(), progress);
                 out.push(Output::Start(spec));
             }
         }
@@ -505,9 +546,9 @@ impl NamespaceState {
             .collect();
         keys.sort();
 
-        let initial = self.initial_allowed && !self.settled;
         for (_, key) in keys {
             let entry = &self.pods[&key];
+            let pod_at_start = entry.at_start;
             let gone = entry.seen_by.is_empty();
             let wanted = if gone {
                 BTreeMap::new()
@@ -534,7 +575,7 @@ impl NamespaceState {
                     None => out.push(Output::Container(ContainerEvent::Added {
                         id: id(name),
                         view: view.clone(),
-                        initial,
+                        initial: pod_at_start && entry.first_containers.contains(name),
                     })),
                     Some(known) if known != view => {
                         out.push(Output::Container(ContainerEvent::Changed {
@@ -562,7 +603,7 @@ impl NamespaceState {
             let was_followed = !entry.followed.is_empty();
             let is_followed = !wanted.is_empty();
             let pod = entry.view.name.clone();
-            if !was_followed && is_followed && !initial {
+            if !was_followed && is_followed && !pod_at_start {
                 let names: Vec<&str> = wanted.keys().map(String::as_str).collect();
                 out.push(Output::Notice {
                     message: format!("pod {pod} appeared; following {}", names.join(", ")),
@@ -725,21 +766,25 @@ impl NamespaceState {
         let Some(progress) = self.owner_watches.get_mut(spec) else {
             return;
         };
+        // What the first list holds was there before the session; whether
+        // that is history worth telling is a matter of its time.
+        let first_list = !progress.listed;
         match event {
             Event::Init => progress.listing = Some(HashSet::new()),
             Event::InitApply(event) => {
                 if let Some(listing) = &mut progress.listing {
                     listing.insert(event.uid.clone());
                 }
-                self.offer_event(event);
+                self.offer_event(event, first_list);
             }
             Event::InitDone => {
                 if let Some(listed) = progress.listing.take() {
                     self.seen_events.retain(|uid, _| listed.contains(uid));
                 }
                 progress.live = true;
+                progress.listed = true;
             }
-            Event::Apply(event) => self.offer_event(event),
+            Event::Apply(event) => self.offer_event(event, false),
             Event::Delete(event) => {
                 self.seen_events.remove(&event.uid);
                 self.pending_events
@@ -750,17 +795,20 @@ impl NamespaceState {
 
     /// Takes an event as the watch reports it: new, or an old one that has
     /// happened again.
-    fn offer_event(&mut self, event: EventView) {
+    fn offer_event(&mut self, event: EventView, first_list: bool) {
         let occurrence = (event.count, event.time);
         if self.seen_events.get(&event.uid) == Some(&occurrence) {
             return;
         }
-        // What happened before the session's history begins is not told,
-        // but remembered, so that it is told when it happens again.
-        let too_old = match (event.time, self.events_since) {
-            (Some(time), Some(since)) => time < since,
-            _ => false,
-        };
+        // What was there before the session and is older than its history
+        // is not told, but remembered, so that it is told when it happens
+        // again. An event that arrives while the session runs is new by
+        // that fact alone; its time is not compared with this machine's
+        // clock, which may be ahead of the cluster's.
+        let too_old = first_list
+            && self
+                .events_since
+                .is_some_and(|since| event.time.is_none_or(|time| time < since));
         if too_old {
             self.seen_events.insert(event.uid, occurrence);
             return;
@@ -2074,22 +2122,71 @@ mod tests {
         );
     }
 
+    /// Lets the watch on events list these, as it does when it starts.
+    fn list_events(state: &mut NamespaceState, events: Vec<EventView>) -> Vec<Output> {
+        let mut out = state.handle(Input::Cluster(WatchSpec::Events, Event::Init));
+        for event in events {
+            out.extend(state.handle(Input::Cluster(WatchSpec::Events, Event::InitApply(event))));
+        }
+        out.extend(state.handle(Input::Cluster(WatchSpec::Events, Event::InitDone)));
+        out
+    }
+
     #[test]
-    fn an_event_from_before_the_history_begins_is_told_only_when_it_happens_again() {
+    fn of_the_events_that_are_there_at_the_start_only_those_of_the_history_are_told() {
         let (mut state, _) = state_with_events(&["flowcpt"]);
         list_pods(&mut state, &pods(None), vec![pod("a", &[], None, &["api"])]);
-        // An hour before the session's history begins.
+        // One from an hour before the history begins, one from within it.
         let old = cluster_event("e1", "Pod", "a", "Unhealthy", 7, -3_600);
-        assert_eq!(
-            told(&apply_event(&mut state, old.clone())),
-            Vec::<String>::new()
-        );
+        let recent = cluster_event("e2", "Pod", "a", "Started", 1, 30);
+        let out = list_events(&mut state, vec![old.clone(), recent]);
+        assert_eq!(told(&out), ["Pod/a Started x1"]);
+
+        // The old one is told when it happens again.
         assert_eq!(told(&apply_event(&mut state, old)), Vec::<String>::new());
-        let again = cluster_event("e1", "Pod", "a", "Unhealthy", 8, 30);
+        let again = cluster_event("e1", "Pod", "a", "Unhealthy", 8, 60);
         assert_eq!(
             told(&apply_event(&mut state, again)),
             ["Pod/a Unhealthy x8"]
         );
+    }
+
+    #[test]
+    fn an_event_that_arrives_while_the_session_runs_is_told_whatever_its_time() {
+        let (mut state, _) = state_with_events(&["flowcpt"]);
+        list_pods(&mut state, &pods(None), vec![pod("a", &[], None, &["api"])]);
+        list_events(&mut state, vec![]);
+        // The clock of this machine is ahead of the cluster's: by it, the
+        // event happened before the session began. It did not.
+        let skewed = cluster_event("e1", "Pod", "a", "Killing", 1, -120);
+        assert_eq!(told(&apply_event(&mut state, skewed)), ["Pod/a Killing x1"]);
+
+        // An event the watch finds when it lists again was missed while the
+        // watch was down, and is told too.
+        let missed = cluster_event("e2", "Pod", "a", "Started", 1, -60);
+        assert_eq!(
+            told(&list_events(&mut state, vec![missed])),
+            ["Pod/a Started x1"]
+        );
+    }
+
+    #[test]
+    fn more_events_than_a_few_hundred_can_wait_for_their_pods() {
+        let (mut state, _) = state_with_events(&["flowcpt"]);
+        // The events of a busy namespace are listed before any pod is known.
+        let events: Vec<EventView> = (0..1_000)
+            .map(|number| {
+                let pod = format!("pod-{}", number % 10);
+                cluster_event(&format!("e{number}"), "Pod", &pod, "Pulled", 1, number)
+            })
+            .collect();
+        assert_eq!(told(&list_events(&mut state, events)), Vec::<String>::new());
+        let out = list_pods(
+            &mut state,
+            &pods(None),
+            vec![pod("pod-3", &[], None, &["api"])],
+        );
+        assert_eq!(told(&out).len(), 100);
     }
 
     #[test]
@@ -2217,6 +2314,92 @@ mod tests {
         let out = apply_pod(&mut state, &all, pod_in(exited(1, 10), 0, None));
         assert_eq!(changes(&out), ["~a/api"]);
         assert_eq!(told(&out), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_first_list_that_fails_and_is_tried_again_still_finds_what_was_there_at_the_start() {
+        let (mut state, _) = state(&["flowcpt/deployment:flowcpt-api"]);
+        let deployments = owners(OwnerKind::Deployment, Some("flowcpt-api"));
+        let sets = owners(OwnerKind::ReplicaSet, None);
+        // The API server hiccups on the first lists.
+        state.handle(Input::Failed(
+            deployments.clone(),
+            "connection reset".to_string(),
+        ));
+        let out = state.handle(Input::Failed(sets.clone(), "connection reset".to_string()));
+        assert_eq!(settled(&out), Some(vec![]));
+
+        // A second later they work. The pods were there all along: they get
+        // the history of the start, not their whole log, and no notice.
+        list_owners(
+            &mut state,
+            &deployments,
+            vec![deployment("flowcpt-api", &[("app", "flowcpt-api")])],
+        );
+        list_owners(
+            &mut state,
+            &sets,
+            vec![replica_set("flowcpt-api-7d9f", "flowcpt-api")],
+        );
+        let pod_watch = pods(Some("app=flowcpt-api"));
+        state.handle(Input::Failed(
+            pod_watch.clone(),
+            "connection reset".to_string(),
+        ));
+        let out = list_pods(
+            &mut state,
+            &pod_watch,
+            vec![set_pod(
+                "flowcpt-api-7d9f-xk2p1",
+                "flowcpt-api",
+                "flowcpt-api-7d9f",
+                &["api"],
+            )],
+        );
+        assert_eq!(changes(&out), ["+flowcpt-api-7d9f-xk2p1/api!"]);
+        assert_eq!(notices(&out), Vec::<String>::new());
+
+        // A pod that comes after that is new.
+        let out = apply_pod(
+            &mut state,
+            &pod_watch,
+            set_pod(
+                "flowcpt-api-7d9f-m4q8z",
+                "flowcpt-api",
+                "flowcpt-api-7d9f",
+                &["api"],
+            ),
+        );
+        assert_eq!(changes(&out), ["+flowcpt-api-7d9f-m4q8z/api"]);
+    }
+
+    #[test]
+    fn a_pod_that_is_there_at_the_start_stays_so_when_it_is_matched_late() {
+        // The pods are listed before the replica sets are.
+        let (mut state, _) = state(&["flowcpt/deployment:flowcpt-api"]);
+        list_owners(
+            &mut state,
+            &owners(OwnerKind::Deployment, Some("flowcpt-api")),
+            vec![deployment("flowcpt-api", &[("app", "flowcpt-api")])],
+        );
+        let out = list_pods(
+            &mut state,
+            &pods(Some("app=flowcpt-api")),
+            vec![set_pod(
+                "flowcpt-api-7d9f-xk2p1",
+                "flowcpt-api",
+                "flowcpt-api-7d9f",
+                &["api"],
+            )],
+        );
+        assert_eq!(changes(&out), Vec::<String>::new());
+        let out = list_owners(
+            &mut state,
+            &owners(OwnerKind::ReplicaSet, None),
+            vec![replica_set("flowcpt-api-7d9f", "flowcpt-api")],
+        );
+        assert_eq!(changes(&out), ["+flowcpt-api-7d9f-xk2p1/api!"]);
+        assert_eq!(notices(&out), Vec::<String>::new());
     }
 
     #[test]
