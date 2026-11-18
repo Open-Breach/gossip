@@ -1,29 +1,64 @@
 # Gossip
 
-Gossip is a Rust tool for following Kubernetes pod logs and cluster events
-across restarts and rollouts. It is built as a core library plus a command
-line, step by step from [SPEC.md](SPEC.md).
+Gossip follows the logs of a set of Kubernetes workloads from the command
+line. It keeps following them across pod restarts and rollouts, merges the
+cluster's own events about those pods into the same stream, and reads JSON
+and logfmt lines as data: a level, a message and fields.
 
-This README describes what exists in the repository today, not what the spec
-plans.
+```bash
+gossip follow flowcpt/flowcpt-api
+```
+
+```
+14:02:11.482 7d9f-xk2p1 api  WARN  request_id=8b1c tenant_id=t_123  payment intent expired
+14:02:11.490 7d9f-xk2p1 💀         Killing: Container api failed liveness probe, will be restarted
+14:02:12.007 7d9f-m4q8z api  INFO  request_id=8b1d tenant_id=t_456  request done
+14:02:13.004 7d9f-xk2p1 🚀         Started: Started container api
+14:02:13.210 7d9f-xk2p1 api  INFO  version=0.14.2  starting
+```
 
 ## Status
 
-Two commands work against a cluster: `gossip list` shows what is in it, and
-`gossip follow` follows the logs of a set of targets across restarts and
-rollouts, with the cluster's own events about those pods in the same stream.
-Templates from a config file are not built yet.
+Gossip is a prototype, built from [SPEC.md](SPEC.md). This README describes
+what exists in the repository today.
 
-| Crate | Kind | Holds today |
+It is one Cargo workspace with two crates:
+
+| Crate | Kind | Holds |
 | --- | --- | --- |
-| `crates/gossip-core` | library | cluster access, discovery, target resolution, log streams with reconnection, cluster events, the session that merges them, the line parser, filters; and, not yet used by the command line, the config file |
-| `crates/gossip` | binary `gossip` | `gossip list`, `gossip follow` |
+| `crates/gossip-core` | library | cluster access, discovery, target resolution, log streams with reconnection, cluster events, the session that merges them, the line parser, filters, the config file |
+| `crates/gossip` | binary `gossip` | the commands `list`, `follow` and `templates`, and the rendering |
+
+The command line only presents what the core produces; nothing in it talks to
+the cluster, and the core prints nothing. Gossip follows one cluster at a
+time.
 
 Gossip is a client only: it reads from the cluster and never creates, changes
 or deletes anything in it. It reaches the cluster through the kubeconfig
 (`KUBECONFIG` or `~/.kube/config`) with the same credentials `kubectl` uses,
 exec plugins such as `kubelogin` included, and it honours `HTTPS_PROXY` and a
 `proxy-url` in the kubeconfig.
+
+The tests run the whole of it against a stand-in API server inside the test
+code. Its behaviour against a real cluster is checked by hand; there are no
+tests against a cluster in CI.
+
+## Build and install
+
+Gossip needs the latest stable Rust toolchain (edition 2024);
+`rust-toolchain.toml` selects it for you when you use `rustup`.
+
+Install the `gossip` binary into `~/.cargo/bin`:
+
+```bash
+cargo install --path crates/gossip
+```
+
+Or build and run from a checkout:
+
+```bash
+cargo run -p gossip -- --help
+```
 
 ## Commands
 
@@ -56,15 +91,11 @@ ends the command with exit code 1 and the error.
 ### `gossip follow`
 
 ```bash
-gossip follow flowcpt/flowcpt-api
+gossip follow <target>... [flags]
 ```
 
-```
-14:02:11.482 7d9f-xk2p1 api  WARN  request_id=8b1c tenant_id=t_123  payment intent expired
-14:02:11.490 7d9f-xk2p1 💀         Killing: Container api failed liveness probe, will be restarted
-14:02:12.007 7d9f-m4q8z api  INFO  request_id=8b1d tenant_id=t_456  request done
-14:02:13.004 7d9f-xk2p1 🚀         Started: Started container api
-14:02:13.210 7d9f-xk2p1 api  INFO  version=0.14.2  starting
+```bash
+gossip follow --template <name> [flags]
 ```
 
 Follow prints the last lines of every container the targets select, then new
@@ -97,6 +128,7 @@ Gossip keeps watching until something matches.
 
 | Flag | Meaning | Default |
 | --- | --- | --- |
+| `--template <name>` | follow what a template of the config file says, in place of targets | none |
 | `--context <name>` | the kubeconfig context of the cluster | the current context |
 | `--since <duration>` | history per container at start: `30s`, `5m`, `1h` | none |
 | `--tail <n>` | last n lines per container at start | 20, unless `--since` is given |
@@ -178,30 +210,123 @@ Ctrl-C stops following and exits 0. A cluster that cannot be reached at start
 exits 1 with the error; once following, Gossip retries instead and says so in
 a notice.
 
-## Build and install
+### `gossip templates`
 
-Gossip needs the latest stable Rust toolchain (edition 2024);
-`rust-toolchain.toml` selects it for you when you use `rustup`.
-
-Build and run from a checkout:
+| Form | Shows |
+| --- | --- |
+| `gossip templates` | the templates of the config file, with their targets |
+| `gossip templates show <name>` | one template, as it stands in the config file |
 
 ```bash
-cargo build
+gossip templates
+```
+
+```
+NAME          TARGETS
+dev-api       flowcpt/flowcpt-api, flowcpt/flowcpt-web-api
+staging-all   flowcpt-stg
+```
+
+## Config file and templates
+
+One TOML file holds defaults and templates: named, saved combinations of
+targets, filters and options. It lives at `~/.config/gossip/gossip.toml` on
+Linux and in the platform's config directory elsewhere; `$GOSSIP_CONFIG`
+overrides the path. Gossip only reads it. Nothing secret goes in it:
+credentials stay in the kubeconfig.
+
+```toml
+[defaults]
+context = "aks-vulcan-01"
+tail = 20
+events = true
+
+[templates.dev-api]
+context = "aks-vulcan-01"
+targets = ["flowcpt/flowcpt-api", "flowcpt/flowcpt-web-api"]
+container = "api"
+filter = { all = [
+  { field = "level", op = ">=", value = "info" },
+  { any = [
+    { field = "f.tenant_id", op = "==", value = "t_123" },
+    { field = "kind", op = "==", value = "event" },
+  ] },
+] }
+fields = ["tenant_id", "request_id"]
+
+[templates.staging-all]
+context = "aks-vulcan-01"
+targets = ["flowcpt-stg/*"]
+since = "5m"
+format = { api = "json", envoy = "text" }
 ```
 
 ```bash
-cargo run -p gossip -- --help
+gossip follow --template dev-api
 ```
 
-Install the `gossip` binary into `~/.cargo/bin`:
+A template holds what `follow` takes:
 
-```bash
-cargo install --path crates/gossip
+| Key | Value |
+| --- | --- |
+| `context` | the kubeconfig context of the cluster |
+| `targets` | a list of targets |
+| `container` | a glob: only containers whose name matches |
+| `since` | history at start as a duration, `"5m"` |
+| `tail` | history at start as a number of lines |
+| `events` | `false` leaves the cluster's events out |
+| `format` | `"auto"`, `"json"`, `"logfmt"` or `"text"` for every container, or a table by container name; `"text"` shows lines untouched and does not join continuation lines |
+| `filter` | a filter, see below |
+| `fields` | the fields of a line to show, in this order |
+| `output` | `"text"` or `"json"` |
+
+What is used is decided in layers: a flag on the command line, then the
+template, then `[defaults]`, then the built-in defaults. `[defaults]` takes
+every key of a template except `targets`, and applies to `gossip follow` with
+or without a template. `since` and `tail` are one setting: the layer that
+gives either one decides both. A filter flag (`--level`, `--grep`, `--match`,
+`--field`) beside a template takes the place of the template's filter.
+
+An unknown key is an error that names the line, so that a typo in a template
+does not silently follow the wrong thing.
+
+### Filters
+
+A filter is a rule, or `all`, `any` or `not` over filters, nested as deep as
+needed:
+
+```toml
+filter = { field = "message", op = "contains", value = "expired" }
+filter = { not = { field = "f.debug", op = "exists" } }
 ```
+
+A rule compares a field of a record with a value.
+
+| Fields | |
+| --- | --- |
+| `level` | `trace`, `debug`, `info`, `warn`, `error` |
+| `message` | the message of a line or an event |
+| `pod`, `container`, `namespace` | where the record came from |
+| `kind` | `line`, `event` or `notice` |
+| `f.<key>` | a field of the line, such as `f.tenant_id` |
+
+| Operators | |
+| --- | --- |
+| `==`, `!=` | equal, not equal |
+| `>=` | at this level or above; on `level` only |
+| `contains` | the value is part of the field |
+| `matches` | the regular expression finds a match in the field |
+| `exists` | the record has the field; takes no value |
+
+A rule on a field the record does not have is false, except `!=`. In the
+config file a filter is exactly what is written: unlike the filter flags, it
+applies to events too, which is why the example above names `kind == event`.
+Notices from Gossip always pass.
 
 ## Development
 
-The same three checks run in CI on every push and pull request:
+The tests need no cluster. The same three checks run in CI on every push and
+pull request:
 
 ```bash
 cargo fmt --check

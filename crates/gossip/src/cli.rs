@@ -23,6 +23,9 @@ pub enum Command {
     /// Follow the logs of a set of targets, across restarts and rollouts.
     #[command(after_help = TARGET_FORMS)]
     Follow(Box<FollowArgs>),
+
+    /// List the templates of the config file, or show one.
+    Templates(TemplatesArgs),
 }
 
 const TARGET_FORMS: &str = "\
@@ -59,8 +62,17 @@ pub struct ListArgs {
 #[derive(Debug, Args)]
 pub struct FollowArgs {
     /// What to follow; see the forms below.
-    #[arg(value_name = "TARGET", required = true)]
+    #[arg(
+        value_name = "TARGET",
+        required_unless_present = "template",
+        conflicts_with = "template"
+    )]
     pub targets: Vec<Target>,
+
+    /// Follow what a template of the config file says. Flags given beside
+    /// it override its values.
+    #[arg(long, value_name = "NAME")]
+    pub template: Option<String>,
 
     /// The kubeconfig context of the cluster [default: the current context].
     #[arg(long, value_name = "NAME")]
@@ -123,6 +135,22 @@ pub struct FollowArgs {
     /// stdout is a terminal and the locale is UTF-8].
     #[arg(long)]
     pub no_emoji: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct TemplatesArgs {
+    #[command(subcommand)]
+    pub command: Option<TemplatesCommand>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TemplatesCommand {
+    /// Print one template as it stands in the config file.
+    Show {
+        /// The name of the template.
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
 }
 
 #[cfg(test)]
@@ -240,6 +268,34 @@ mod tests {
         assert_eq!(args.fields, None);
         assert!(!args.raw && !args.no_color && !args.long_names);
         assert!(!args.no_events && !args.no_emoji);
+    }
+
+    #[test]
+    fn follow_takes_a_template_in_place_of_targets() {
+        let args = follow(&["--template", "dev-api", "--tail", "50"]).unwrap();
+        assert_eq!(args.template.as_deref(), Some("dev-api"));
+        assert!(args.targets.is_empty());
+        assert_eq!(args.tail, Some(50));
+        // One or the other, not both and not neither.
+        assert!(follow(&["flowcpt", "--template", "dev-api"]).is_err());
+        assert!(follow(&["--tail", "50"]).is_err());
+    }
+
+    #[test]
+    fn templates_lists_or_shows_one() {
+        let parse = |args: &[&str]| {
+            let cli = Cli::try_parse_from(["gossip", "templates"].iter().chain(args)).unwrap();
+            match cli.command {
+                Command::Templates(args) => args.command,
+                other => panic!("expected the templates command, got {other:?}"),
+            }
+        };
+        assert!(parse(&[]).is_none());
+        let Some(TemplatesCommand::Show { name }) = parse(&["show", "dev-api"]) else {
+            panic!("expected show");
+        };
+        assert_eq!(name, "dev-api");
+        assert!(Cli::try_parse_from(["gossip", "templates", "show"]).is_err());
     }
 
     #[test]
