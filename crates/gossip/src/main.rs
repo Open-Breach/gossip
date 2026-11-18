@@ -9,6 +9,7 @@ mod follow;
 mod list;
 mod render;
 mod table;
+mod templates;
 
 use std::io;
 use std::process::ExitCode;
@@ -35,6 +36,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::List(args) => list::run(&args, &mut io::stdout().lock()).await,
         Command::Follow(args) => follow::run(*args).await,
+        Command::Templates(args) => templates::run(&args, &mut io::stdout().lock()),
     }
 }
 

@@ -55,14 +55,31 @@ struct Follow {
     child: Child,
     stdout: Lines<BufReader<ChildStdout>>,
     kubeconfig: PathBuf,
+    config: PathBuf,
 }
 
 impl Follow {
-    /// Starts `gossip follow` with these arguments against the stand-in.
+    /// Starts `gossip follow` with these arguments against the stand-in,
+    /// with an empty config file.
     fn start(fake: &FakeCluster, test: &str, args: &[&str]) -> Follow {
+        Follow::start_with_config(fake, test, "", args)
+    }
+
+    /// The same with a config file of this content.
+    fn start_with_config(
+        fake: &FakeCluster,
+        test: &str,
+        config_text: &str,
+        args: &[&str],
+    ) -> Follow {
         let kubeconfig =
             std::env::temp_dir().join(format!("gossip-{}-{test}.kubeconfig", std::process::id()));
         std::fs::write(&kubeconfig, fake.kubeconfig()).unwrap();
+        // A config file of the test's own, so that the one of whoever runs
+        // the tests stays out of them.
+        let config =
+            std::env::temp_dir().join(format!("gossip-{}-{test}.toml", std::process::id()));
+        std::fs::write(&config, config_text).unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_gossip"));
         command
             .arg("follow")
@@ -70,7 +87,7 @@ impl Follow {
             .env("KUBECONFIG", &kubeconfig)
             // Times are printed in the local zone; pin it down.
             .env("TZ", "UTC")
-            .env_remove("GOSSIP_CONFIG")
+            .env("GOSSIP_CONFIG", &config)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
@@ -90,6 +107,7 @@ impl Follow {
             child,
             stdout,
             kubeconfig,
+            config,
         }
     }
 
@@ -120,6 +138,7 @@ impl Follow {
 impl Drop for Follow {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.kubeconfig);
+        let _ = std::fs::remove_file(&self.config);
     }
 }
 
@@ -572,4 +591,117 @@ async fn an_event_as_json_carries_its_reason_type_and_count() {
             "reason": "BackOff", "type": "Warning", "count": 1, "regarding": "Pod/redis-0"
         })
     );
+}
+
+const TEMPLATES: &str = r#"
+[defaults]
+tail = 2
+events = false
+
+[templates.tenant]
+targets = ["flowcpt"]
+container = "api"
+tail = 10
+fields = ["request_id"]
+filter = { all = [
+  { field = "level", op = ">=", value = "warn" },
+  { field = "f.tenant_id", op = "==", value = "t_123" },
+] }
+
+[templates.plain]
+targets = ["flowcpt"]
+fields = []
+"#;
+
+#[tokio::test]
+async fn a_template_behaves_as_the_flags_spelt_out_in_it() {
+    let fake = FakeCluster::start().await;
+    seed_tenant_lines(&fake);
+
+    let mut by_template = Follow::start_with_config(
+        &fake,
+        "template",
+        TEMPLATES,
+        &["--template", "tenant", "--no-color"],
+    );
+    let from_template = by_template.line().await;
+    by_template.expect_quiet().await;
+
+    let mut by_flags = Follow::start(
+        &fake,
+        "template-flags",
+        &[
+            "flowcpt",
+            "--no-color",
+            "--no-events",
+            "--container",
+            "api",
+            "--tail",
+            "10",
+            "--fields",
+            "request_id",
+            "--level",
+            "warn",
+            "--field",
+            "tenant_id=t_123",
+        ],
+    );
+    let from_flags = by_flags.line().await;
+    by_flags.expect_quiet().await;
+
+    assert_eq!(
+        from_template,
+        "14:00:02.000 redis-0 api  WARN  request_id=8b1d  payment intent expired"
+    );
+    assert_eq!(from_template, from_flags);
+}
+
+#[tokio::test]
+async fn the_defaults_fill_in_what_a_template_leaves_out_and_a_flag_overrides() {
+    let fake = FakeCluster::start().await;
+    seed_tenant_lines(&fake);
+
+    // The template says nothing about the history: the defaults give 2 lines.
+    let mut follow = Follow::start_with_config(
+        &fake,
+        "template-defaults",
+        TEMPLATES,
+        &["--template", "plain", "--no-color"],
+    );
+    assert_eq!(
+        follow.lines(2).await,
+        [
+            "14:00:03.000 redis-0 api  ERROR card declined",
+            "14:00:04.000 redis-0 api        a plain line with no level",
+        ]
+    );
+    follow.expect_quiet().await;
+
+    // A flag beside the template overrides: three lines of history.
+    let mut follow = Follow::start_with_config(
+        &fake,
+        "template-override",
+        TEMPLATES,
+        &["--template", "plain", "--no-color", "--tail", "3"],
+    );
+    let lines = follow.lines(3).await;
+    assert!(
+        lines[0].ends_with("WARN  payment intent expired"),
+        "{}",
+        lines[0]
+    );
+    follow.expect_quiet().await;
+
+    // A filter flag takes the place of the filter of the template.
+    let mut follow = Follow::start_with_config(
+        &fake,
+        "template-filter",
+        TEMPLATES,
+        &["--template", "tenant", "--no-color", "--level", "error"],
+    );
+    assert_eq!(
+        follow.line().await,
+        "14:00:03.000 redis-0 api  ERROR request_id=8b1e  card declined"
+    );
+    follow.expect_quiet().await;
 }

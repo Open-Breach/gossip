@@ -5,14 +5,15 @@ use std::io::{self, IsTerminal, Write};
 
 use anyhow::{Context, bail};
 use gossip_core::{
-    Cluster, Filter, Kind, Output, Record, Session, SessionOptions, Settings, Template,
+    Cluster, Config, Filter, Kind, Output, Record, Session, SessionOptions, Settings, Template,
 };
 
 use crate::cli::FollowArgs;
 use crate::render::{TextOptions, TextRenderer, Zone, json_line};
 
 pub async fn run(args: FollowArgs) -> anyhow::Result<()> {
-    let settings = settings(&args)?;
+    let config = Config::load()?;
+    let settings = settings(&args, &config)?;
     let cluster = Cluster::open(settings.context.as_deref()).await?;
     // A cluster that cannot be reached at start is an error. Once the
     // session runs, the core retries instead.
@@ -40,9 +41,9 @@ pub async fn run(args: FollowArgs) -> anyhow::Result<()> {
     }
 }
 
-/// What the command line asks for, with the built-in defaults for whatever
-/// it leaves out.
-fn settings(args: &FollowArgs) -> anyhow::Result<Settings> {
+/// What to follow and how: the flags, over the template when one is named,
+/// over the `[defaults]` of the config file, over the built-in defaults.
+fn settings(args: &FollowArgs, config: &Config) -> anyhow::Result<Settings> {
     let asked = Template {
         context: args.context.clone(),
         targets: args.targets.clone(),
@@ -55,7 +56,20 @@ fn settings(args: &FollowArgs) -> anyhow::Result<Settings> {
         fields: args.fields.clone(),
         output: args.output,
     };
-    Ok(asked.resolve())
+    let template = match &args.template {
+        Some(name) => crate::templates::find(config, name)?.clone(),
+        None => Template::default(),
+    };
+    let settings = asked
+        .or(template)
+        .or(config.defaults.clone().into())
+        .resolve();
+    if settings.targets.is_empty()
+        && let Some(name) = &args.template
+    {
+        bail!("the template `{name}` has no targets");
+    }
+    Ok(settings)
 }
 
 /// The filter the flags stand for: every one of them must hold for a line.
@@ -176,7 +190,7 @@ mod tests {
 
     #[test]
     fn the_defaults_of_follow() {
-        let settings = settings(&args(&[])).unwrap();
+        let settings = settings(&args(&[]), &Config::default()).unwrap();
         assert_eq!(settings.context, None);
         assert_eq!(settings.targets.len(), 1);
         assert_eq!(settings.container, None);
@@ -191,11 +205,15 @@ mod tests {
 
     #[test]
     fn since_alone_is_not_cut_to_twenty_lines() {
-        let settings = settings(&args(&["--since", "5m"])).unwrap();
+        let settings = settings(&args(&["--since", "5m"]), &Config::default()).unwrap();
         assert_eq!(settings.since, Some(Duration::from_secs(300)));
         assert_eq!(settings.tail, None);
 
-        let both = super::settings(&args(&["--since", "5m", "--tail", "50"])).unwrap();
+        let both = super::settings(
+            &args(&["--since", "5m", "--tail", "50"]),
+            &Config::default(),
+        )
+        .unwrap();
         assert_eq!(both.since, Some(Duration::from_secs(300)));
         assert_eq!(both.tail, Some(50));
     }
@@ -276,8 +294,159 @@ mod tests {
 
     #[test]
     fn events_are_on_unless_no_events_is_given() {
-        assert!(settings(&args(&[])).unwrap().events);
-        assert!(!settings(&args(&["--no-events"])).unwrap().events);
+        assert!(settings(&args(&[]), &Config::default()).unwrap().events);
+        assert!(
+            !settings(&args(&["--no-events"]), &Config::default())
+                .unwrap()
+                .events
+        );
+    }
+
+    // ---- templates and defaults ---------------------------------------
+
+    const CONFIG: &str = r#"
+[defaults]
+context = "aks-vulcan-01"
+tail = 50
+events = false
+output = "json"
+
+[templates.dev-api]
+targets = ["flowcpt/flowcpt-api", "flowcpt/flowcpt-web-api"]
+container = "api"
+filter = { field = "level", op = ">=", value = "info" }
+fields = ["tenant_id", "request_id"]
+format = { api = "json" }
+
+[templates.staging-all]
+context = "aks-staging"
+targets = ["flowcpt-stg/*"]
+since = "5m"
+output = "text"
+
+[templates.empty]
+container = "api"
+"#;
+
+    /// `gossip follow` with these arguments and nothing else.
+    fn follow_args(arguments: &[&str]) -> FollowArgs {
+        let cli = Cli::try_parse_from(["gossip", "follow"].iter().chain(arguments)).unwrap();
+        match cli.command {
+            Command::Follow(args) => *args,
+            other => panic!("expected the follow command, got {other:?}"),
+        }
+    }
+
+    fn config() -> Config {
+        Config::from_toml(CONFIG).unwrap()
+    }
+
+    #[test]
+    fn a_template_behaves_as_the_flags_it_spells_out() {
+        let settings = settings(&follow_args(&["--template", "dev-api"]), &config()).unwrap();
+        assert_eq!(
+            settings.targets,
+            [
+                "flowcpt/flowcpt-api".parse().unwrap(),
+                "flowcpt/flowcpt-web-api".parse().unwrap()
+            ]
+        );
+        assert!(settings.container.unwrap().matches("api"));
+        assert_eq!(settings.filter, Some(Filter::level_at_least(Level::Info)));
+        assert_eq!(
+            settings.fields,
+            Some(vec!["tenant_id".to_string(), "request_id".to_string()])
+        );
+        assert_eq!(settings.format.for_container("api"), FormatChoice::Json);
+        assert_eq!(settings.format.for_container("envoy"), FormatChoice::Auto);
+        // What the template leaves out comes from the defaults.
+        assert_eq!(settings.context.as_deref(), Some("aks-vulcan-01"));
+        assert_eq!(settings.tail, Some(50));
+        assert_eq!(settings.since, None);
+        assert!(!settings.events);
+        assert_eq!(settings.output, Output::Json);
+    }
+
+    #[test]
+    fn a_template_wins_over_the_defaults() {
+        let settings = settings(&follow_args(&["--template", "staging-all"]), &config()).unwrap();
+        assert_eq!(settings.context.as_deref(), Some("aks-staging"));
+        assert_eq!(settings.output, Output::Text);
+        // Its `since` decides the history; the `tail` of the defaults does
+        // not cut it to 50 lines.
+        assert_eq!(settings.since, Some(Duration::from_secs(300)));
+        assert_eq!(settings.tail, None);
+    }
+
+    #[test]
+    fn a_flag_beside_a_template_overrides_it() {
+        let settings = settings(
+            &follow_args(&[
+                "--template",
+                "dev-api",
+                "--context",
+                "kind-dev",
+                "--container",
+                "envoy",
+                "--tail",
+                "5",
+                "--fields",
+                "status",
+                "--output",
+                "text",
+                "--level",
+                "error",
+            ]),
+            &config(),
+        )
+        .unwrap();
+        assert_eq!(settings.context.as_deref(), Some("kind-dev"));
+        assert!(settings.container.unwrap().matches("envoy"));
+        assert_eq!(settings.tail, Some(5));
+        assert_eq!(settings.fields, Some(vec!["status".to_string()]));
+        assert_eq!(settings.output, Output::Text);
+        // The filter of the flags takes the place of the template's.
+        assert_eq!(
+            settings.filter,
+            Some(Filter::Any(vec![
+                Filter::kind_is(Kind::Event),
+                Filter::level_at_least(Level::Error),
+            ]))
+        );
+        // What no flag names stays as the template has it.
+        assert_eq!(settings.targets.len(), 2);
+        assert_eq!(settings.format.for_container("api"), FormatChoice::Json);
+    }
+
+    #[test]
+    fn the_defaults_apply_without_a_template_too() {
+        let settings = settings(&follow_args(&["flowcpt"]), &config()).unwrap();
+        assert_eq!(settings.context.as_deref(), Some("aks-vulcan-01"));
+        assert_eq!(settings.tail, Some(50));
+        assert!(!settings.events);
+        assert_eq!(settings.output, Output::Json);
+        assert_eq!(settings.filter, None);
+
+        let overridden =
+            super::settings(&follow_args(&["flowcpt", "--since", "1m"]), &config()).unwrap();
+        assert_eq!(overridden.since, Some(Duration::from_secs(60)));
+        assert_eq!(overridden.tail, None);
+    }
+
+    #[test]
+    fn a_template_that_is_not_there_or_has_no_targets_is_an_error() {
+        let error = settings(&follow_args(&["--template", "nope"]), &config()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "there is no template `nope`; the templates are: dev-api, empty, staging-all"
+        );
+        let error = settings(&follow_args(&["--template", "empty"]), &config()).unwrap_err();
+        assert_eq!(error.to_string(), "the template `empty` has no targets");
+        let error = settings(&follow_args(&["--template", "x"]), &Config::default()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "there is no template `x`; the config file holds no templates"
+        );
     }
 
     #[test]
@@ -326,7 +495,7 @@ mod tests {
     fn which_rendering_the_flags_pick() {
         let text = |extra: &[&str], terminal: bool| {
             let args = args(extra);
-            let settings = settings(&args).unwrap();
+            let settings = settings(&args, &Config::default()).unwrap();
             match Printer::new(&args, &settings, terminal).mode {
                 Mode::Text(_) => "text",
                 Mode::Json => "json",
