@@ -106,6 +106,11 @@ struct Progress {
     /// It has listed what there is, or failed trying; either way the
     /// namespace does not wait for it any longer.
     live: bool,
+    /// It has listed what there is at least once.
+    listed: bool,
+    /// For a pod watch: it was started while the namespace was first being
+    /// looked at, so what its first list holds was there at the start.
+    at_start: bool,
     /// The keys seen so far while it lists.
     listing: Option<HashSet<String>>,
 }
@@ -117,6 +122,12 @@ struct PodEntry {
     seen_by: BTreeSet<WatchSpec>,
     /// The containers followed right now, as last reported.
     followed: BTreeMap<String, ContainerView>,
+    /// The pod was there when the session started: it came with the first
+    /// list of a watch that was started at the start.
+    at_start: bool,
+    /// The containers it had when it was first seen. One that is added to
+    /// a pod later is new, also in a pod that was there at the start.
+    first_containers: BTreeSet<String>,
 }
 
 /// The resolver's state for one namespace.
@@ -127,14 +138,17 @@ pub struct NamespaceState {
     targets: Vec<(usize, Target)>,
     /// Only containers whose name matches are followed.
     containers: Option<Pattern>,
-    /// Whether what is found before the namespace settles counts as having
-    /// been there when the session started.
+    /// Whether what the first lists hold counts as having been there when
+    /// the session started.
     initial_allowed: bool,
     owner_watches: BTreeMap<WatchSpec, Progress>,
     pod_watches: BTreeMap<WatchSpec, Progress>,
     owners: BTreeMap<(OwnerKind, String), WorkloadView>,
     pods: HashMap<String, PodEntry>,
     settled: bool,
+    /// Every owner watch has listed what there is, so whatever pod watch is
+    /// started from now on is about something that came later.
+    started: bool,
     /// The last failure of each watch, to say it once and not on every retry.
     failures: HashMap<WatchSpec, String>,
     /// The kinds a target's name was found in, when a notice said so.
@@ -204,6 +218,7 @@ impl NamespaceState {
             owners: BTreeMap::new(),
             pods: HashMap::new(),
             settled: false,
+            started: false,
             failures: HashMap::new(),
             ambiguous: BTreeMap::new(),
         };
@@ -285,6 +300,7 @@ impl NamespaceState {
                     });
                 }
                 progress.live = true;
+                progress.listed = true;
             }
             Event::Apply(owner) => {
                 self.owners.insert((kind, owner.name.clone()), owner);
@@ -299,11 +315,21 @@ impl NamespaceState {
         let Some(progress) = self.pod_watches.get_mut(spec) else {
             return;
         };
-        let upsert = |pods: &mut HashMap<String, PodEntry>, pod: PodView| {
+        // What the first list of a watch started at the start holds was
+        // there when the session started. A list that failed and is tried
+        // again is still the first.
+        let first_list = progress.at_start && !progress.listed;
+        let upsert = |pods: &mut HashMap<String, PodEntry>, pod: PodView, at_start: bool| {
             let entry = pods.entry(pod_key(&pod)).or_insert_with(|| PodEntry {
+                first_containers: pod
+                    .containers
+                    .iter()
+                    .map(|container| container.name.clone())
+                    .collect(),
                 view: pod.clone(),
                 seen_by: BTreeSet::new(),
                 followed: BTreeMap::new(),
+                at_start,
             });
             entry.view = pod;
             entry.seen_by.insert(spec.clone());
@@ -314,7 +340,7 @@ impl NamespaceState {
                 if let Some(listing) = &mut progress.listing {
                     listing.insert(pod_key(&pod));
                 }
-                upsert(&mut self.pods, pod);
+                upsert(&mut self.pods, pod, first_list);
             }
             Event::InitDone => {
                 if let Some(listed) = progress.listing.take() {
@@ -325,8 +351,9 @@ impl NamespaceState {
                     }
                 }
                 progress.live = true;
+                progress.listed = true;
             }
-            Event::Apply(pod) => upsert(&mut self.pods, pod),
+            Event::Apply(pod) => upsert(&mut self.pods, pod, false),
             Event::Delete(pod) => {
                 if let Some(entry) = self.pods.get_mut(&pod_key(&pod)) {
                     entry.seen_by.remove(spec);
@@ -339,6 +366,11 @@ impl NamespaceState {
     /// known now.
     fn reconcile(&mut self, out: &mut Vec<Output>) {
         self.reconcile_pod_watches(out);
+        // The pod watches started up to here belong to the start; later
+        // ones are for workloads that came while the session ran.
+        if !self.started && self.owner_watches.values().all(|progress| progress.listed) {
+            self.started = true;
+        }
         self.reconcile_containers(out);
         self.note_ambiguous_names(out);
 
@@ -371,7 +403,11 @@ impl NamespaceState {
         }
         for spec in desired {
             if !self.pod_watches.contains_key(&spec) {
-                self.pod_watches.insert(spec.clone(), Progress::default());
+                let progress = Progress {
+                    at_start: self.initial_allowed && !self.started,
+                    ..Progress::default()
+                };
+                self.pod_watches.insert(spec.clone(), progress);
                 out.push(Output::Start(spec));
             }
         }
@@ -437,9 +473,9 @@ impl NamespaceState {
             .collect();
         keys.sort();
 
-        let initial = self.initial_allowed && !self.settled;
         for (_, key) in keys {
             let entry = &self.pods[&key];
+            let pod_at_start = entry.at_start;
             let gone = entry.seen_by.is_empty();
             let wanted = if gone {
                 BTreeMap::new()
@@ -464,7 +500,7 @@ impl NamespaceState {
                     None => out.push(Output::Container(ContainerEvent::Added {
                         id: id(name),
                         view: view.clone(),
-                        initial,
+                        initial: pod_at_start && entry.first_containers.contains(name),
                     })),
                     Some(known) if known != view => {
                         out.push(Output::Container(ContainerEvent::Changed {
@@ -479,7 +515,7 @@ impl NamespaceState {
             let was_followed = !entry.followed.is_empty();
             let is_followed = !wanted.is_empty();
             let pod = entry.view.name.clone();
-            if !was_followed && is_followed && !initial {
+            if !was_followed && is_followed && !pod_at_start {
                 let names: Vec<&str> = wanted.keys().map(String::as_str).collect();
                 out.push(Output::Notice {
                     message: format!("pod {pod} appeared; following {}", names.join(", ")),
@@ -1579,6 +1615,92 @@ mod tests {
         // Once it works again, a new failure is worth a new notice.
         list_owners(&mut state, &cron, vec![]);
         assert_eq!(notices(&state.handle(failure())).len(), 1);
+    }
+
+    #[test]
+    fn a_first_list_that_fails_and_is_tried_again_still_finds_what_was_there_at_the_start() {
+        let (mut state, _) = state(&["flowcpt/deployment:flowcpt-api"]);
+        let deployments = owners(OwnerKind::Deployment, Some("flowcpt-api"));
+        let sets = owners(OwnerKind::ReplicaSet, None);
+        // The API server hiccups on the first lists.
+        state.handle(Input::Failed(
+            deployments.clone(),
+            "connection reset".to_string(),
+        ));
+        let out = state.handle(Input::Failed(sets.clone(), "connection reset".to_string()));
+        assert_eq!(settled(&out), Some(vec![]));
+
+        // A second later they work. The pods were there all along: they get
+        // the history of the start, not their whole log, and no notice.
+        list_owners(
+            &mut state,
+            &deployments,
+            vec![deployment("flowcpt-api", &[("app", "flowcpt-api")])],
+        );
+        list_owners(
+            &mut state,
+            &sets,
+            vec![replica_set("flowcpt-api-7d9f", "flowcpt-api")],
+        );
+        let pod_watch = pods(Some("app=flowcpt-api"));
+        state.handle(Input::Failed(
+            pod_watch.clone(),
+            "connection reset".to_string(),
+        ));
+        let out = list_pods(
+            &mut state,
+            &pod_watch,
+            vec![set_pod(
+                "flowcpt-api-7d9f-xk2p1",
+                "flowcpt-api",
+                "flowcpt-api-7d9f",
+                &["api"],
+            )],
+        );
+        assert_eq!(changes(&out), ["+flowcpt-api-7d9f-xk2p1/api!"]);
+        assert_eq!(notices(&out), Vec::<String>::new());
+
+        // A pod that comes after that is new.
+        let out = apply_pod(
+            &mut state,
+            &pod_watch,
+            set_pod(
+                "flowcpt-api-7d9f-m4q8z",
+                "flowcpt-api",
+                "flowcpt-api-7d9f",
+                &["api"],
+            ),
+        );
+        assert_eq!(changes(&out), ["+flowcpt-api-7d9f-m4q8z/api"]);
+    }
+
+    #[test]
+    fn a_pod_that_is_there_at_the_start_stays_so_when_it_is_matched_late() {
+        // The pods are listed before the replica sets are.
+        let (mut state, _) = state(&["flowcpt/deployment:flowcpt-api"]);
+        list_owners(
+            &mut state,
+            &owners(OwnerKind::Deployment, Some("flowcpt-api")),
+            vec![deployment("flowcpt-api", &[("app", "flowcpt-api")])],
+        );
+        let out = list_pods(
+            &mut state,
+            &pods(Some("app=flowcpt-api")),
+            vec![set_pod(
+                "flowcpt-api-7d9f-xk2p1",
+                "flowcpt-api",
+                "flowcpt-api-7d9f",
+                &["api"],
+            )],
+        );
+        assert_eq!(changes(&out), Vec::<String>::new());
+        let out = list_owners(
+            &mut state,
+            &owners(OwnerKind::ReplicaSet, None),
+            vec![replica_set("flowcpt-api-7d9f", "flowcpt-api")],
+        );
+        assert_eq!(changes(&out), ["+flowcpt-api-7d9f-xk2p1/api!"]);
+        assert_eq!(notices(&out), Vec::<String>::new());
     }
 
     #[test]
