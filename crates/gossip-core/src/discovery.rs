@@ -183,8 +183,12 @@ fn is_controlled_by<K: Resource, O: Resource>(object: &K, owner: &O) -> bool {
 
 /// A time of the API as the record's kind of time.
 pub(crate) fn to_utc(time: &Time) -> Option<DateTime<Utc>> {
-    let nanos = u32::try_from(time.0.subsec_nanosecond()).unwrap_or(0);
-    DateTime::from_timestamp(time.0.as_second(), nanos)
+    stamp_to_utc(&time.0)
+}
+
+pub(crate) fn stamp_to_utc(stamp: &k8s_openapi::jiff::Timestamp) -> Option<DateTime<Utc>> {
+    let nanos = u32::try_from(stamp.subsec_nanosecond()).unwrap_or(0);
+    DateTime::from_timestamp(stamp.as_second(), nanos)
 }
 
 fn created(object: &impl ResourceExt) -> Option<DateTime<Utc>> {

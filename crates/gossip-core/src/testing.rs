@@ -58,6 +58,10 @@ pub fn jobs(namespace: &str) -> String {
     format!("/apis/batch/v1/namespaces/{namespace}/jobs")
 }
 
+pub fn events(namespace: &str) -> String {
+    format!("/apis/events.k8s.io/v1/namespaces/{namespace}/events")
+}
+
 pub fn cron_jobs(namespace: &str) -> String {
     format!("/apis/batch/v1/namespaces/{namespace}/cronjobs")
 }
@@ -828,6 +832,41 @@ pub fn pod_object(
         "metadata": metadata(namespace, name, labels, controller),
         "spec": { "containers": specs },
         "status": { "phase": "Running", "containerStatuses": statuses }
+    })
+}
+
+/// A cluster event of the older kind, as the kubelet writes it: about an
+/// object given as kind and name, optionally about one of its containers,
+/// with a count and the time it happened last.
+#[allow(clippy::too_many_arguments)]
+pub fn event_object(
+    namespace: &str,
+    name: &str,
+    regarding: (&str, &str),
+    container: Option<&str>,
+    reason: &str,
+    note: &str,
+    kind: &str,
+    count: i32,
+    time: DateTime<Utc>,
+) -> Value {
+    let (regarding_kind, regarding_name) = regarding;
+    let mut object = json!({
+        "kind": regarding_kind, "namespace": namespace, "name": regarding_name,
+        "uid": format!("uid-{regarding_name}")
+    });
+    if let Some(container) = container {
+        object["fieldPath"] = json!(format!("spec.containers{{{container}}}"));
+    }
+    json!({
+        "metadata": { "namespace": namespace, "name": name, "uid": format!("uid-event-{name}") },
+        "regarding": object,
+        "reason": reason,
+        "note": note,
+        "type": kind,
+        "eventTime": null,
+        "deprecatedCount": count,
+        "deprecatedLastTimestamp": time.to_rfc3339_opts(SecondsFormat::Secs, true)
     })
 }
 

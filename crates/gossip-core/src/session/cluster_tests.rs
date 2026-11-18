@@ -11,7 +11,9 @@ use tokio::time::timeout;
 use super::*;
 use crate::parser::FormatChoice;
 use crate::record::{Format, Kind, Level};
-use crate::testing::{FakeCluster, container_status, pod_with_statuses, pods};
+use crate::testing::{
+    FakeCluster, container_status, event_object, events, pod_with_statuses, pods,
+};
 
 const NS: &str = "flowcpt";
 const POD: &str = "flowcpt-api-7d9f-xk2p1";
@@ -25,11 +27,21 @@ fn target(text: &str) -> Target {
     text.parse().unwrap()
 }
 
-/// Options with a short hold, so that the tests need not wait for it.
+/// Options with a short hold, so that the tests need not wait for it, and
+/// without events, which have tests of their own.
 fn options() -> SessionOptions {
     SessionOptions {
         hold: Duration::from_millis(20),
+        events: false,
         ..SessionOptions::default()
+    }
+}
+
+/// The same with events.
+fn with_events() -> SessionOptions {
+    SessionOptions {
+        events: true,
+        ..options()
     }
 }
 
@@ -809,4 +821,226 @@ async fn dropping_the_session_closes_its_streams() {
     fake.break_log_streams();
     tokio::time::sleep(Duration::from_millis(1_500)).await;
     assert_eq!(fake.requests().len(), before);
+}
+
+/// Records of kind `event` as short texts: the reason and the message.
+fn event_texts(records: &[Record]) -> Vec<String> {
+    records
+        .iter()
+        .filter(|record| record.kind == Kind::Event)
+        .map(|record| record.raw.clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn the_events_of_a_followed_pod_are_merged_into_the_stream() {
+    let fake = FakeCluster::start().await;
+    set_pod(&fake, POD, 0, running(), None);
+    let mut session = Session::start(
+        &fake.cluster(),
+        vec![target("flowcpt")],
+        None,
+        with_events(),
+    );
+    expect_quiet(&mut session).await;
+
+    let now = Utc::now();
+    let pod = ("Pod", POD);
+    fake.apply(
+        &events(NS),
+        event_object(
+            NS,
+            "killing",
+            pod,
+            Some("api"),
+            "Killing",
+            "Container api failed liveness probe, will be restarted",
+            "Normal",
+            1,
+            now,
+        ),
+    );
+    // An event about a pod that is not followed, in another namespace.
+    fake.apply(
+        &events("monitoring"),
+        event_object(
+            "monitoring",
+            "other",
+            ("Pod", "prometheus-0"),
+            None,
+            "Started",
+            "Started container",
+            "Normal",
+            1,
+            now,
+        ),
+    );
+    let record = next(&mut session).await;
+    assert_eq!(record.kind, Kind::Event);
+    assert_eq!(record.format, Format::Text);
+    assert_eq!(record.namespace, NS);
+    assert_eq!(record.pod, POD);
+    assert_eq!(record.container.as_deref(), Some("api"));
+    assert_eq!(record.level, Some(Level::Info));
+    assert_eq!(
+        record.message,
+        "Container api failed liveness probe, will be restarted"
+    );
+    assert_eq!(
+        record.raw,
+        "Killing: Container api failed liveness probe, will be restarted"
+    );
+    assert_eq!(
+        record.fields,
+        BTreeMap::from([
+            ("reason".to_string(), json!("Killing")),
+            ("type".to_string(), json!("Normal")),
+            ("count".to_string(), json!(1)),
+            ("regarding".to_string(), json!(format!("Pod/{POD}"))),
+        ])
+    );
+    // The time of the event is what it is merged on.
+    assert_eq!(record.time.timestamp(), now.timestamp());
+
+    // A warning is the level warn; when it happens again it is told again.
+    let back_off = |count: i32| {
+        event_object(
+            NS,
+            "backoff",
+            pod,
+            Some("api"),
+            "BackOff",
+            "Back-off restarting failed container",
+            "Warning",
+            count,
+            Utc::now(),
+        )
+    };
+    fake.apply(&events(NS), back_off(1));
+    let record = next(&mut session).await;
+    assert_eq!(record.level, Some(Level::Warn));
+    assert_eq!(record.fields["count"], json!(1));
+    fake.apply(&events(NS), back_off(2));
+    assert_eq!(next(&mut session).await.fields["count"], json!(2));
+    expect_quiet(&mut session).await;
+}
+
+#[tokio::test]
+async fn events_from_before_the_session_are_left_out_unless_since_reaches_back() {
+    let fake = FakeCluster::start().await;
+    set_pod(&fake, POD, 0, running(), None);
+    let pod = ("Pod", POD);
+    let old = Utc::now() - TimeDelta::minutes(3);
+    fake.apply(
+        &events(NS),
+        event_object(
+            NS,
+            "started",
+            pod,
+            Some("api"),
+            "Started",
+            "Started container api",
+            "Normal",
+            1,
+            old,
+        ),
+    );
+
+    let mut session = Session::start(
+        &fake.cluster(),
+        vec![target("flowcpt")],
+        None,
+        with_events(),
+    );
+    expect_quiet(&mut session).await;
+    drop(session);
+
+    let reaching_back = SessionOptions {
+        since: Some(Duration::from_secs(300)),
+        tail: None,
+        ..with_events()
+    };
+    let mut session = Session::start(
+        &fake.cluster(),
+        vec![target("flowcpt")],
+        None,
+        reaching_back,
+    );
+    assert_eq!(
+        event_texts(&take(&mut session, 1).await),
+        ["Started: Started container api"]
+    );
+}
+
+#[tokio::test]
+async fn a_container_that_exits_with_a_code_is_an_event() {
+    let fake = FakeCluster::start().await;
+    set_pod(&fake, POD, 0, running(), None);
+    log_lines(&fake, POD, 0, &["about to fall over"]);
+    let mut session = Session::start(
+        &fake.cluster(),
+        vec![target("flowcpt")],
+        None,
+        with_events(),
+    );
+    assert_eq!(texts(&take(&mut session, 1).await), ["about to fall over"]);
+
+    fake.end_run(NS, POD, "api");
+    let killed = json!({ "terminated": {
+        "exitCode": 137, "reason": "OOMKilled", "finishedAt": "2026-11-18T14:00:05Z"
+    } });
+    set_pod(&fake, POD, 0, killed.clone(), None);
+    let record = next(&mut session).await;
+    assert_eq!(record.kind, Kind::Event);
+    assert_eq!(
+        record.raw,
+        "Exited: Container api exited with code 137 (OOMKilled)"
+    );
+    assert_eq!(record.level, Some(Level::Warn));
+    assert_eq!(record.container.as_deref(), Some("api"));
+    assert_eq!(record.fields["reason"], json!("Exited"));
+    assert_eq!(record.fields["type"], json!("Warning"));
+    assert_eq!(record.time, at(5_000));
+
+    // The same exit, now as the last state of the restarted container, is
+    // not told a second time.
+    fake.start_run(NS, POD, "api");
+    set_pod(&fake, POD, 1, running(), Some(killed));
+    expect_quiet(&mut session).await;
+}
+
+#[tokio::test]
+async fn without_events_there_are_no_event_records() {
+    let fake = FakeCluster::start().await;
+    set_pod(&fake, POD, 0, running(), None);
+    log_lines(&fake, POD, 0, &["a line"]);
+    let mut session = Session::start(&fake.cluster(), vec![target("flowcpt")], None, options());
+    assert_eq!(texts(&take(&mut session, 1).await), ["a line"]);
+
+    fake.apply(
+        &events(NS),
+        event_object(
+            NS,
+            "killing",
+            ("Pod", POD),
+            Some("api"),
+            "Killing",
+            "Stopping container api",
+            "Normal",
+            1,
+            Utc::now(),
+        ),
+    );
+    fake.end_run(NS, POD, "api");
+    set_pod(&fake, POD, 0, terminated(137), None);
+    expect_quiet(&mut session).await;
+    // The events of the namespace were not even asked for.
+    assert!(
+        !fake
+            .requests()
+            .iter()
+            .any(|request| request.contains("/events")),
+        "{:#?}",
+        fake.requests()
+    );
 }

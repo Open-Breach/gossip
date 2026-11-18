@@ -6,11 +6,12 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 use k8s_openapi::api::apps::v1::{DaemonSet, Deployment, ReplicaSet, StatefulSet};
 use k8s_openapi::api::batch::v1::{CronJob, Job};
-use k8s_openapi::api::core::v1::{ContainerStatus, Pod};
+use k8s_openapi::api::core::v1::{ContainerStateTerminated, ContainerStatus, Pod};
+use k8s_openapi::api::events::v1::Event;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 use kube::core::Selector;
 
-use crate::discovery::to_utc;
+use crate::discovery::{stamp_to_utc, to_utc};
 use crate::target::WorkloadKind;
 
 /// The kinds of object the resolver watches besides pods: the five workload
@@ -37,6 +38,20 @@ impl OwnerKind {
             OwnerKind::Job => "Job",
             OwnerKind::CronJob => "CronJob",
         }
+    }
+
+    /// The kind that Kubernetes writes this way, if the resolver watches it.
+    pub fn from_kind_name(name: &str) -> Option<OwnerKind> {
+        [
+            OwnerKind::Deployment,
+            OwnerKind::ReplicaSet,
+            OwnerKind::StatefulSet,
+            OwnerKind::DaemonSet,
+            OwnerKind::Job,
+            OwnerKind::CronJob,
+        ]
+        .into_iter()
+        .find(|kind| kind.kind_name() == name)
     }
 
     /// The workload kind a target can name, if this is one.
@@ -197,6 +212,45 @@ pub struct ContainerView {
     pub state: ContainerState,
     /// Whether a run before the current one has ended and left its output.
     pub has_previous: bool,
+    /// How the run before the current one ended, if there was one.
+    pub last_exit: Option<Exit>,
+}
+
+impl ContainerView {
+    /// The latest end of a run that the pod reports for the container: of
+    /// the current run when that has ended, of the one before otherwise.
+    pub fn latest_exit(&self) -> Option<Exit> {
+        match &self.state {
+            ContainerState::Terminated {
+                exit_code,
+                reason,
+                finished_at,
+            } => Some(Exit {
+                exit_code: *exit_code,
+                reason: reason.clone(),
+                finished_at: *finished_at,
+            }),
+            _ => self.last_exit.clone(),
+        }
+    }
+}
+
+/// How a run of a container ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Exit {
+    pub exit_code: i32,
+    pub reason: Option<String>,
+    pub finished_at: Option<DateTime<Utc>>,
+}
+
+impl From<&ContainerStateTerminated> for Exit {
+    fn from(terminated: &ContainerStateTerminated) -> Self {
+        Exit {
+            exit_code: terminated.exit_code,
+            reason: terminated.reason.clone(),
+            finished_at: terminated.finished_at.as_ref().and_then(to_utc),
+        }
+    }
 }
 
 /// The state of a container.
@@ -328,15 +382,94 @@ fn container_view(
             }
         }
     };
+    let last_exit = status
+        .and_then(|status| status.last_state.as_ref())
+        .and_then(|last| last.terminated.as_ref())
+        .map(Exit::from);
     ContainerView {
         name: name.to_string(),
         role,
         restart_count: status.map_or(0, |status| status.restart_count),
         state,
-        has_previous: status
-            .and_then(|status| status.last_state.as_ref())
-            .is_some_and(|last| last.terminated.is_some()),
+        has_previous: last_exit.is_some(),
+        last_exit,
     }
+}
+
+/// A cluster event as the resolver sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventView {
+    pub uid: String,
+    /// The kind, name and uid of the object the event is about.
+    pub regarding_kind: String,
+    pub regarding_name: String,
+    pub regarding_uid: String,
+    /// The container the event is about, when it is about one of a pod.
+    pub container: Option<String>,
+    /// `Scheduled`, `Pulling`, `Started`, `Killing`, `BackOff`, ...
+    pub reason: String,
+    pub message: String,
+    /// The type of the event is `Warning`, as opposed to `Normal`.
+    pub warning: bool,
+    /// How often it has happened.
+    pub count: i32,
+    /// When it happened last.
+    pub time: Option<DateTime<Utc>>,
+}
+
+impl From<&Event> for EventView {
+    fn from(event: &Event) -> Self {
+        let regarding = event.regarding.as_ref();
+        let series = event.series.as_ref();
+        // The time it happened last: of a series its last observation, of an
+        // event of the older kind its last timestamp, else the time of the
+        // event itself.
+        let time = series
+            .and_then(|series| stamp_to_utc(&series.last_observed_time.0))
+            .or_else(|| event.deprecated_last_timestamp.as_ref().and_then(to_utc))
+            .or_else(|| {
+                event
+                    .event_time
+                    .as_ref()
+                    .and_then(|time| stamp_to_utc(&time.0))
+            })
+            .or_else(|| event.deprecated_first_timestamp.as_ref().and_then(to_utc))
+            .or_else(|| event.metadata.creation_timestamp.as_ref().and_then(to_utc));
+        EventView {
+            uid: event.metadata.uid.clone().unwrap_or_default(),
+            regarding_kind: regarding
+                .and_then(|object| object.kind.clone())
+                .unwrap_or_default(),
+            regarding_name: regarding
+                .and_then(|object| object.name.clone())
+                .unwrap_or_default(),
+            regarding_uid: regarding
+                .and_then(|object| object.uid.clone())
+                .unwrap_or_default(),
+            container: regarding
+                .and_then(|object| object.field_path.as_deref())
+                .and_then(container_of_field_path),
+            reason: event.reason.clone().unwrap_or_default(),
+            message: event.note.clone().unwrap_or_default(),
+            warning: event.type_.as_deref() == Some("Warning"),
+            count: series
+                .map(|series| series.count)
+                .or(event.deprecated_count)
+                .unwrap_or(1),
+            time,
+        }
+    }
+}
+
+/// The container a field path such as `spec.containers{api}` points at.
+fn container_of_field_path(path: &str) -> Option<String> {
+    let (list, rest) = path.split_once('{')?;
+    let name = rest.strip_suffix('}')?;
+    matches!(
+        list,
+        "spec.containers" | "spec.initContainers" | "spec.ephemeralContainers"
+    )
+    .then(|| name.to_string())
 }
 
 #[cfg(test)]
@@ -427,6 +560,7 @@ mod tests {
                         finished_at: Some(Utc.with_ymd_and_hms(2026, 11, 18, 13, 0, 3).unwrap()),
                     },
                     has_previous: false,
+                    last_exit: None,
                 },
                 ContainerView {
                     name: "api".into(),
@@ -437,6 +571,11 @@ mod tests {
                         message: Some("back-off 40s restarting failed container".into()),
                     },
                     has_previous: true,
+                    last_exit: Some(Exit {
+                        exit_code: 101,
+                        reason: Some("Error".into()),
+                        finished_at: None,
+                    }),
                 },
                 ContainerView {
                     name: "envoy".into(),
@@ -446,6 +585,7 @@ mod tests {
                         started_at: Some(Utc.with_ymd_and_hms(2026, 11, 18, 13, 0, 5).unwrap()),
                     },
                     has_previous: false,
+                    last_exit: None,
                 },
                 // The pod reports nothing for the ephemeral container yet.
                 ContainerView {
@@ -454,6 +594,7 @@ mod tests {
                     restart_count: 0,
                     state: ContainerState::Unknown,
                     has_previous: false,
+                    last_exit: None,
                 },
             ]
         );
@@ -573,7 +714,142 @@ mod tests {
     }
 
     #[test]
+    fn the_latest_exit_of_a_container() {
+        let pod: Pod = from_json(json!({
+            "metadata": { "name": "p", "uid": "u" },
+            "spec": { "containers": [ { "name": "ended" }, { "name": "restarted" }, { "name": "fresh" } ] },
+            "status": { "containerStatuses": [
+                {
+                    "name": "ended", "ready": false, "restartCount": 0, "image": "", "imageID": "",
+                    "state": { "terminated": {
+                        "exitCode": 137, "reason": "OOMKilled", "finishedAt": "2026-11-18T14:00:00Z"
+                    } }
+                },
+                {
+                    "name": "restarted", "ready": true, "restartCount": 1, "image": "", "imageID": "",
+                    "state": { "running": {} },
+                    "lastState": { "terminated": { "exitCode": 1, "reason": "Error" } }
+                },
+                {
+                    "name": "fresh", "ready": true, "restartCount": 0, "image": "", "imageID": "",
+                    "state": { "running": {} }
+                }
+            ] }
+        }));
+        let view = PodView::from(&pod);
+        assert_eq!(
+            view.containers[0].latest_exit(),
+            Some(Exit {
+                exit_code: 137,
+                reason: Some("OOMKilled".into()),
+                finished_at: Some(Utc.with_ymd_and_hms(2026, 11, 18, 14, 0, 0).unwrap()),
+            })
+        );
+        assert_eq!(view.containers[1].latest_exit().unwrap().exit_code, 1);
+        assert!(view.containers[1].has_previous);
+        assert_eq!(view.containers[2].latest_exit(), None);
+    }
+
+    #[test]
+    fn an_event_of_the_older_kind_about_a_container() {
+        // What the kubelet writes: no event time, a count and two timestamps.
+        let event: Event = from_json(json!({
+            "metadata": { "name": "flowcpt-api-7d9f-xk2p1.18a1", "uid": "event-1" },
+            "regarding": {
+                "kind": "Pod", "name": "flowcpt-api-7d9f-xk2p1", "uid": "pod-1",
+                "fieldPath": "spec.containers{api}"
+            },
+            "reason": "BackOff",
+            "note": "Back-off restarting failed container api in pod flowcpt-api-7d9f-xk2p1",
+            "type": "Warning",
+            "eventTime": null,
+            "deprecatedCount": 37,
+            "deprecatedFirstTimestamp": "2026-11-18T13:00:00Z",
+            "deprecatedLastTimestamp": "2026-11-18T14:02:11Z"
+        }));
+        assert_eq!(
+            EventView::from(&event),
+            EventView {
+                uid: "event-1".into(),
+                regarding_kind: "Pod".into(),
+                regarding_name: "flowcpt-api-7d9f-xk2p1".into(),
+                regarding_uid: "pod-1".into(),
+                container: Some("api".into()),
+                reason: "BackOff".into(),
+                message: "Back-off restarting failed container api in pod flowcpt-api-7d9f-xk2p1"
+                    .into(),
+                warning: true,
+                count: 37,
+                time: Some(Utc.with_ymd_and_hms(2026, 11, 18, 14, 2, 11).unwrap()),
+            }
+        );
+    }
+
+    #[test]
+    fn an_event_of_the_newer_kind_and_a_series() {
+        let once: Event = from_json(json!({
+            "metadata": { "name": "e", "uid": "event-2" },
+            "regarding": { "kind": "Deployment", "name": "flowcpt-api", "uid": "deploy-1" },
+            "reason": "ScalingReplicaSet",
+            "note": "Scaled up replica set flowcpt-api-7d9f to 2",
+            "type": "Normal",
+            "eventTime": "2026-11-18T14:02:11.482913Z"
+        }));
+        let view = EventView::from(&once);
+        assert_eq!(view.regarding_kind, "Deployment");
+        assert_eq!(view.container, None);
+        assert!(!view.warning);
+        assert_eq!(view.count, 1);
+        assert_eq!(
+            view.time,
+            Some(
+                Utc.with_ymd_and_hms(2026, 11, 18, 14, 2, 11).unwrap()
+                    + chrono::TimeDelta::microseconds(482_913)
+            )
+        );
+
+        // In a series the last observation is the time, and the series counts.
+        let series: Event = from_json(json!({
+            "metadata": { "name": "e", "uid": "event-3" },
+            "regarding": { "kind": "Pod", "name": "p", "uid": "pod-1" },
+            "reason": "Unhealthy",
+            "eventTime": "2026-11-18T14:00:00.000000Z",
+            "series": { "count": 5, "lastObservedTime": "2026-11-18T14:02:00.000000Z" }
+        }));
+        let view = EventView::from(&series);
+        assert_eq!(view.count, 5);
+        assert_eq!(
+            view.time,
+            Some(Utc.with_ymd_and_hms(2026, 11, 18, 14, 2, 0).unwrap())
+        );
+    }
+
+    #[test]
+    fn the_container_of_a_field_path() {
+        assert_eq!(
+            container_of_field_path("spec.containers{api}"),
+            Some("api".into())
+        );
+        assert_eq!(
+            container_of_field_path("spec.initContainers{migrate}"),
+            Some("migrate".into())
+        );
+        assert_eq!(
+            container_of_field_path("spec.ephemeralContainers{debugger}"),
+            Some("debugger".into())
+        );
+        assert_eq!(container_of_field_path("spec.volumes{data}"), None);
+        assert_eq!(container_of_field_path("spec.containers"), None);
+        assert_eq!(container_of_field_path(""), None);
+    }
+
+    #[test]
     fn owner_kinds_and_workload_kinds() {
+        assert_eq!(
+            OwnerKind::from_kind_name("ReplicaSet"),
+            Some(OwnerKind::ReplicaSet)
+        );
+        assert_eq!(OwnerKind::from_kind_name("Pod"), None);
         for kind in WorkloadKind::ALL {
             assert_eq!(OwnerKind::from(kind).workload(), Some(kind));
             assert_eq!(OwnerKind::from(kind).kind_name(), kind.kind_name());

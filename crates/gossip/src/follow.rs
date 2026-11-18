@@ -49,7 +49,7 @@ fn settings(args: &FollowArgs) -> anyhow::Result<Settings> {
         container: args.container.clone(),
         since: args.since,
         tail: args.tail,
-        events: None,
+        events: args.no_events.then_some(false),
         format: None,
         filter: filter(args)?,
         fields: args.fields.clone(),
@@ -58,7 +58,9 @@ fn settings(args: &FollowArgs) -> anyhow::Result<Settings> {
     Ok(asked.resolve())
 }
 
-/// The filter the flags stand for: every one of them must hold.
+/// The filter the flags stand for: every one of them must hold for a line.
+/// The flags are about lines; events pass them, and `--no-events` is what
+/// leaves events out.
 fn filter(args: &FollowArgs) -> anyhow::Result<Option<Filter>> {
     let mut rules = Vec::new();
     if let Some(level) = args.level {
@@ -76,11 +78,29 @@ fn filter(args: &FollowArgs) -> anyhow::Result<Option<Filter>> {
         };
         rules.push(Filter::field_equals(key, value).context("--field")?);
     }
-    Ok(match rules.len() {
-        0 => None,
-        1 => rules.pop(),
-        _ => Some(Filter::All(rules)),
-    })
+    let lines = match rules.len() {
+        0 => return Ok(None),
+        1 => rules.remove(0),
+        _ => Filter::All(rules),
+    };
+    Ok(Some(Filter::Any(vec![Filter::kind_is(Kind::Event), lines])))
+}
+
+/// Whether the terminal can be trusted with emoji: the locale says UTF-8.
+fn locale_is_utf8() -> bool {
+    if cfg!(windows) {
+        return true;
+    }
+    let locale = ["LC_ALL", "LC_CTYPE", "LANG"]
+        .into_iter()
+        .filter_map(|variable| std::env::var(variable).ok())
+        .find(|value| !value.is_empty());
+    locale.is_some_and(|locale| is_utf8_locale(&locale))
+}
+
+fn is_utf8_locale(locale: &str) -> bool {
+    let locale = locale.to_lowercase();
+    locale.contains("utf-8") || locale.contains("utf8")
 }
 
 /// Prints records to stdout in the rendering that was asked for.
@@ -105,6 +125,9 @@ impl Printer {
                 colour: stdout_is_terminal && !args.no_color,
                 fields: settings.fields.clone(),
                 long_names: args.long_names,
+                // Emoji only where they will show: a terminal that says
+                // it speaks UTF-8.
+                emoji: !args.no_emoji && stdout_is_terminal && locale_is_utf8(),
                 zone: Zone::Local,
             }))
         };
@@ -177,34 +200,99 @@ mod tests {
         assert_eq!(both.tail, Some(50));
     }
 
+    /// The filter of some flags, without the part that lets events pass.
+    fn line_filter(extra: &[&str]) -> Filter {
+        match filter(&args(extra)).unwrap() {
+            Some(Filter::Any(mut parts)) => {
+                assert_eq!(parts.len(), 2);
+                assert_eq!(parts[0], Filter::kind_is(Kind::Event));
+                parts.remove(1)
+            }
+            other => panic!("expected events or lines, got {other:?}"),
+        }
+    }
+
     #[test]
     fn the_flags_build_the_rules_they_stand_for() {
+        assert_eq!(filter(&args(&[])).unwrap(), None);
         assert_eq!(
-            filter(&args(&["--level", "warn"])).unwrap(),
-            Some(Filter::level_at_least(Level::Warn))
+            line_filter(&["--level", "warn"]),
+            Filter::level_at_least(Level::Warn)
         );
         assert_eq!(
-            filter(&args(&["--grep", "expired"])).unwrap(),
-            Some(Filter::message_contains("expired"))
+            line_filter(&["--grep", "expired"]),
+            Filter::message_contains("expired")
         );
         assert_eq!(
-            filter(&args(&["--match", "^pay"])).unwrap(),
-            Some(Filter::message_matches("^pay").unwrap())
+            line_filter(&["--match", "^pay"]),
+            Filter::message_matches("^pay").unwrap()
         );
         assert_eq!(
-            filter(&args(&["--field", "tenant_id=t_123"])).unwrap(),
-            Some(Filter::field_equals("tenant_id", "t_123").unwrap())
+            line_filter(&["--field", "tenant_id=t_123"]),
+            Filter::field_equals("tenant_id", "t_123").unwrap()
         );
         // A value may hold an equals sign of its own.
         assert_eq!(
-            filter(&args(&["--field", "query=a=b"])).unwrap(),
-            Some(Filter::field_equals("query", "a=b").unwrap())
+            line_filter(&["--field", "query=a=b"]),
+            Filter::field_equals("query", "a=b").unwrap()
         );
     }
 
     #[test]
+    fn the_filter_flags_are_about_lines_and_events_still_show() {
+        use chrono::Utc;
+        use gossip_core::{Format, Record};
+        use std::collections::BTreeMap;
+
+        let filter = filter(&args(&["--level", "warn", "--field", "tenant_id=t_123"]))
+            .unwrap()
+            .unwrap();
+        let record = |kind: Kind, level: Option<Level>, tenant: Option<&str>| Record {
+            cluster: "c".into(),
+            namespace: "flowcpt".into(),
+            pod: "p".into(),
+            container: None,
+            time: Utc::now(),
+            kind,
+            format: Format::Text,
+            level,
+            message: String::new(),
+            fields: tenant
+                .map(|tenant| BTreeMap::from([("tenant_id".to_string(), tenant.into())]))
+                .unwrap_or_default(),
+            raw: String::new(),
+            previous: false,
+            truncated: false,
+        };
+        // A line must pass every flag.
+        assert!(filter.accepts(&record(Kind::Line, Some(Level::Error), Some("t_123"))));
+        assert!(!filter.accepts(&record(Kind::Line, Some(Level::Info), Some("t_123"))));
+        assert!(!filter.accepts(&record(Kind::Line, Some(Level::Error), Some("t_999"))));
+        assert!(!filter.accepts(&record(Kind::Line, None, None)));
+        // An event passes, normal or warning, with no tenant at all.
+        assert!(filter.accepts(&record(Kind::Event, Some(Level::Info), None)));
+        assert!(filter.accepts(&record(Kind::Event, Some(Level::Warn), None)));
+    }
+
+    #[test]
+    fn events_are_on_unless_no_events_is_given() {
+        assert!(settings(&args(&[])).unwrap().events);
+        assert!(!settings(&args(&["--no-events"])).unwrap().events);
+    }
+
+    #[test]
+    fn a_locale_that_says_utf8() {
+        for locale in ["en_US.UTF-8", "de_CH.utf8", "C.UTF-8", "en_GB.utf-8"] {
+            assert!(is_utf8_locale(locale), "{locale}");
+        }
+        for locale in ["C", "POSIX", "en_US", "en_US.ISO-8859-1"] {
+            assert!(!is_utf8_locale(locale), "{locale}");
+        }
+    }
+
+    #[test]
     fn several_flags_combine_with_and() {
-        let combined = filter(&args(&[
+        let combined = line_filter(&[
             "--level",
             "warn",
             "--grep",
@@ -213,16 +301,15 @@ mod tests {
             "tenant_id=t_123",
             "--field",
             "status=402",
-        ]))
-        .unwrap();
+        ]);
         assert_eq!(
             combined,
-            Some(Filter::All(vec![
+            Filter::All(vec![
                 Filter::level_at_least(Level::Warn),
                 Filter::message_contains("expired"),
                 Filter::field_equals("tenant_id", "t_123").unwrap(),
                 Filter::field_equals("status", "402").unwrap(),
-            ]))
+            ])
         );
     }
 

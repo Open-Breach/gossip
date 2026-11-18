@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, TimeZone, Utc};
 use gossip_core::testing::{
-    FakeCluster, deployments, owner, pod_object, pods, replica_sets, workload_object,
+    FakeCluster, deployments, event_object, events, owner, pod_object, pods, replica_sets,
+    workload_object,
 };
 use tokio::io::{AsyncBufReadExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdout, Command};
@@ -427,5 +428,148 @@ async fn a_cluster_that_cannot_be_reached_at_start_exits_1_with_the_error() {
     assert!(
         stderr.starts_with("gossip: cannot reach the cluster `nowhere`: "),
         "{stderr}"
+    );
+}
+
+/// Puts an event about the container `api` of the pod `redis-0` into the
+/// namespace, happening now.
+fn add_event(fake: &FakeCluster, name: &str, reason: &str, note: &str, kind: &str) {
+    let event = event_object(
+        NS,
+        name,
+        ("Pod", "redis-0"),
+        Some("api"),
+        reason,
+        note,
+        kind,
+        1,
+        Utc::now(),
+    );
+    fake.apply(&events(NS), event);
+}
+
+#[tokio::test]
+async fn events_are_merged_into_the_stream() {
+    let fake = FakeCluster::start().await;
+    seed_tenant_lines(&fake);
+    let mut follow = Follow::start(
+        &fake,
+        "events",
+        &["flowcpt", "--no-color", "--fields", "request_id"],
+    );
+    follow.lines(4).await;
+
+    add_event(
+        &fake,
+        "killing",
+        "Killing",
+        "Container api failed liveness probe, will be restarted",
+        "Normal",
+    );
+    let line = follow.line().await;
+    // Stdout is not a terminal here, so the event is marked `EVNT`, in the
+    // column of the container.
+    assert!(
+        line.ends_with(
+            " redis-0 EVNT        Killing: Container api failed liveness probe, will be restarted"
+        ),
+        "{line}"
+    );
+
+    // A line after it is aligned to the wider column.
+    fake.log(NS, "redis-0", "api", Utc::now(), "INFO back again");
+    let line = follow.line().await;
+    assert!(
+        line.ends_with(" redis-0 api   INFO  INFO back again"),
+        "{line}"
+    );
+}
+
+#[tokio::test]
+async fn the_filter_flags_hide_lines_and_events_still_show() {
+    let fake = FakeCluster::start().await;
+    seed_tenant_lines(&fake);
+    let mut follow = Follow::start(
+        &fake,
+        "events-filter",
+        &[
+            "flowcpt",
+            "--no-color",
+            "--fields",
+            "request_id",
+            "--level",
+            "warn",
+            "--field",
+            "tenant_id=t_123",
+        ],
+    );
+    // Of the four lines only the warning of that tenant is left.
+    assert_eq!(
+        follow.line().await,
+        "14:00:02.000 redis-0 api  WARN  request_id=8b1d  payment intent expired"
+    );
+
+    add_event(
+        &fake,
+        "started",
+        "Started",
+        "Started container api",
+        "Normal",
+    );
+    let line = follow.line().await;
+    assert!(line.ends_with("Started: Started container api"), "{line}");
+    follow.expect_quiet().await;
+}
+
+#[tokio::test]
+async fn no_events_shows_no_event_records() {
+    let fake = FakeCluster::start().await;
+    seed_tenant_lines(&fake);
+    let mut follow = Follow::start(
+        &fake,
+        "no-events",
+        &["flowcpt", "--no-color", "--no-events"],
+    );
+    follow.lines(4).await;
+
+    add_event(
+        &fake,
+        "started",
+        "Started",
+        "Started container api",
+        "Normal",
+    );
+    follow.expect_quiet().await;
+    // A line still comes through.
+    fake.log(NS, "redis-0", "api", Utc::now(), "still following");
+    assert!(follow.line().await.ends_with("still following"));
+}
+
+#[tokio::test]
+async fn an_event_as_json_carries_its_reason_type_and_count() {
+    let fake = FakeCluster::start().await;
+    fake.apply(&pods(NS), pod_object(NS, "redis-0", &[], None, &["api"]));
+    let mut follow = Follow::start(&fake, "events-json", &["flowcpt", "--output", "json"]);
+    // Give the session a moment to find the pod, then let the event happen.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    add_event(
+        &fake,
+        "backoff",
+        "BackOff",
+        "Back-off restarting failed container",
+        "Warning",
+    );
+    let record: serde_json::Value = serde_json::from_str(&follow.line().await).unwrap();
+    assert_eq!(record["kind"], "event");
+    assert_eq!(record["format"], "text");
+    assert_eq!(record["level"], "warn");
+    assert_eq!(record["pod"], "redis-0");
+    assert_eq!(record["container"], "api");
+    assert_eq!(record["message"], "Back-off restarting failed container");
+    assert_eq!(
+        record["fields"],
+        serde_json::json!({
+            "reason": "BackOff", "type": "Warning", "count": 1, "regarding": "Pod/redis-0"
+        })
     );
 }

@@ -75,6 +75,10 @@ pub struct FollowArgs {
     #[arg(long, value_name = "N")]
     pub tail: Option<u64>,
 
+    /// Leave the cluster's events out of the stream.
+    #[arg(long)]
+    pub no_events: bool,
+
     /// Only containers whose name matches the glob.
     #[arg(long, value_name = "GLOB")]
     pub container: Option<Pattern>,
@@ -114,6 +118,11 @@ pub struct FollowArgs {
     /// Keep pod names whole instead of shortening them to hash and suffix.
     #[arg(long)]
     pub long_names: bool,
+
+    /// Mark events with `EVNT` instead of an emoji [default: emoji when
+    /// stdout is a terminal and the locale is UTF-8].
+    #[arg(long)]
+    pub no_emoji: bool,
 }
 
 #[cfg(test)]
@@ -195,6 +204,8 @@ mod tests {
             "--fields",
             "tenant_id,request_id",
             "--long-names",
+            "--no-events",
+            "--no-emoji",
         ])
         .unwrap();
         assert_eq!(args.targets.len(), 2);
@@ -215,6 +226,8 @@ mod tests {
             Some(vec!["tenant_id".to_string(), "request_id".to_string()])
         );
         assert!(args.long_names);
+        assert!(args.no_events);
+        assert!(args.no_emoji);
     }
 
     #[test]
@@ -226,6 +239,7 @@ mod tests {
         assert_eq!(args.output, None);
         assert_eq!(args.fields, None);
         assert!(!args.raw && !args.no_color && !args.long_names);
+        assert!(!args.no_events && !args.no_emoji);
     }
 
     #[test]

@@ -5,12 +5,13 @@
 //! stop and the containers to follow or let go. The module above it runs
 //! the watches.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
+use chrono::{DateTime, Utc};
 use kube::core::SelectorExt;
 use kube::runtime::watcher::Event;
 
-use super::model::{ContainerView, OwnerKind, PodView, WorkloadView};
+use super::model::{ContainerView, EventView, Exit, OwnerKind, PodView, WorkloadView};
 use crate::target::{Pattern, Target, WorkloadKind, WorkloadSelector};
 
 /// One watch the resolver runs in a namespace.
@@ -23,6 +24,8 @@ pub enum WatchSpec {
     },
     /// The pods, all of them or those that carry these labels.
     Pods { selector: Option<String> },
+    /// The cluster events of the namespace.
+    Events,
 }
 
 impl WatchSpec {
@@ -38,6 +41,7 @@ impl WatchSpec {
             WatchSpec::Pods {
                 selector: Some(selector),
             } => format!("pods with the labels `{selector}`"),
+            WatchSpec::Events => "events".to_string(),
         }
     }
 }
@@ -47,6 +51,7 @@ impl WatchSpec {
 pub enum Input {
     Owner(WatchSpec, Event<WorkloadView>),
     Pod(WatchSpec, Event<PodView>),
+    Cluster(WatchSpec, Event<EventView>),
     /// The watch failed and is being retried.
     Failed(WatchSpec, String),
 }
@@ -57,6 +62,8 @@ pub enum Output {
     Start(WatchSpec),
     Stop(WatchSpec),
     Container(ContainerEvent),
+    /// A cluster event about something that is followed.
+    Cluster(ClusterEvent),
     Notice {
         pod: Option<String>,
         message: String,
@@ -100,6 +107,36 @@ pub enum ContainerEvent {
     Removed { id: ContainerId },
 }
 
+/// A cluster event about a followed pod or a workload above it, or the end
+/// of a run of a followed container, which Kubernetes has no event for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterEvent {
+    pub namespace: String,
+    /// The pod the event is about, when it is about one.
+    pub pod: Option<String>,
+    /// The container the event is about, when it is about one.
+    pub container: Option<String>,
+    /// The object the event is about, as kind and name: `Pod/flowcpt-api-…`.
+    pub regarding: String,
+    pub reason: String,
+    pub message: String,
+    /// The type of the event is `Warning`, as opposed to `Normal`.
+    pub warning: bool,
+    pub count: i32,
+    /// When it happened; none when the cluster does not say.
+    pub time: Option<DateTime<Utc>>,
+}
+
+/// The reason of the event that stands for the end of a run of a container
+/// with an exit code other than zero.
+pub const EXITED: &str = "Exited";
+
+/// How many events that are about nothing followed are kept, in case what
+/// they are about is reported a moment later. The events of a namespace
+/// are listed before its pods are known, so this must hold the history of
+/// a busy namespace.
+const PENDING_EVENTS: usize = 4096;
+
 /// How far a watch has come.
 #[derive(Debug, Default)]
 struct Progress {
@@ -122,6 +159,9 @@ struct PodEntry {
     seen_by: BTreeSet<WatchSpec>,
     /// The containers followed right now, as last reported.
     followed: BTreeMap<String, ContainerView>,
+    /// The latest end of a run known for each followed container, so that
+    /// each end is told once.
+    exits: BTreeMap<String, Exit>,
     /// The pod was there when the session started: it came with the first
     /// list of a watch that was started at the start.
     at_start: bool,
@@ -153,6 +193,16 @@ pub struct NamespaceState {
     failures: HashMap<WatchSpec, String>,
     /// The kinds a target's name was found in, when a notice said so.
     ambiguous: BTreeMap<usize, BTreeSet<WorkloadKind>>,
+    /// Whether cluster events are followed, and how far back: of the events
+    /// that are there when the watch first lists them, those not older than
+    /// this are told. What happens after that list is always told, whatever
+    /// the clocks say.
+    events_since: Option<DateTime<Utc>>,
+    /// The count and time of every event that was dealt with, by its uid,
+    /// so that an event is told again only when it happens again.
+    seen_events: HashMap<String, (i32, Option<DateTime<Utc>>)>,
+    /// Events about nothing that is followed, so far.
+    pending_events: VecDeque<EventView>,
 }
 
 impl NamespaceState {
@@ -163,6 +213,7 @@ impl NamespaceState {
         targets: Vec<(usize, Target)>,
         containers: Option<Pattern>,
         initial_allowed: bool,
+        events_since: Option<DateTime<Utc>>,
     ) -> (Self, Vec<Output>) {
         // Which kinds to watch, and whether one name is enough.
         let mut wanted: BTreeMap<WorkloadKind, Option<String>> = BTreeMap::new();
@@ -187,11 +238,21 @@ impl NamespaceState {
             }
         }
         // A cron job is followed through its jobs, whatever they are called.
-        if wanted.contains_key(&WorkloadKind::CronJob) {
+        // And to tell which events are about a workload above a followed
+        // pod, the jobs and replica sets between them must be known.
+        if wanted.contains_key(&WorkloadKind::CronJob) || events_since.is_some() {
             wanted.insert(WorkloadKind::Job, None);
         }
 
         let mut owner_watches = BTreeMap::new();
+        if events_since.is_some() {
+            let sets = WatchSpec::Owners {
+                kind: OwnerKind::ReplicaSet,
+                name: None,
+            };
+            owner_watches.insert(sets, Progress::default());
+            owner_watches.insert(WatchSpec::Events, Progress::default());
+        }
         for (kind, name) in wanted {
             // A deployment is followed through its replica sets.
             if kind == WorkloadKind::Deployment {
@@ -221,6 +282,9 @@ impl NamespaceState {
             started: false,
             failures: HashMap::new(),
             ambiguous: BTreeMap::new(),
+            events_since,
+            seen_events: HashMap::new(),
+            pending_events: VecDeque::new(),
         };
         let mut out: Vec<Output> = state
             .owner_watches
@@ -250,6 +314,13 @@ impl NamespaceState {
                 }
                 self.failures.remove(&spec);
                 self.on_pod(&spec, event);
+            }
+            Input::Cluster(spec, event) => {
+                if !self.owner_watches.contains_key(&spec) {
+                    return out;
+                }
+                self.failures.remove(&spec);
+                self.on_cluster_event(&spec, event);
             }
             Input::Failed(spec, reason) => {
                 let progress = match self.owner_watches.get_mut(&spec) {
@@ -329,6 +400,7 @@ impl NamespaceState {
                 view: pod.clone(),
                 seen_by: BTreeSet::new(),
                 followed: BTreeMap::new(),
+                exits: BTreeMap::new(),
                 at_start,
             });
             entry.view = pod;
@@ -372,6 +444,7 @@ impl NamespaceState {
             self.started = true;
         }
         self.reconcile_containers(out);
+        self.reconcile_events(out);
         self.note_ambiguous_names(out);
 
         let all_live = |watches: &BTreeMap<WatchSpec, Progress>| {
@@ -495,7 +568,9 @@ impl NamespaceState {
                     out.push(Output::Container(ContainerEvent::Removed { id: id(name) }));
                 }
             }
+            let mut exits = BTreeMap::new();
             for (name, view) in &wanted {
+                let exit = view.latest_exit();
                 match entry.followed.get(name) {
                     None => out.push(Output::Container(ContainerEvent::Added {
                         id: id(name),
@@ -507,10 +582,23 @@ impl NamespaceState {
                             id: id(name),
                             view: view.clone(),
                         }));
+                        // A run ended since the last report. Kubernetes has
+                        // no event for that, so one is made here.
+                        if self.events_since.is_some()
+                            && let Some(exit) = &exit
+                            && entry.exits.get(name) != Some(exit)
+                            && exit.exit_code != 0
+                        {
+                            out.push(Output::Cluster(exit_event(&id(name), exit)));
+                        }
                     }
                     Some(_) => {}
                 }
+                if let Some(exit) = exit {
+                    exits.insert(name.clone(), exit);
+                }
             }
+            entry.exits = exits;
 
             let was_followed = !entry.followed.is_empty();
             let is_followed = !wanted.is_empty();
@@ -673,6 +761,169 @@ impl NamespaceState {
     }
 }
 
+impl NamespaceState {
+    fn on_cluster_event(&mut self, spec: &WatchSpec, event: Event<EventView>) {
+        let Some(progress) = self.owner_watches.get_mut(spec) else {
+            return;
+        };
+        // What the first list holds was there before the session; whether
+        // that is history worth telling is a matter of its time.
+        let first_list = !progress.listed;
+        match event {
+            Event::Init => progress.listing = Some(HashSet::new()),
+            Event::InitApply(event) => {
+                if let Some(listing) = &mut progress.listing {
+                    listing.insert(event.uid.clone());
+                }
+                self.offer_event(event, first_list);
+            }
+            Event::InitDone => {
+                if let Some(listed) = progress.listing.take() {
+                    self.seen_events.retain(|uid, _| listed.contains(uid));
+                }
+                progress.live = true;
+                progress.listed = true;
+            }
+            Event::Apply(event) => self.offer_event(event, false),
+            Event::Delete(event) => {
+                self.seen_events.remove(&event.uid);
+                self.pending_events
+                    .retain(|pending| pending.uid != event.uid);
+            }
+        }
+    }
+
+    /// Takes an event as the watch reports it: new, or an old one that has
+    /// happened again.
+    fn offer_event(&mut self, event: EventView, first_list: bool) {
+        let occurrence = (event.count, event.time);
+        if self.seen_events.get(&event.uid) == Some(&occurrence) {
+            return;
+        }
+        // What was there before the session and is older than its history
+        // is not told, but remembered, so that it is told when it happens
+        // again. An event that arrives while the session runs is new by
+        // that fact alone; its time is not compared with this machine's
+        // clock, which may be ahead of the cluster's.
+        let too_old = first_list
+            && self
+                .events_since
+                .is_some_and(|since| event.time.is_none_or(|time| time < since));
+        if too_old {
+            self.seen_events.insert(event.uid, occurrence);
+            return;
+        }
+        self.pending_events
+            .retain(|pending| pending.uid != event.uid);
+        self.pending_events.push_back(event);
+        while self.pending_events.len() > PENDING_EVENTS {
+            self.pending_events.pop_front();
+        }
+    }
+
+    /// Tells the pending events that are about something followed. An event
+    /// can arrive before the pod it is about, so the others are kept.
+    fn reconcile_events(&mut self, out: &mut Vec<Output>) {
+        if self.pending_events.is_empty() {
+            return;
+        }
+        let relevant = self.relevant_uids();
+        let mut kept = VecDeque::new();
+        for event in std::mem::take(&mut self.pending_events) {
+            if !relevant.contains(event.regarding_uid.as_str()) {
+                kept.push_back(event);
+                continue;
+            }
+            self.seen_events
+                .insert(event.uid.clone(), (event.count, event.time));
+            let about_pod = event.regarding_kind == "Pod";
+            // An event about a container that is kept out is kept out too.
+            let container_followed = match (&event.container, about_pod) {
+                (Some(container), true) => self.pods.values().any(|entry| {
+                    entry.view.uid == event.regarding_uid && entry.followed.contains_key(container)
+                }),
+                _ => true,
+            };
+            if !container_followed {
+                continue;
+            }
+            out.push(Output::Cluster(ClusterEvent {
+                namespace: self.namespace.clone(),
+                pod: about_pod.then(|| event.regarding_name.clone()),
+                container: event.container,
+                regarding: format!("{}/{}", event.regarding_kind, event.regarding_name),
+                reason: event.reason,
+                message: event.message,
+                warning: event.warning,
+                count: event.count,
+                time: event.time,
+            }));
+        }
+        self.pending_events = kept;
+    }
+
+    /// The uids of everything an event can be about and be told: the
+    /// followed pods, the workloads above them, and the workloads the
+    /// targets name, also while those have no pods.
+    fn relevant_uids(&self) -> HashSet<String> {
+        let mut uids = HashSet::new();
+        for entry in self.pods.values() {
+            if entry.followed.is_empty() {
+                continue;
+            }
+            uids.insert(entry.view.uid.clone());
+            let Some(controller) = &entry.view.controller else {
+                continue;
+            };
+            uids.insert(controller.uid.clone());
+            // The deployment above the replica set, the cron job above the job.
+            let above = OwnerKind::from_kind_name(&controller.kind)
+                .and_then(|kind| self.owners.get(&(kind, controller.name.clone())))
+                .filter(|owner| owner.uid == controller.uid)
+                .and_then(|owner| owner.controller.as_ref());
+            if let Some(above) = above {
+                uids.insert(above.uid.clone());
+            }
+        }
+        for owner in self.owners.values() {
+            let named_above = owner.controller.as_ref().is_some_and(|controller| {
+                OwnerKind::from_kind_name(&controller.kind)
+                    .and_then(|kind| self.owners.get(&(kind, controller.name.clone())))
+                    .is_some_and(|above| above.uid == controller.uid && self.is_named(above))
+            });
+            if self.is_named(owner) || named_above {
+                uids.insert(owner.uid.clone());
+            }
+        }
+        uids
+    }
+}
+
+/// The event that stands for the end of a run of a container.
+fn exit_event(id: &ContainerId, exit: &Exit) -> ClusterEvent {
+    let message = match &exit.reason {
+        Some(reason) => format!(
+            "Container {} exited with code {} ({reason})",
+            id.container, exit.exit_code
+        ),
+        None => format!(
+            "Container {} exited with code {}",
+            id.container, exit.exit_code
+        ),
+    };
+    ClusterEvent {
+        namespace: id.namespace.clone(),
+        pod: Some(id.pod.clone()),
+        container: Some(id.container.clone()),
+        regarding: format!("Pod/{}", id.pod),
+        reason: EXITED.to_string(),
+        message,
+        warning: true,
+        count: 1,
+        time: exit.finished_at,
+    }
+}
+
 fn pod_key(pod: &PodView) -> String {
     if pod.uid.is_empty() {
         pod.name.clone()
@@ -684,7 +935,7 @@ fn pod_key(pod: &PodView) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resolver::model::{ContainerRole, ContainerState, OwnerRef};
+    use crate::resolver::model::{ContainerRole, ContainerState, EventView, Exit, OwnerRef};
     use kube::core::Selector;
 
     const NS: &str = "flowcpt";
@@ -700,7 +951,7 @@ mod tests {
     }
 
     fn state(texts: &[&str]) -> (NamespaceState, Vec<Output>) {
-        NamespaceState::new(NS, targets(texts), None, true)
+        NamespaceState::new(NS, targets(texts), None, true, None)
     }
 
     fn selector(pairs: &[(&'static str, &'static str)]) -> Selector {
@@ -751,6 +1002,7 @@ mod tests {
             restart_count: 0,
             state: ContainerState::Running { started_at: None },
             has_previous: false,
+            last_exit: None,
         }
     }
 
@@ -1026,6 +1278,7 @@ mod tests {
             targets(&["flowcpt"]),
             Some(Pattern::new("{api,worker}").unwrap()),
             true,
+            None,
         );
         let out = list_pods(
             &mut state,
@@ -1567,7 +1820,7 @@ mod tests {
 
     #[test]
     fn a_namespace_that_came_later_has_nothing_from_the_start() {
-        let (mut state, _) = NamespaceState::new(NS, targets(&["flow*"]), None, false);
+        let (mut state, _) = NamespaceState::new(NS, targets(&["flow*"]), None, false, None);
         let out = list_pods(&mut state, &pods(None), vec![pod("a", &[], None, &["api"])]);
         assert_eq!(changes(&out), ["+a/api"]);
         assert_eq!(notices(&out), ["pod a appeared; following api"]);
@@ -1615,6 +1868,452 @@ mod tests {
         // Once it works again, a new failure is worth a new notice.
         list_owners(&mut state, &cron, vec![]);
         assert_eq!(notices(&state.handle(failure())).len(), 1);
+    }
+
+    // ---- events -------------------------------------------------------
+
+    fn at(seconds: i64) -> DateTime<Utc> {
+        use chrono::TimeZone;
+        Utc.with_ymd_and_hms(2026, 11, 18, 14, 0, 0).unwrap() + chrono::TimeDelta::seconds(seconds)
+    }
+
+    /// A state that follows events from 14:00:00 on.
+    fn state_with_events(texts: &[&str]) -> (NamespaceState, Vec<Output>) {
+        NamespaceState::new(NS, targets(texts), None, true, Some(at(0)))
+    }
+
+    /// An event about the object `name` of this kind, with the uid the
+    /// builders above give that object.
+    fn cluster_event(
+        uid: &str,
+        kind: &str,
+        name: &str,
+        reason: &str,
+        count: i32,
+        seconds: i64,
+    ) -> EventView {
+        EventView {
+            uid: uid.to_string(),
+            regarding_kind: kind.to_string(),
+            regarding_name: name.to_string(),
+            regarding_uid: format!("uid-{name}"),
+            container: None,
+            reason: reason.to_string(),
+            message: format!("{reason} happened"),
+            warning: false,
+            count,
+            time: Some(at(seconds)),
+        }
+    }
+
+    fn apply_event(state: &mut NamespaceState, event: EventView) -> Vec<Output> {
+        state.handle(Input::Cluster(WatchSpec::Events, Event::Apply(event)))
+    }
+
+    /// The events told, as `regarding reason xcount`.
+    fn told(out: &[Output]) -> Vec<String> {
+        out.iter()
+            .filter_map(|output| match output {
+                Output::Cluster(event) => Some(format!(
+                    "{} {} x{}",
+                    event.regarding, event.reason, event.count
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn events_need_a_watch_on_events_and_on_what_lies_between_pods_and_workloads() {
+        let (_, out) = state_with_events(&["flowcpt"]);
+        assert_eq!(
+            starts(&out),
+            [
+                owners(OwnerKind::ReplicaSet, None),
+                owners(OwnerKind::Job, None),
+                WatchSpec::Events,
+                pods(None),
+            ]
+        );
+        // Without events a bare namespace watches its pods and nothing else.
+        let (_, out) = state(&["flowcpt"]);
+        assert_eq!(starts(&out), [pods(None)]);
+    }
+
+    #[test]
+    fn an_event_about_a_followed_pod_is_told_and_one_about_another_is_not() {
+        let (mut state, _) = state_with_events(&["flowcpt/-/followed"]);
+        list_pods(
+            &mut state,
+            &pods(None),
+            vec![
+                pod("followed", &[], None, &["api"]),
+                pod("other", &[], None, &["api"]),
+            ],
+        );
+        let out = apply_event(
+            &mut state,
+            cluster_event("e1", "Pod", "followed", "Started", 1, 10),
+        );
+        assert_eq!(told(&out), ["Pod/followed Started x1"]);
+        let Output::Cluster(event) = &out[0] else {
+            panic!("expected an event, got {out:?}");
+        };
+        assert_eq!(event.namespace, NS);
+        assert_eq!(event.pod.as_deref(), Some("followed"));
+        assert_eq!(event.message, "Started happened");
+        assert_eq!(event.time, Some(at(10)));
+
+        let out = apply_event(
+            &mut state,
+            cluster_event("e2", "Pod", "other", "Started", 1, 10),
+        );
+        assert_eq!(told(&out), Vec::<String>::new());
+    }
+
+    #[test]
+    fn events_about_the_replica_set_and_the_deployment_above_a_followed_pod_are_told() {
+        let (mut state, _) = state_with_events(&["flowcpt"]);
+        list_owners(
+            &mut state,
+            &owners(OwnerKind::ReplicaSet, None),
+            vec![
+                replica_set("flowcpt-api-7d9f", "flowcpt-api"),
+                replica_set("unrelated-5c8b", "unrelated"),
+            ],
+        );
+        list_pods(
+            &mut state,
+            &pods(None),
+            vec![set_pod(
+                "flowcpt-api-7d9f-xk2p1",
+                "flowcpt-api",
+                "flowcpt-api-7d9f",
+                &["api"],
+            )],
+        );
+        let out = apply_event(
+            &mut state,
+            cluster_event(
+                "e1",
+                "ReplicaSet",
+                "flowcpt-api-7d9f",
+                "SuccessfulCreate",
+                1,
+                5,
+            ),
+        );
+        assert_eq!(
+            told(&out),
+            ["ReplicaSet/flowcpt-api-7d9f SuccessfulCreate x1"]
+        );
+        let Output::Cluster(event) = &out[0] else {
+            panic!("expected an event, got {out:?}");
+        };
+        // It is not about a pod.
+        assert_eq!(event.pod, None);
+
+        let out = apply_event(
+            &mut state,
+            cluster_event("e2", "Deployment", "flowcpt-api", "ScalingReplicaSet", 1, 6),
+        );
+        assert_eq!(told(&out), ["Deployment/flowcpt-api ScalingReplicaSet x1"]);
+
+        // A deployment with no followed pod below it stays out.
+        let out = apply_event(
+            &mut state,
+            cluster_event("e3", "Deployment", "unrelated", "ScalingReplicaSet", 1, 7),
+        );
+        assert_eq!(told(&out), Vec::<String>::new());
+    }
+
+    #[test]
+    fn events_about_a_workload_a_target_names_are_told_also_while_it_has_no_pods() {
+        // Scaled to zero: the event that scales it up comes before any pod.
+        let (mut state, _) = state_with_events(&["flowcpt/deployment:flowcpt-api"]);
+        list_owners(
+            &mut state,
+            &owners(OwnerKind::Deployment, Some("flowcpt-api")),
+            vec![deployment("flowcpt-api", &[("app", "flowcpt-api")])],
+        );
+        list_owners(
+            &mut state,
+            &owners(OwnerKind::ReplicaSet, None),
+            vec![replica_set("flowcpt-api-7d9f", "flowcpt-api")],
+        );
+        let out = apply_event(
+            &mut state,
+            cluster_event("e1", "Deployment", "flowcpt-api", "ScalingReplicaSet", 1, 5),
+        );
+        assert_eq!(told(&out), ["Deployment/flowcpt-api ScalingReplicaSet x1"]);
+        let out = apply_event(
+            &mut state,
+            cluster_event(
+                "e2",
+                "ReplicaSet",
+                "flowcpt-api-7d9f",
+                "SuccessfulCreate",
+                1,
+                6,
+            ),
+        );
+        assert_eq!(
+            told(&out),
+            ["ReplicaSet/flowcpt-api-7d9f SuccessfulCreate x1"]
+        );
+    }
+
+    #[test]
+    fn an_event_that_arrives_before_its_pod_is_told_when_the_pod_does() {
+        let (mut state, _) = state_with_events(&["flowcpt"]);
+        let all = pods(None);
+        // Every watch has listed what there is, which is nothing.
+        list_owners(&mut state, &owners(OwnerKind::ReplicaSet, None), vec![]);
+        list_owners(&mut state, &owners(OwnerKind::Job, None), vec![]);
+        state.handle(Input::Cluster(WatchSpec::Events, Event::Init));
+        state.handle(Input::Cluster(WatchSpec::Events, Event::InitDone));
+        list_pods(&mut state, &all, vec![]);
+        let out = apply_event(
+            &mut state,
+            cluster_event("e1", "Pod", "new", "Scheduled", 1, 5),
+        );
+        assert_eq!(told(&out), Vec::<String>::new());
+
+        let out = apply_pod(&mut state, &all, pod("new", &[], None, &["api"]));
+        assert_eq!(changes(&out), ["+new/api"]);
+        assert_eq!(told(&out), ["Pod/new Scheduled x1"]);
+        // And only once.
+        let out = apply_pod(&mut state, &all, pod("new", &[], None, &["api", "envoy"]));
+        assert_eq!(told(&out), Vec::<String>::new());
+    }
+
+    #[test]
+    fn an_event_is_told_again_only_when_it_happens_again() {
+        let (mut state, _) = state_with_events(&["flowcpt"]);
+        list_pods(&mut state, &pods(None), vec![pod("a", &[], None, &["api"])]);
+        let back_off =
+            |count: i32, seconds: i64| cluster_event("e1", "Pod", "a", "BackOff", count, seconds);
+
+        assert_eq!(
+            told(&apply_event(&mut state, back_off(1, 10))),
+            ["Pod/a BackOff x1"]
+        );
+        // The same occurrence, reported again.
+        assert_eq!(
+            told(&apply_event(&mut state, back_off(1, 10))),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            told(&apply_event(&mut state, back_off(2, 20))),
+            ["Pod/a BackOff x2"]
+        );
+
+        // The watch lists again: nothing that was told is told again.
+        let mut out = state.handle(Input::Cluster(WatchSpec::Events, Event::Init));
+        out.extend(state.handle(Input::Cluster(
+            WatchSpec::Events,
+            Event::InitApply(back_off(2, 20)),
+        )));
+        out.extend(state.handle(Input::Cluster(WatchSpec::Events, Event::InitDone)));
+        assert_eq!(told(&out), Vec::<String>::new());
+        assert_eq!(
+            told(&apply_event(&mut state, back_off(3, 30))),
+            ["Pod/a BackOff x3"]
+        );
+    }
+
+    /// Lets the watch on events list these, as it does when it starts.
+    fn list_events(state: &mut NamespaceState, events: Vec<EventView>) -> Vec<Output> {
+        let mut out = state.handle(Input::Cluster(WatchSpec::Events, Event::Init));
+        for event in events {
+            out.extend(state.handle(Input::Cluster(WatchSpec::Events, Event::InitApply(event))));
+        }
+        out.extend(state.handle(Input::Cluster(WatchSpec::Events, Event::InitDone)));
+        out
+    }
+
+    #[test]
+    fn of_the_events_that_are_there_at_the_start_only_those_of_the_history_are_told() {
+        let (mut state, _) = state_with_events(&["flowcpt"]);
+        list_pods(&mut state, &pods(None), vec![pod("a", &[], None, &["api"])]);
+        // One from an hour before the history begins, one from within it.
+        let old = cluster_event("e1", "Pod", "a", "Unhealthy", 7, -3_600);
+        let recent = cluster_event("e2", "Pod", "a", "Started", 1, 30);
+        let out = list_events(&mut state, vec![old.clone(), recent]);
+        assert_eq!(told(&out), ["Pod/a Started x1"]);
+
+        // The old one is told when it happens again.
+        assert_eq!(told(&apply_event(&mut state, old)), Vec::<String>::new());
+        let again = cluster_event("e1", "Pod", "a", "Unhealthy", 8, 60);
+        assert_eq!(
+            told(&apply_event(&mut state, again)),
+            ["Pod/a Unhealthy x8"]
+        );
+    }
+
+    #[test]
+    fn an_event_that_arrives_while_the_session_runs_is_told_whatever_its_time() {
+        let (mut state, _) = state_with_events(&["flowcpt"]);
+        list_pods(&mut state, &pods(None), vec![pod("a", &[], None, &["api"])]);
+        list_events(&mut state, vec![]);
+        // The clock of this machine is ahead of the cluster's: by it, the
+        // event happened before the session began. It did not.
+        let skewed = cluster_event("e1", "Pod", "a", "Killing", 1, -120);
+        assert_eq!(told(&apply_event(&mut state, skewed)), ["Pod/a Killing x1"]);
+
+        // An event the watch finds when it lists again was missed while the
+        // watch was down, and is told too.
+        let missed = cluster_event("e2", "Pod", "a", "Started", 1, -60);
+        assert_eq!(
+            told(&list_events(&mut state, vec![missed])),
+            ["Pod/a Started x1"]
+        );
+    }
+
+    #[test]
+    fn more_events_than_a_few_hundred_can_wait_for_their_pods() {
+        let (mut state, _) = state_with_events(&["flowcpt"]);
+        // The events of a busy namespace are listed before any pod is known.
+        let events: Vec<EventView> = (0..1_000)
+            .map(|number| {
+                let pod = format!("pod-{}", number % 10);
+                cluster_event(&format!("e{number}"), "Pod", &pod, "Pulled", 1, number)
+            })
+            .collect();
+        assert_eq!(told(&list_events(&mut state, events)), Vec::<String>::new());
+        let out = list_pods(
+            &mut state,
+            &pods(None),
+            vec![pod("pod-3", &[], None, &["api"])],
+        );
+        assert_eq!(told(&out).len(), 100);
+    }
+
+    #[test]
+    fn an_event_about_a_container_that_is_kept_out_is_kept_out_too() {
+        let (mut state, _) = NamespaceState::new(
+            NS,
+            targets(&["flowcpt"]),
+            Some(Pattern::new("api").unwrap()),
+            true,
+            Some(at(0)),
+        );
+        list_pods(
+            &mut state,
+            &pods(None),
+            vec![pod("a", &[], None, &["api", "envoy"])],
+        );
+        let about = |uid: &str, container: Option<&str>| EventView {
+            container: container.map(str::to_string),
+            ..cluster_event(uid, "Pod", "a", "Started", 1, 5)
+        };
+        assert_eq!(
+            told(&apply_event(&mut state, about("e1", Some("envoy")))),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            told(&apply_event(&mut state, about("e2", Some("api")))),
+            ["Pod/a Started x1"]
+        );
+        // An event about the pod as a whole is told.
+        assert_eq!(
+            told(&apply_event(&mut state, about("e3", None))),
+            ["Pod/a Started x1"]
+        );
+    }
+
+    fn exited(exit_code: i32, seconds: i64) -> ContainerState {
+        ContainerState::Terminated {
+            exit_code,
+            reason: Some(if exit_code == 0 { "Completed" } else { "Error" }.to_string()),
+            finished_at: Some(at(seconds)),
+        }
+    }
+
+    /// A pod with one container `api` in this state.
+    fn pod_in(state: ContainerState, restart_count: i32, last_exit: Option<Exit>) -> PodView {
+        let mut view = pod("a", &[], None, &["api"]);
+        view.containers[0].state = state;
+        view.containers[0].restart_count = restart_count;
+        view.containers[0].has_previous = last_exit.is_some();
+        view.containers[0].last_exit = last_exit;
+        view
+    }
+
+    #[test]
+    fn the_end_of_a_run_with_an_exit_code_is_told_as_an_event_once() {
+        let (mut state, _) = state_with_events(&["flowcpt"]);
+        let all = pods(None);
+        let running = || ContainerState::Running { started_at: None };
+        list_pods(&mut state, &all, vec![pod_in(running(), 0, None)]);
+
+        // The container falls over.
+        let out = apply_pod(&mut state, &all, pod_in(exited(101, 10), 0, None));
+        assert_eq!(told(&out), ["Pod/a Exited x1"]);
+        let event = out
+            .iter()
+            .find_map(|output| match output {
+                Output::Cluster(event) => Some(event),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(event.message, "Container api exited with code 101 (Error)");
+        assert!(event.warning);
+        assert_eq!(event.container.as_deref(), Some("api"));
+        assert_eq!(event.time, Some(at(10)));
+
+        // It waits to be restarted, then runs again: the same exit, now the
+        // last state, is not told again.
+        let last = Exit {
+            exit_code: 101,
+            reason: Some("Error".to_string()),
+            finished_at: Some(at(10)),
+        };
+        let waiting = ContainerState::Waiting {
+            reason: Some("CrashLoopBackOff".to_string()),
+            message: None,
+        };
+        let out = apply_pod(&mut state, &all, pod_in(waiting, 1, Some(last.clone())));
+        assert_eq!(told(&out), Vec::<String>::new());
+        let out = apply_pod(&mut state, &all, pod_in(running(), 1, Some(last)));
+        assert_eq!(told(&out), Vec::<String>::new());
+
+        // It falls over again, and this time the pod is first seen when it
+        // already runs again.
+        let second = Exit {
+            exit_code: 137,
+            reason: Some("OOMKilled".to_string()),
+            finished_at: Some(at(60)),
+        };
+        let out = apply_pod(&mut state, &all, pod_in(running(), 2, Some(second)));
+        assert_eq!(told(&out), ["Pod/a Exited x1"]);
+    }
+
+    #[test]
+    fn an_exit_with_code_zero_or_from_before_the_session_is_no_event() {
+        let (mut state, _) = state_with_events(&["flowcpt"]);
+        let all = pods(None);
+        // Seen for the first time when it has already ended.
+        let out = list_pods(&mut state, &all, vec![pod_in(exited(1, -60), 0, None)]);
+        assert_eq!(told(&out), Vec::<String>::new());
+
+        let (mut state, _) = state_with_events(&["flowcpt"]);
+        let running = ContainerState::Running { started_at: None };
+        list_pods(&mut state, &all, vec![pod_in(running, 0, None)]);
+        let out = apply_pod(&mut state, &all, pod_in(exited(0, 10), 0, None));
+        assert_eq!(changes(&out), ["~a/api"]);
+        assert_eq!(told(&out), Vec::<String>::new());
+    }
+
+    #[test]
+    fn without_events_an_exit_is_only_a_new_state() {
+        let (mut state, _) = state(&["flowcpt"]);
+        let all = pods(None);
+        let running = ContainerState::Running { started_at: None };
+        list_pods(&mut state, &all, vec![pod_in(running, 0, None)]);
+        let out = apply_pod(&mut state, &all, pod_in(exited(1, 10), 0, None));
+        assert_eq!(changes(&out), ["~a/api"]);
+        assert_eq!(told(&out), Vec::<String>::new());
     }
 
     #[test]

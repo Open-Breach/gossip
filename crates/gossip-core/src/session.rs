@@ -4,14 +4,15 @@
 //! merges what comes in into one stream ordered by time. Stopping it, by
 //! dropping it, closes every stream and every watch.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, TimeDelta, Utc};
 use futures::Stream;
+use serde_json::json;
 use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Instant, sleep_until};
@@ -21,8 +22,10 @@ use crate::config::{DEFAULT_TAIL, FormatSetting, Settings};
 use crate::filter::Filter;
 use crate::logs::{self, Followers, History};
 use crate::merge::{DEFAULT_HOLD, ReorderBuffer};
-use crate::record::Record;
-use crate::resolver::{ContainerEvent, ContainerId, ContainerView, Resolver, ResolverEvent};
+use crate::record::{Format, Kind, Level, Record, event_field};
+use crate::resolver::{
+    ClusterEvent, ContainerEvent, ContainerId, ContainerView, Resolver, ResolverEvent,
+};
 use crate::target::{Pattern, Target};
 
 /// The options of a session.
@@ -33,6 +36,9 @@ pub struct SessionOptions {
     /// History per container at start, as a number of lines. With `since`
     /// as well, the last lines of that time.
     pub tail: Option<u64>,
+    /// Whether the cluster's events about the followed pods, and about the
+    /// workloads above them, are merged into the stream.
+    pub events: bool,
     /// Only containers whose name matches are followed, to keep sidecars out.
     pub containers: Option<Pattern>,
     /// Which recogniser reads the lines, for all containers or per container.
@@ -53,6 +59,7 @@ impl Default for SessionOptions {
         SessionOptions {
             since: None,
             tail: Some(DEFAULT_TAIL),
+            events: true,
             containers: None,
             format: FormatSetting::default(),
             hold: DEFAULT_HOLD,
@@ -66,6 +73,7 @@ impl From<&Settings> for SessionOptions {
         SessionOptions {
             since: settings.since,
             tail: settings.tail,
+            events: settings.events,
             containers: settings.container.clone(),
             format: settings.format.clone(),
             hold: DEFAULT_HOLD,
@@ -132,7 +140,22 @@ async fn drive(
     options: SessionOptions,
     out: mpsc::Sender<Record>,
 ) {
-    let mut resolver = Resolver::start(&cluster, targets, options.containers.clone());
+    // Events are told from where the history of the lines begins: as far
+    // back as `since` reaches, or from now on.
+    // Events that are there when the session starts are told as far back
+    // as `since` reaches; with a history in lines, none of them is. Events
+    // that happen while the session runs are always told.
+    let events_since = options.events.then(|| match options.since {
+        Some(since) => {
+            let back = TimeDelta::from_std(since).unwrap_or_default();
+            // Many events carry their time in whole seconds, so the start
+            // of the history is a whole second too.
+            let start = Utc::now() - back;
+            DateTime::from_timestamp(start.timestamp(), 0).unwrap_or(start)
+        }
+        None => DateTime::<Utc>::MAX_UTC,
+    });
+    let mut resolver = Resolver::start(&cluster, targets, options.containers.clone(), events_since);
     let (records_tx, mut records_rx) = mpsc::channel(1024);
     let context = Arc::new(Followers {
         client: cluster.client(),
@@ -169,6 +192,9 @@ async fn drive(
                     // and finish.
                     followers.remove(&id);
                 }
+                Some(ResolverEvent::Cluster(event)) => {
+                    buffer.push(event_record(cluster.name(), event), Instant::now().into_std());
+                }
                 Some(ResolverEvent::Notice(notice)) => {
                     let record = Record::notice(
                         cluster.name(),
@@ -193,6 +219,40 @@ async fn drive(
                 return;
             }
         }
+    }
+}
+
+/// A cluster event as a record of kind `event`: the reason, the type and
+/// the count are fields, `Warning` is the level `warn` and `Normal` is
+/// `info`.
+fn event_record(cluster: &str, event: ClusterEvent) -> Record {
+    let fields = BTreeMap::from([
+        (event_field::REASON.to_string(), json!(event.reason)),
+        (
+            event_field::TYPE.to_string(),
+            json!(if event.warning { "Warning" } else { "Normal" }),
+        ),
+        (event_field::COUNT.to_string(), json!(event.count)),
+        (event_field::REGARDING.to_string(), json!(event.regarding)),
+    ]);
+    Record {
+        cluster: cluster.to_string(),
+        namespace: event.namespace,
+        pod: event.pod.unwrap_or_default(),
+        container: event.container,
+        time: event.time.unwrap_or_else(Utc::now),
+        kind: Kind::Event,
+        format: Format::Text,
+        level: Some(if event.warning {
+            Level::Warn
+        } else {
+            Level::Info
+        }),
+        raw: format!("{}: {}", event.reason, event.message),
+        message: event.message,
+        fields,
+        previous: false,
+        truncated: false,
     }
 }
 
