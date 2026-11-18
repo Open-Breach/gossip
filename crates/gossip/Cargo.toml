@@ -1,0 +1,14 @@
+[package]
+name = "gossip"
+description = "Follow Kubernetes pod logs and cluster events across restarts and rollouts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "gossip"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true

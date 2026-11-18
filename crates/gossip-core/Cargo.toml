@@ -1,0 +1,9 @@
+[package]
+name = "gossip-core"
+description = "Core library of Gossip: follow Kubernetes pod logs and cluster events across restarts and rollouts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
