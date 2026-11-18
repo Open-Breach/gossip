@@ -8,7 +8,12 @@
 //! Two rules hold for everything in here: the core prints nothing, and it
 //! only ever reads from the cluster.
 //!
-//! What exists so far is the logic that needs no cluster:
+//! What talks to a cluster so far:
+//!
+//! - [`cluster`]: the contexts of the kubeconfig, and a client for one.
+//! - [`discovery`]: the namespaces, deployments and pods of a cluster.
+//!
+//! And the logic that needs no cluster:
 //!
 //! - [`target`]: targets, the paths `namespace[/workload[/pod[/container]]]`
 //!   whose names may be globs.
@@ -19,15 +24,21 @@
 //! - [`config`]: the config file with its defaults and templates.
 //! - [`duration`]: durations as the command line and the config write them.
 
+pub mod cluster;
 pub mod config;
+pub mod discovery;
 pub mod duration;
+pub mod error;
 pub mod filter;
 pub mod parser;
 pub mod record;
 pub mod target;
 
+pub use cluster::{Cluster, ContextInfo};
 pub use config::{Config, ConfigError, Defaults, FormatSetting, Output, Settings, Template};
+pub use discovery::{ContainerInfo, DeploymentInfo, NamespaceInfo, PodInfo};
 pub use duration::{DurationError, format_duration, parse_duration};
+pub use error::Error;
 pub use filter::{Field, Filter, FilterError, Op, Rule};
 pub use parser::{FormatChoice, LineParser, ParsedLine};
 pub use record::{Format, Kind, Level, Record, Value};

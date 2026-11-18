@@ -9,26 +9,47 @@ plans.
 
 ## Status
 
-The command line is still a skeleton: the `gossip` binary only prints its help
-and its version, and nothing talks to a cluster yet.
-
-The core library holds the logic that needs no cluster, with unit tests:
-
-| Module | What it does |
-| --- | --- |
-| `target` | Parses targets, the paths `namespace[/workload[/pod[/container]]]` whose names may be globs, such as `flowcpt/flowcpt-api`, `flowcpt/cronjob:nightly-sync` or `monitoring/prometheus/*/exporter`. |
-| `record` | The record: one type for a log line, a cluster event or a notice, with where it came from, when, a level, a message and structured fields. |
-| `parser` | Turns the lines of a container into records. JSON and logfmt lines become a level, a message and fields; anything else is text with a guessed level. Indented lines and lines starting with `at ` or `Caused by:` join the line before them. |
-| `filter` | Rules `field operator value` over records, joined into a tree with `all`, `any` and `not`. |
-| `config` | Reads and writes the config file with its `[defaults]` and templates, and layers a template over the defaults. Unknown keys are an error that names the line. |
-| `duration` | Durations such as `30s`, `5m` and `1h30m`. |
-
-The command line does not use any of this yet.
+One command works against a cluster so far: `gossip list`. Following logs is
+not built yet.
 
 | Crate | Kind | Holds today |
 | --- | --- | --- |
-| `crates/gossip-core` | library | the modules above |
-| `crates/gossip` | binary `gossip` | `--help` and `--version` |
+| `crates/gossip-core` | library | cluster access and discovery; and, not yet used by the command line, targets, records, the line parser, filters and the config file |
+| `crates/gossip` | binary `gossip` | `gossip list` |
+
+Gossip is a client only: it reads from the cluster and never creates, changes
+or deletes anything in it. It reaches the cluster through the kubeconfig
+(`KUBECONFIG` or `~/.kube/config`) with the same credentials `kubectl` uses,
+exec plugins such as `kubelogin` included, and it honours `HTTPS_PROXY` and a
+`proxy-url` in the kubeconfig.
+
+## Commands
+
+### `gossip list`
+
+Shows what is in a cluster, so that names need not be typed from memory.
+
+| Form | Shows |
+| --- | --- |
+| `gossip list contexts` | the contexts of the kubeconfig, the current one marked with `*` |
+| `gossip list namespaces` | the namespaces of the cluster, with status and age |
+| `gossip list <namespace>` | the deployments of the namespace, with ready / desired replicas and age |
+| `gossip list <namespace>/<deployment>` | the pods of the deployment, with phase, restarts, age and containers |
+
+`--context <name>` picks the cluster; without it the current context is used.
+`--json` prints the same as JSON for scripts.
+
+```bash
+gossip list flowcpt/flowcpt-api
+```
+
+```
+NAME                     PHASE     RESTARTS   AGE     CONTAINERS
+flowcpt-api-7d9f-xk2p1   Running   0          3h12m   migrate (init), api, envoy
+```
+
+Names are exact here; globs are not accepted. A cluster that cannot be reached
+ends the command with exit code 1 and the error.
 
 ## Build and install
 
