@@ -285,6 +285,7 @@ async fn watch_namespaces(client: Client, control: mpsc::Sender<Control>) {
             Ok(event) => Control::Namespaces(convert(event, |namespace: &Namespace| {
                 namespace.metadata.name.clone().unwrap_or_default()
             })),
+            Err(error) if lost_its_place(&error) => continue,
             Err(error) => Control::NamespacesFailed(describe_watch_error(&error)),
         };
         if control.send(message).await.is_err() {
@@ -452,6 +453,7 @@ async fn watch<K, V>(
     while let Some(item) = events.next().await {
         let input = match item {
             Ok(event) => wrap(spec.clone(), convert(event, |object: &K| V::from(object))),
+            Err(error) if lost_its_place(&error) => continue,
             Err(error) => Input::Failed(spec.clone(), describe_watch_error(&error)),
         };
         if tx.send(input).await.is_err() {
@@ -469,6 +471,13 @@ fn convert<K, V>(event: Event<K>, view: impl Fn(&K) -> V) -> Event<V> {
         Event::InitApply(object) => Event::InitApply(view(&object)),
         Event::InitDone => Event::InitDone,
     }
+}
+
+/// Whether a watch only lost its place: the API server no longer has the
+/// version it was at (410 Gone). `kube` lists again by itself, which is
+/// routine and nothing to tell the user.
+fn lost_its_place(error: &watcher::Error) -> bool {
+    matches!(error, watcher::Error::WatchError(status) if status.code == 410)
 }
 
 pub(crate) fn describe_watch_error(error: &watcher::Error) -> String {
@@ -523,6 +532,18 @@ mod tests {
         let mut nothing = NothingTracker::new(1, true);
         nothing.namespaces_listed();
         assert_eq!(nothing.report(), [0]);
+    }
+
+    #[test]
+    fn a_watch_that_lost_its_place_is_not_a_failure() {
+        use kube::core::Status;
+        let gone = Status::failure("too old resource version: 5 (9)", "Expired").with_code(410);
+        assert!(lost_its_place(&watcher::Error::WatchError(gone.boxed())));
+        let forbidden = Status::failure("pods is forbidden", "Forbidden").with_code(403);
+        assert!(!lost_its_place(&watcher::Error::WatchError(
+            forbidden.boxed()
+        )));
+        assert!(!lost_its_place(&watcher::Error::NoResourceVersion));
     }
 
     #[test]
