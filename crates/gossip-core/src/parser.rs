@@ -2,14 +2,18 @@
 //!
 //! The format is detected per line. Three recognisers run in order, JSON,
 //! logfmt, then text, and the first that accepts the line wins. Before them
-//! comes the continuation rule: a line that starts with whitespace, with
-//! `at ` or with `Caused by:` belongs to the line before it.
+//! comes the continuation rule, which has two triggers. A line that starts
+//! with whitespace, with `at ` or with `Caused by:` belongs to the line
+//! before it. And a line that starts a Rust panic opens a block: the lines
+//! after it belong to it until a blank line or a JSON or logfmt line.
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
+use std::sync::LazyLock;
 
 use chrono::{DateTime, TimeDelta, Utc};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -22,6 +26,13 @@ pub const MAX_LINE_BYTES: usize = 1024 * 1024;
 /// A continuation line joins the line before it only when it is no more than
 /// this much younger than that line.
 const CONTINUATION_WINDOW: TimeDelta = TimeDelta::seconds(2);
+
+/// The first line of a Rust panic: `thread 'main' panicked at src/main.rs:5:5:`.
+/// Toolchains since 1.91 put the id of the thread in brackets after its
+/// name: `thread 'main' (238) panicked at ...`.
+static PANIC_START: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^thread '.*' (?:\(\d+\) )?panicked at\b").expect("the pattern is valid")
+});
 
 /// The key under which the application's own timestamp is kept in the fields
 /// of a line, whichever of `timestamp`, `ts` or `time` the line used.
@@ -108,6 +119,8 @@ pub struct ParsedLine {
 pub struct LineParser {
     choice: FormatChoice,
     pending: Option<ParsedLine>,
+    /// The line kept back opened a panic block that still takes lines.
+    block_open: bool,
 }
 
 impl LineParser {
@@ -115,6 +128,7 @@ impl LineParser {
         LineParser {
             choice,
             pending: None,
+            block_open: false,
         }
     }
 
@@ -123,36 +137,91 @@ impl LineParser {
     /// one is now complete.
     pub fn push(&mut self, time: DateTime<Utc>, line: &str) -> Option<ParsedLine> {
         let (line, truncated) = cut(line);
-
-        if self.choice != FormatChoice::Text && is_continuation(line) {
-            if let Some(pending) = &mut self.pending {
-                let young = time.signed_duration_since(pending.time) <= CONTINUATION_WINDOW;
-                let fits = pending.raw.len() + 1 + line.len() <= MAX_LINE_BYTES;
-                if young && fits {
-                    pending.message.push('\n');
-                    pending.message.push_str(line);
-                    pending.raw.push('\n');
-                    pending.raw.push_str(line);
-                    pending.truncated |= truncated;
-                    return None;
-                }
-            }
-            // Too old, or nothing to join: text on its own.
-            return self.pending.replace(text_line(time, line, truncated));
+        if self.choice == FormatChoice::Text {
+            // Every line is text on its own: nothing joins anything.
+            return self.keep(text_line(time, line, truncated), false);
         }
 
-        self.pending
-            .replace(recognise(self.choice, time, line, truncated))
+        // A line that is shaped like a continuation is never read as JSON
+        // or logfmt: it belongs to the line before it, or stands as text.
+        let shaped = is_continuation(line);
+        let structured = if shaped {
+            None
+        } else {
+            structured(self.choice, line)
+        };
+
+        if self.block_open {
+            // In a panic block every line joins, until a blank line, a line
+            // that parses as JSON or logfmt, or the next panic.
+            let blank = line.trim().is_empty();
+            let ends = blank || structured.is_some() || PANIC_START.is_match(line);
+            if !ends && self.join(time, line, truncated) {
+                return None;
+            }
+            if blank {
+                // The blank line that ends a block joins nothing.
+                return self.keep(text_line(time, line, truncated), false);
+            }
+        } else if shaped && self.join(time, line, truncated) {
+            return None;
+        }
+
+        if PANIC_START.is_match(line) {
+            return self.keep(text_line(time, line, truncated), true);
+        }
+        let parsed = match structured {
+            Some((format, fields)) => structured_line(time, line, truncated, format, fields),
+            // Also a continuation that is too old or has nothing to join:
+            // text on its own.
+            None => text_line(time, line, truncated),
+        };
+        self.keep(parsed, false)
     }
 
-    /// Hands out the line kept back, if there is one.
+    /// Hands out the line kept back, if there is one. A panic block that
+    /// was open is over with it.
     pub fn flush(&mut self) -> Option<ParsedLine> {
+        self.block_open = false;
         self.pending.take()
     }
 
     /// Whether a line is kept back.
     pub fn has_pending(&self) -> bool {
         self.pending.is_some()
+    }
+
+    /// Whether the line kept back is a panic block that still takes lines.
+    /// Its lines can come with pauses between them, so it is worth waiting
+    /// a little longer before flushing it.
+    pub fn in_block(&self) -> bool {
+        self.block_open && self.pending.is_some()
+    }
+
+    /// Keeps a line back and hands out the one kept back before it.
+    fn keep(&mut self, line: ParsedLine, opens_block: bool) -> Option<ParsedLine> {
+        self.block_open = opens_block;
+        self.pending.replace(line)
+    }
+
+    /// Appends a line to the one kept back, when there is one, the line is
+    /// no more than two seconds younger than its first line, and the record
+    /// stays within the size limit. Says whether it did.
+    fn join(&mut self, time: DateTime<Utc>, line: &str, truncated: bool) -> bool {
+        let Some(pending) = &mut self.pending else {
+            return false;
+        };
+        let young = time.signed_duration_since(pending.time) <= CONTINUATION_WINDOW;
+        let fits = pending.raw.len() + 1 + line.len() <= MAX_LINE_BYTES;
+        if !(young && fits) {
+            return false;
+        }
+        pending.message.push('\n');
+        pending.message.push_str(line);
+        pending.raw.push('\n');
+        pending.raw.push_str(line);
+        pending.truncated |= truncated;
+        true
     }
 }
 
@@ -174,29 +243,35 @@ fn is_continuation(line: &str) -> bool {
         || line.starts_with("Caused by:")
 }
 
-fn recognise(choice: FormatChoice, time: DateTime<Utc>, line: &str, truncated: bool) -> ParsedLine {
-    let structured = match choice {
-        FormatChoice::Auto => parse_json(line)
-            .map(|fields| (Format::Json, fields))
-            .or_else(|| parse_logfmt(line).map(|fields| (Format::Logfmt, fields))),
-        FormatChoice::Json => parse_json(line).map(|fields| (Format::Json, fields)),
-        FormatChoice::Logfmt => parse_logfmt(line).map(|fields| (Format::Logfmt, fields)),
+/// The fields of a line that a recogniser the choice allows accepts as JSON
+/// or logfmt.
+fn structured(choice: FormatChoice, line: &str) -> Option<(Format, BTreeMap<String, Value>)> {
+    let json = || parse_json(line).map(|fields| (Format::Json, fields));
+    let logfmt = || parse_logfmt(line).map(|fields| (Format::Logfmt, fields));
+    match choice {
+        FormatChoice::Auto => json().or_else(logfmt),
+        FormatChoice::Json => json(),
+        FormatChoice::Logfmt => logfmt(),
         FormatChoice::Text => None,
-    };
-    match structured {
-        Some((format, mut fields)) => {
-            let (level, message) = normalise(&mut fields);
-            ParsedLine {
-                time,
-                format,
-                level,
-                message,
-                fields,
-                raw: line.to_string(),
-                truncated,
-            }
-        }
-        None => text_line(time, line, truncated),
+    }
+}
+
+fn structured_line(
+    time: DateTime<Utc>,
+    line: &str,
+    truncated: bool,
+    format: Format,
+    mut fields: BTreeMap<String, Value>,
+) -> ParsedLine {
+    let (level, message) = normalise(&mut fields);
+    ParsedLine {
+        time,
+        format,
+        level,
+        message,
+        fields,
+        raw: line.to_string(),
+        truncated,
     }
 }
 
@@ -700,36 +775,261 @@ mod tests {
         assert_eq!(parsed[1].raw, lines[1..].join("\n"));
     }
 
+    // ---- panic blocks ---------------------------------------------------
+
+    /// A panic as Rust 1.100 prints it with a backtrace: a blank line, the
+    /// line that names the thread, the message, the backtrace, a note.
+    const PANIC: [&str; 11] = [
+        "",
+        "thread 'tokio-runtime-worker' (241) panicked at src/payments.rs:42:19:",
+        "tenant t_123 not found",
+        "stack backtrace:",
+        "   0: __rustc::rust_begin_unwind",
+        "             at /rustc/0ef1bc386/library/std/src/panicking.rs:676:5",
+        "   1: core::panicking::panic_fmt",
+        "             at /rustc/0ef1bc386/library/core/src/panicking.rs:80:14",
+        "   2: flowcpt_api::payments::charge",
+        "             at ./src/payments.rs:42:19",
+        "note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.",
+    ];
+
+    fn messages(parsed: &[ParsedLine]) -> Vec<&str> {
+        parsed.iter().map(|line| line.message.as_str()).collect()
+    }
+
     #[test]
-    fn a_rust_backtrace_joins_the_line_before_it() {
+    fn a_rust_panic_with_its_backtrace_is_one_record_whose_message_holds_every_line() {
+        let parsed = all(FormatChoice::Auto, &PANIC);
+        // The blank line Rust prints first, then the whole panic.
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].message, "");
+        assert_eq!(parsed[1].message, PANIC[1..].join("\n"));
+        assert_eq!(parsed[1].raw, PANIC[1..].join("\n"));
+        assert_eq!(parsed[1].format, Format::Text);
+        assert_eq!(parsed[1].time, at(0));
+        assert!(parsed[1].fields.is_empty());
+    }
+
+    #[test]
+    fn a_panic_without_a_backtrace_is_one_record_too() {
         let lines = [
             "thread 'main' panicked at src/main.rs:5:5:",
             "boom",
-            "stack backtrace:",
-            "   0: rust_begin_unwind",
-            "             at /rustc/0ef1bc386/library/std/src/panicking.rs:697:5",
-            "   1: core::panicking::panic_fmt",
-            "             at /rustc/0ef1bc386/library/core/src/panicking.rs:75:14",
-            "   2: flowcpt_api::main",
-            "             at ./src/main.rs:5:5",
-            "note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.",
+            "note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace",
         ];
         let parsed = all(FormatChoice::Auto, &lines);
-        // The frames are continuation lines and join `stack backtrace:`.
-        // The panic message, `stack backtrace:` and the note start at the
-        // margin with none of the three marks, so by the continuation rule
-        // each begins a record of its own.
-        let messages: Vec<&str> = parsed.iter().map(|line| line.message.as_str()).collect();
+        assert_eq!(messages(&parsed), [lines.join("\n")]);
+    }
+
+    #[test]
+    fn which_lines_start_a_panic() {
+        for line in [
+            "thread 'main' panicked at src/main.rs:5:5:",
+            "thread 'main' (238) panicked at main.rs:9:5:",
+            "thread '<unnamed>' (242) panicked at main.rs:7:41:",
+            "thread 'tokio-runtime-worker' panicked at 'boom', src/main.rs:5:5",
+            "thread 'it's mine' panicked at src/lib.rs:1:1:",
+        ] {
+            assert!(PANIC_START.is_match(line), "{line}");
+        }
+        for line in [
+            "the thread 'main' panicked at src/main.rs:5:5:",
+            "  thread 'main' panicked at src/main.rs:5:5:",
+            "thread 'main' has overflowed its stack",
+            "thread main panicked at src/main.rs:5:5:",
+            "thread 'main' (x) panicked at src/main.rs:5:5:",
+            "thread 'main' panickedat",
+            "",
+        ] {
+            assert!(!PANIC_START.is_match(line), "{line}");
+        }
+    }
+
+    #[test]
+    fn a_blank_line_ends_a_panic_block() {
+        let mut lines = PANIC[1..].to_vec();
+        lines.extend(["", "listening again", "   after a blank line"]);
+        let parsed = all(FormatChoice::Auto, &lines);
         assert_eq!(
-            messages,
+            messages(&parsed),
             [
-                lines[0].to_string(),
-                lines[1].to_string(),
-                lines[2..9].join("\n"),
-                lines[9].to_string(),
+                PANIC[1..].join("\n"),
+                String::new(),
+                "listening again\n   after a blank line".to_string(),
             ]
         );
-        assert!(parsed.iter().all(|line| line.format == Format::Text));
+    }
+
+    #[test]
+    fn a_line_of_nothing_but_spaces_ends_a_panic_block_and_joins_nothing() {
+        let parsed = all(
+            FormatChoice::Auto,
+            &[
+                "thread 'main' panicked at src/main.rs:5:5:",
+                "boom",
+                "   ",
+                "next",
+            ],
+        );
+        assert_eq!(
+            messages(&parsed),
+            [
+                "thread 'main' panicked at src/main.rs:5:5:\nboom",
+                "   ",
+                "next"
+            ]
+        );
+    }
+
+    #[test]
+    fn two_panics_in_a_row_are_two_records() {
+        let lines: Vec<&str> = PANIC.iter().chain(PANIC.iter()).copied().collect();
+        let parsed = all(FormatChoice::Auto, &lines);
+        assert_eq!(
+            messages(&parsed),
+            ["", &PANIC[1..].join("\n"), "", &PANIC[1..].join("\n")]
+        );
+
+        // Older toolchains print no blank line between them. The next panic
+        // starts a block of its own all the same.
+        let lines = [
+            "thread 'a' panicked at src/a.rs:1:1:",
+            "first",
+            "thread 'b' panicked at src/b.rs:2:2:",
+            "second",
+        ];
+        let parsed = all(FormatChoice::Auto, &lines);
+        assert_eq!(
+            messages(&parsed),
+            [
+                "thread 'a' panicked at src/a.rs:1:1:\nfirst",
+                "thread 'b' panicked at src/b.rs:2:2:\nsecond",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_json_or_logfmt_line_ends_a_panic_block() {
+        let json = r#"{"level":"INFO","message":"worker restarted"}"#;
+        let parsed = all(
+            FormatChoice::Auto,
+            &[
+                "thread 'main' panicked at src/main.rs:5:5:",
+                "boom",
+                json,
+                "   detail",
+            ],
+        );
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(
+            parsed[0].message,
+            "thread 'main' panicked at src/main.rs:5:5:\nboom"
+        );
+        // The line that ends the block is a record of its own, and the
+        // indented line after it joins that one, as it always did.
+        assert_eq!(parsed[1].format, Format::Json);
+        assert_eq!(parsed[1].level, Some(Level::Info));
+        assert_eq!(parsed[1].message, "worker restarted\n   detail");
+
+        let parsed = all(
+            FormatChoice::Auto,
+            &[
+                "thread 'main' panicked at src/main.rs:5:5:",
+                "boom",
+                r#"level=info msg="worker restarted""#,
+            ],
+        );
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[1].format, Format::Logfmt);
+        assert_eq!(parsed[1].message, "worker restarted");
+    }
+
+    #[test]
+    fn a_plain_line_after_a_panic_joins_it_until_something_ends_the_block() {
+        let parsed = all(
+            FormatChoice::Auto,
+            &[
+                "thread 'main' panicked at src/main.rs:5:5:",
+                "boom",
+                "INFO shutting down",
+                "",
+                "INFO stopped",
+            ],
+        );
+        assert_eq!(
+            messages(&parsed),
+            [
+                "thread 'main' panicked at src/main.rs:5:5:\nboom\nINFO shutting down",
+                "",
+                "INFO stopped",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_panic_block_takes_no_line_more_than_two_seconds_after_its_first() {
+        let mut parser = LineParser::new(FormatChoice::Auto);
+        assert_eq!(
+            parser.push(at(0), "thread 'main' panicked at src/main.rs:5:5:"),
+            None
+        );
+        assert_eq!(parser.push(at(1_000), "boom"), None);
+        assert_eq!(parser.push(at(2_000), "stack backtrace:"), None);
+        assert!(parser.in_block());
+        let block = parser.push(at(2_001), "much later").unwrap();
+        assert_eq!(
+            block.message,
+            "thread 'main' panicked at src/main.rs:5:5:\nboom\nstack backtrace:"
+        );
+        assert_eq!(block.time, at(0));
+        // The late line is a record of its own, and the block is over.
+        assert!(!parser.in_block());
+        assert_eq!(
+            parser.push(at(2_002), "and one more").unwrap().message,
+            "much later"
+        );
+        assert_eq!(parser.flush().unwrap().message, "and one more");
+    }
+
+    #[test]
+    fn flushing_ends_a_panic_block() {
+        let mut parser = LineParser::new(FormatChoice::Auto);
+        assert!(!parser.in_block());
+        parser.push(at(0), "thread 'main' panicked at src/main.rs:5:5:");
+        assert!(parser.in_block());
+        parser.push(at(1), "boom");
+        assert!(parser.in_block());
+        assert_eq!(
+            parser.flush().unwrap().message,
+            "thread 'main' panicked at src/main.rs:5:5:\nboom"
+        );
+        assert!(!parser.in_block());
+        // What comes now has no block to join.
+        assert_eq!(parser.push(at(2), "a line of its own"), None);
+        assert_eq!(parser.flush().unwrap().message, "a line of its own");
+    }
+
+    #[test]
+    fn format_text_turns_the_panic_block_off_as_well() {
+        let parsed = all(FormatChoice::Text, &PANIC);
+        assert_eq!(messages(&parsed), PANIC);
+    }
+
+    #[test]
+    fn a_forced_format_ends_a_panic_block_only_with_its_own_kind_of_line() {
+        let lines = [
+            "thread 'main' panicked at src/main.rs:5:5:",
+            "level=info msg=joins",
+            r#"{"message":"ends"}"#,
+        ];
+        let parsed = all(FormatChoice::Json, &lines);
+        assert_eq!(
+            messages(&parsed),
+            [
+                "thread 'main' panicked at src/main.rs:5:5:\nlevel=info msg=joins",
+                "ends"
+            ]
+        );
     }
 
     #[test]

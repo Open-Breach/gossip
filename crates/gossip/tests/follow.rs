@@ -276,7 +276,7 @@ async fn the_field_flag_keeps_only_that_tenants_lines() {
 }
 
 #[tokio::test]
-async fn the_level_flag_hides_info_lines() {
+async fn the_level_flag_hides_info_lines_and_keeps_lines_with_no_level() {
     let fake = FakeCluster::start().await;
     seed_tenant_lines(&fake);
     let mut follow = Follow::start(
@@ -291,12 +291,92 @@ async fn the_level_flag_hides_info_lines() {
             "warn",
         ],
     );
+    // The line with no level stays: unknown is not the same as unimportant.
     assert_eq!(
-        follow.lines(2).await,
+        follow.lines(3).await,
         [
             "14:00:02.000 redis-0 api  WARN  request_id=8b1d  payment intent expired",
             "14:00:03.000 redis-0 api  ERROR request_id=8b1e  card declined",
+            "14:00:04.000 redis-0 api        a plain line with no level",
         ]
+    );
+    follow.expect_quiet().await;
+}
+
+/// A panic as Rust prints it, in the container `api` of the pod `redis-0`,
+/// after a JSON line and before another.
+fn seed_panic(fake: &FakeCluster) {
+    fake.apply(&pods(NS), pod_object(NS, "redis-0", &[], None, &["api"]));
+    let lines = [
+        r#"{"level":"INFO","message":"charging","tenant_id":"t_123"}"#,
+        "",
+        "thread 'tokio-runtime-worker' (241) panicked at src/payments.rs:42:19:",
+        "tenant t_123 not found",
+        "stack backtrace:",
+        "   0: __rustc::rust_begin_unwind",
+        "             at /rustc/0ef1bc386/library/std/src/panicking.rs:676:5",
+        "   1: flowcpt_api::payments::charge",
+        "note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.",
+        r#"{"level":"INFO","message":"worker restarted"}"#,
+    ];
+    for (index, line) in lines.iter().enumerate() {
+        fake.log(NS, "redis-0", "api", at(1_000 + index as i64), line);
+    }
+}
+
+#[tokio::test]
+async fn a_rust_panic_with_its_backtrace_arrives_as_one_record() {
+    let fake = FakeCluster::start().await;
+    seed_panic(&fake);
+    let mut follow = Follow::start(&fake, "panic", &["flowcpt", "--output", "json"]);
+    let records: Vec<serde_json::Value> = follow
+        .lines(4)
+        .await
+        .iter()
+        .map(|line| serde_json::from_str(line).expect("every line is JSON"))
+        .collect();
+    assert_eq!(records[0]["message"], "charging");
+    // The blank line Rust prints before a panic.
+    assert_eq!(records[1]["message"], "");
+    // One record whose message holds every line of the panic.
+    assert_eq!(
+        records[2]["message"],
+        "thread 'tokio-runtime-worker' (241) panicked at src/payments.rs:42:19:\n\
+         tenant t_123 not found\n\
+         stack backtrace:\n\
+         \x20  0: __rustc::rust_begin_unwind\n\
+         \x20            at /rustc/0ef1bc386/library/std/src/panicking.rs:676:5\n\
+         \x20  1: flowcpt_api::payments::charge\n\
+         note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace."
+    );
+    assert_eq!(records[2]["format"], "text");
+    assert_eq!(records[2]["level"], serde_json::Value::Null);
+    // The JSON line after it ended the block and is a record of its own.
+    assert_eq!(records[3]["message"], "worker restarted");
+    follow.expect_quiet().await;
+}
+
+#[tokio::test]
+async fn a_panic_does_not_vanish_under_a_level_filter() {
+    let fake = FakeCluster::start().await;
+    seed_panic(&fake);
+    let mut follow = Follow::start(
+        &fake,
+        "panic-level",
+        &["flowcpt", "--no-color", "--level", "error"],
+    );
+    // The two info lines are hidden. The panic has no level and stays, and
+    // so does the blank line before it.
+    let lines = follow.lines(8).await;
+    assert_eq!(lines[0], "14:00:01.001 redis-0 api");
+    assert_eq!(
+        lines[1],
+        "14:00:01.002 redis-0 api        thread 'tokio-runtime-worker' (241) panicked at src/payments.rs:42:19:"
+    );
+    assert_eq!(lines[2], "tenant t_123 not found");
+    assert_eq!(
+        lines[7],
+        "note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace."
     );
     follow.expect_quiet().await;
 }
@@ -692,16 +772,37 @@ async fn the_defaults_fill_in_what_a_template_leaves_out_and_a_flag_overrides() 
     );
     follow.expect_quiet().await;
 
-    // A filter flag takes the place of the filter of the template.
+    // A filter flag beside a template narrows its filter: a line must pass
+    // both. No line of that tenant is an error, so nothing is left.
     let mut follow = Follow::start_with_config(
         &fake,
-        "template-filter",
+        "template-narrow",
         TEMPLATES,
         &["--template", "tenant", "--no-color", "--level", "error"],
     );
+    follow.expect_quiet().await;
+
+    // With --no-filter the filter of the template is dropped first, and the
+    // flag is the whole filter. The line with no level passes it.
+    let mut follow = Follow::start_with_config(
+        &fake,
+        "template-no-filter",
+        TEMPLATES,
+        &[
+            "--template",
+            "tenant",
+            "--no-color",
+            "--no-filter",
+            "--level",
+            "error",
+        ],
+    );
     assert_eq!(
-        follow.line().await,
-        "14:00:03.000 redis-0 api  ERROR request_id=8b1e  card declined"
+        follow.lines(2).await,
+        [
+            "14:00:03.000 redis-0 api  ERROR request_id=8b1e  card declined",
+            "14:00:04.000 redis-0 api        a plain line with no level",
+        ]
     );
     follow.expect_quiet().await;
 }

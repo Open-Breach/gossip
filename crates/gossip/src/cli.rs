@@ -70,9 +70,14 @@ pub struct FollowArgs {
     pub targets: Vec<Target>,
 
     /// Follow what a template of the config file says. Flags given beside
-    /// it override its values.
+    /// it override its values; the filter flags narrow its filter.
     #[arg(long, value_name = "NAME")]
     pub template: Option<String>,
+
+    /// Drop the filter of the template, or of the defaults, so that only
+    /// the filter flags apply.
+    #[arg(long)]
+    pub no_filter: bool,
 
     /// The kubeconfig context of the cluster [default: the current context].
     #[arg(long, value_name = "NAME")]
@@ -234,6 +239,7 @@ mod tests {
             "--long-names",
             "--no-events",
             "--no-emoji",
+            "--no-filter",
         ])
         .unwrap();
         assert_eq!(args.targets.len(), 2);
@@ -256,6 +262,7 @@ mod tests {
         assert!(args.long_names);
         assert!(args.no_events);
         assert!(args.no_emoji);
+        assert!(args.no_filter);
     }
 
     #[test]
@@ -267,7 +274,7 @@ mod tests {
         assert_eq!(args.output, None);
         assert_eq!(args.fields, None);
         assert!(!args.raw && !args.no_color && !args.long_names);
-        assert!(!args.no_events && !args.no_emoji);
+        assert!(!args.no_events && !args.no_emoji && !args.no_filter);
     }
 
     #[test]

@@ -43,6 +43,10 @@ pub async fn run(args: FollowArgs) -> anyhow::Result<()> {
 
 /// What to follow and how: the flags, over the template when one is named,
 /// over the `[defaults]` of the config file, over the built-in defaults.
+///
+/// The filter is the one thing a flag does not override. The filter flags
+/// narrow the filter of the config file: a record must pass both. With
+/// `--no-filter` the filter of the config file is dropped first.
 fn settings(args: &FollowArgs, config: &Config) -> anyhow::Result<Settings> {
     let asked = Template {
         context: args.context.clone(),
@@ -52,7 +56,7 @@ fn settings(args: &FollowArgs, config: &Config) -> anyhow::Result<Settings> {
         tail: args.tail,
         events: args.no_events.then_some(false),
         format: None,
-        filter: filter(args)?,
+        filter: None,
         fields: args.fields.clone(),
         output: args.output,
     };
@@ -60,10 +64,17 @@ fn settings(args: &FollowArgs, config: &Config) -> anyhow::Result<Settings> {
         Some(name) => crate::templates::find(config, name)?.clone(),
         None => Template::default(),
     };
-    let settings = asked
+    let mut settings = asked
         .or(template)
         .or(config.defaults.clone().into())
         .resolve();
+    // What is left in `filter` is the filter of the config file: the
+    // template's, or the one of the defaults.
+    let from_config = settings.filter.take().filter(|_| !args.no_filter);
+    settings.filter = match (from_config, filter(args)?) {
+        (Some(from_config), Some(from_flags)) => Some(Filter::All(vec![from_config, from_flags])),
+        (from_config, from_flags) => from_config.or(from_flags),
+    };
     if settings.targets.is_empty()
         && let Some(name) = &args.template
     {
@@ -405,17 +416,112 @@ container = "api"
         assert_eq!(settings.tail, Some(5));
         assert_eq!(settings.fields, Some(vec!["status".to_string()]));
         assert_eq!(settings.output, Output::Text);
-        // The filter of the flags takes the place of the template's.
+        // A filter flag does not override: it narrows. A record must pass
+        // the filter of the template and the filter of the flags.
         assert_eq!(
             settings.filter,
-            Some(Filter::Any(vec![
-                Filter::kind_is(Kind::Event),
-                Filter::level_at_least(Level::Error),
+            Some(Filter::All(vec![
+                Filter::level_at_least(Level::Info),
+                Filter::Any(vec![
+                    Filter::kind_is(Kind::Event),
+                    Filter::level_at_least(Level::Error),
+                ]),
             ]))
         );
         // What no flag names stays as the template has it.
         assert_eq!(settings.targets.len(), 2);
         assert_eq!(settings.format.for_container("api"), FormatChoice::Json);
+    }
+
+    #[test]
+    fn no_filter_drops_the_filter_of_the_template_before_the_flags_apply() {
+        // Alone, it leaves no filter at all.
+        let settings = settings(
+            &follow_args(&["--template", "dev-api", "--no-filter"]),
+            &config(),
+        )
+        .unwrap();
+        assert_eq!(settings.filter, None);
+        // The rest of the template stays.
+        assert_eq!(settings.targets.len(), 2);
+        assert!(settings.container.unwrap().matches("api"));
+
+        // With a filter flag, that flag is the whole filter: it replaces.
+        let settings = super::settings(
+            &follow_args(&["--template", "dev-api", "--no-filter", "--grep", "expired"]),
+            &config(),
+        )
+        .unwrap();
+        assert_eq!(
+            settings.filter,
+            Some(Filter::Any(vec![
+                Filter::kind_is(Kind::Event),
+                Filter::message_contains("expired"),
+            ]))
+        );
+    }
+
+    #[test]
+    fn the_filter_of_the_defaults_is_narrowed_and_dropped_in_the_same_way() {
+        let config = Config::from_toml(
+            r#"
+            [defaults]
+            filter = { field = "f.tenant_id", op = "==", value = "t_123" }
+
+            [templates.plain]
+            targets = ["flowcpt"]
+            "#,
+        )
+        .unwrap();
+        let tenant = Filter::field_equals("tenant_id", "t_123").unwrap();
+        let warn = Filter::Any(vec![
+            Filter::kind_is(Kind::Event),
+            Filter::level_at_least(Level::Warn),
+        ]);
+        let filter_of =
+            |arguments: &[&str]| settings(&follow_args(arguments), &config).unwrap().filter;
+
+        // With a template that has no filter of its own, and with none.
+        for start in [&["--template", "plain"][..], &["flowcpt"]] {
+            let with = |more: &[&str]| filter_of(&[start, more].concat());
+            assert_eq!(with(&[]), Some(tenant.clone()));
+            assert_eq!(
+                with(&["--level", "warn"]),
+                Some(Filter::All(vec![tenant.clone(), warn.clone()]))
+            );
+            assert_eq!(with(&["--no-filter"]), None);
+            assert_eq!(
+                with(&["--no-filter", "--level", "warn"]),
+                Some(warn.clone())
+            );
+        }
+    }
+
+    #[test]
+    fn a_line_with_no_level_passes_the_level_flag() {
+        use chrono::Utc;
+        use gossip_core::{Format, Record};
+        use std::collections::BTreeMap;
+
+        let filter = filter(&args(&["--level", "error"])).unwrap().unwrap();
+        let line = |level: Option<Level>| Record {
+            cluster: "c".into(),
+            namespace: "flowcpt".into(),
+            pod: "p".into(),
+            container: Some("api".into()),
+            time: Utc::now(),
+            kind: Kind::Line,
+            format: Format::Text,
+            level,
+            message: "thread 'main' panicked at src/main.rs:5:5:".into(),
+            fields: BTreeMap::new(),
+            raw: String::new(),
+            previous: false,
+            truncated: false,
+        };
+        assert!(filter.accepts(&line(None)));
+        assert!(filter.accepts(&line(Some(Level::Error))));
+        assert!(!filter.accepts(&line(Some(Level::Warn))));
     }
 
     #[test]
