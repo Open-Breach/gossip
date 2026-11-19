@@ -82,6 +82,16 @@ impl FieldChoice {
         }
     }
 
+    /// The setting that stands for this choice: what `--fields` or the
+    /// `fields` of a template would say. None for the default.
+    pub fn to_setting(&self) -> Option<Vec<String>> {
+        match self {
+            FieldChoice::Default => None,
+            FieldChoice::All => Some(vec![ALL.to_string()]),
+            FieldChoice::Named(names) => Some(names.clone()),
+        }
+    }
+
     /// The fields of a line to show, in the order to show them in.
     pub fn of<'a, V>(&self, fields: &'a BTreeMap<String, V>) -> Vec<(&'a String, &'a V)> {
         match self {
@@ -310,6 +320,21 @@ mod tests {
             FieldChoice::from_setting(Some(&list(&["ALL"]))),
             names(&["ALL"])
         );
+    }
+
+    #[test]
+    fn a_choice_is_written_as_the_setting_it_was_read_from() {
+        let list =
+            |names: &[&str]| -> Vec<String> { names.iter().map(|name| name.to_string()).collect() };
+        for setting in [
+            None,
+            Some(list(&["all"])),
+            Some(list(&[])),
+            Some(list(&["rows", "tenant_id"])),
+        ] {
+            let choice = FieldChoice::from_setting(setting.as_deref());
+            assert_eq!(choice.to_setting(), setting);
+        }
     }
 
     #[test]

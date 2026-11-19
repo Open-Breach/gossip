@@ -64,8 +64,8 @@ pub struct FollowArgs {
     /// What to follow; see the forms below.
     #[arg(
         value_name = "TARGET",
-        required_unless_present = "template",
-        conflicts_with = "template"
+        required_unless_present_any = ["template", "last"],
+        conflicts_with_all = ["template", "last"]
     )]
     pub targets: Vec<Target>,
 
@@ -73,6 +73,12 @@ pub struct FollowArgs {
     /// it override its values; the filter flags narrow its filter.
     #[arg(long, value_name = "NAME")]
     pub template: Option<String>,
+
+    /// Follow what was followed when an interactive `gossip follow` last
+    /// quit: its targets, filter, fields and columns. The same as
+    /// `--template last`.
+    #[arg(long, conflicts_with = "template")]
+    pub last: bool,
 
     /// Drop the filter of the template, or of the defaults, so that only
     /// the filter flags apply.
@@ -323,6 +329,17 @@ mod tests {
         // One or the other, not both and not neither.
         assert!(follow(&["flowcpt", "--template", "dev-api"]).is_err());
         assert!(follow(&["--tail", "50"]).is_err());
+    }
+
+    #[test]
+    fn follow_takes_last_in_place_of_targets_and_of_a_template() {
+        let args = follow(&["--last", "--level", "warn"]).unwrap();
+        assert!(args.last);
+        assert!(args.targets.is_empty() && args.template.is_none());
+        assert_eq!(args.level, Some(Level::Warn));
+        assert!(!follow(&["flowcpt"]).unwrap().last);
+        assert!(follow(&["flowcpt", "--last"]).is_err());
+        assert!(follow(&["--last", "--template", "dev-api"]).is_err());
     }
 
     #[test]

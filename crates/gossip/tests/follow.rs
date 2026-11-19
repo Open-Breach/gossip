@@ -1287,6 +1287,82 @@ async fn the_columns_of_the_config_file_and_of_a_template_apply_and_a_flag_goes_
     );
 }
 
+// ---- --last -----------------------------------------------------------------
+
+const LAST_CONFIG: &str = r#"# Kept by gossip when it quits.
+[templates.last]
+targets = ["flowcpt"]
+container = "api"
+filter = { any = [
+  { field = "kind", op = "==", value = "event" },
+  { field = "level", op = ">=", value = "warn" },
+] }
+fields = ["request_id"]
+columns = { pod = { width = 0 } }
+"#;
+
+#[tokio::test]
+async fn last_follows_what_the_template_of_that_name_holds() {
+    let fake = FakeCluster::start().await;
+    seed_tenant_lines(&fake);
+
+    // Acceptance 8, as far as it goes without a terminal: `--last` resumes
+    // the targets, the filter, the fields and the columns that were kept.
+    let mut follow = Follow::start_with_config(&fake, "last", LAST_CONFIG, &["--last"]);
+    assert_eq!(
+        follow.lines(3).await,
+        [
+            "14:00:02.000 api         WARN  request_id=8b1d  payment intent expired",
+            "14:00:03.000 api         ERROR request_id=8b1e  card declined",
+            "14:00:04.000 api               a plain line with no level",
+        ]
+    );
+    follow.expect_quiet().await;
+
+    // It is `--template last`, to the letter.
+    let mut by_name =
+        Follow::start_with_config(&fake, "last-template", LAST_CONFIG, &["--template", "last"]);
+    assert_eq!(
+        by_name.line().await,
+        "14:00:02.000 api         WARN  request_id=8b1d  payment intent expired"
+    );
+
+    // A run without a terminal keeps nothing for `--last`: the config file
+    // is what it was.
+    let pid = follow.child.id().expect("gossip is running").to_string();
+    std::process::Command::new("kill")
+        .args(["-INT", &pid])
+        .status()
+        .unwrap();
+    timeout(Duration::from_secs(10), follow.child.wait())
+        .await
+        .expect("gossip should stop in time")
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&follow.config).unwrap(),
+        LAST_CONFIG
+    );
+}
+
+#[tokio::test]
+async fn last_without_a_kept_session_is_an_error_that_says_what_it_is_for() {
+    let fake = FakeCluster::start().await;
+    let (mut command, kubeconfig, config) = follow_command(&fake, "no-last", "", &["--last"]);
+    let output = timeout(Duration::from_secs(15), command.output())
+        .await
+        .expect("gossip should stop in time")
+        .unwrap();
+    let _ = std::fs::remove_file(kubeconfig);
+    let _ = std::fs::remove_file(config);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.starts_with("gossip: there is no session to resume yet: `--last` follows what"),
+        "{stderr}"
+    );
+}
+
 // ---- the output without a terminal, byte for byte -------------------------
 
 /// What `gossip follow` with these arguments writes to stdout, as bytes:

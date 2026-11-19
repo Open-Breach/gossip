@@ -38,6 +38,8 @@ pub enum Action {
     Run(String),
     /// The command line changed, or opened, or closed: show it as it is.
     Prompt,
+    /// The answer to the question on the status line.
+    Answer(bool),
     /// The key means nothing here.
     Nothing,
 }
@@ -51,9 +53,28 @@ const SEARCH: &str = "grep ";
 pub struct Keyboard {
     line: Option<Line>,
     history: History,
+    /// A question that waits for `y` or `n`.
+    question: Option<String>,
 }
 
 impl Keyboard {
+    /// Puts a question on the status line; the next key answers it.
+    pub fn ask(&mut self, question: impl Into<String>) {
+        self.line = None;
+        self.question = Some(question.into());
+    }
+
+    /// The question that waits for an answer.
+    pub fn question(&self) -> Option<&str> {
+        self.question.as_deref()
+    }
+
+    /// Opens the command line with this text typed, the cursor behind it.
+    pub fn open_with(&mut self, text: &str) {
+        self.question = None;
+        self.line = Some(Line::new(text));
+    }
+
     /// The command line while it is open: its text, and the text in front
     /// of the cursor.
     pub fn prompt(&self) -> Option<(String, String)> {
@@ -64,6 +85,15 @@ impl Keyboard {
 
     /// Takes a key and says what it asks for.
     pub fn press(&mut self, key: Key) -> Action {
+        if self.question.take().is_some() {
+            return match key {
+                Key::Char('y' | 'Y') => Action::Answer(true),
+                // `Ctrl-C` quits from anywhere.
+                Key::Ctrl('c') => Action::Quit,
+                // Anything else is a no: nothing is done by accident.
+                _ => Action::Answer(false),
+            };
+        }
         match &mut self.line {
             None => self.in_the_stream(key),
             Some(_) => self.on_the_command_line(key),
@@ -363,6 +393,49 @@ mod tests {
         typed(&mut keyboard, "level");
         assert_eq!(keyboard.press(Key::Ctrl('l')), Action::Clear);
         assert_eq!(prompt(&keyboard).as_deref(), Some("level|"));
+    }
+
+    #[test]
+    fn a_question_is_answered_by_the_next_key() {
+        let mut keyboard = Keyboard::default();
+        keyboard.ask("overwrite the template dev-api? y/n");
+        assert_eq!(
+            keyboard.question(),
+            Some("overwrite the template dev-api? y/n")
+        );
+        assert_eq!(keyboard.press(Key::Char('y')), Action::Answer(true));
+        assert_eq!(keyboard.question(), None);
+        // The stream has its keys back.
+        assert_eq!(keyboard.press(Key::Char(' ')), Action::Pause);
+
+        for no in [
+            Key::Char('n'),
+            Key::Char('N'),
+            Key::Esc,
+            Key::Enter,
+            Key::Char(' '),
+        ] {
+            keyboard.ask("sure? y/n");
+            assert_eq!(keyboard.press(no), Action::Answer(false), "{no:?}");
+            assert_eq!(keyboard.question(), None);
+        }
+        keyboard.ask("sure? y/n");
+        assert_eq!(keyboard.press(Key::Char('Y')), Action::Answer(true));
+        // `Ctrl-C` quits also here.
+        keyboard.ask("sure? y/n");
+        assert_eq!(keyboard.press(Key::Ctrl('c')), Action::Quit);
+    }
+
+    #[test]
+    fn the_command_line_can_be_opened_with_a_command_typed() {
+        let mut keyboard = Keyboard::default();
+        keyboard.open_with("save ");
+        assert_eq!(prompt(&keyboard).as_deref(), Some("save |"));
+        typed(&mut keyboard, "dev-api");
+        assert_eq!(
+            keyboard.press(Key::Enter),
+            Action::Run("save dev-api".to_string())
+        );
     }
 
     #[test]

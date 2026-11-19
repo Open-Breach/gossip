@@ -4,6 +4,7 @@
 use std::io::{self, IsTerminal, Write};
 
 use anyhow::{Context, bail};
+use gossip_core::save::LAST;
 use gossip_core::{
     Cluster, Config, Kind, Output, Record, Session, SessionOptions, SessionSpec, Settings,
 };
@@ -17,6 +18,7 @@ use crate::render::{TextOptions, TextRenderer, Zone, json_line};
 pub async fn run(args: FollowArgs) -> anyhow::Result<()> {
     let config = Config::load()?;
     let (settings, filter) = settings_and_filter(&args, &config)?;
+    let template = template_name(&args);
     let cluster = Cluster::open(settings.context.as_deref()).await?;
     // A cluster that cannot be reached at start is an error. Once the
     // session runs, the core retries instead.
@@ -37,6 +39,9 @@ pub async fn run(args: FollowArgs) -> anyhow::Result<()> {
             printer,
             filter,
             pause_buffer: config.pause_buffer,
+            // `last` is no template to save back into by its name.
+            template: template.filter(|name| name != LAST),
+            config_path: Config::path()?,
         };
         return interactive::run(session, setup).await;
     }
@@ -91,8 +96,12 @@ fn settings_and_filter(
         output: args.output,
         columns: args.columns.unwrap_or_default(),
     };
-    let template = match &args.template {
-        Some(name) => crate::templates::find(config, name)?.clone(),
+    let template = match template_name(args) {
+        Some(name) if args.last && !config.templates.contains_key(LAST) => bail!(
+            "there is no session to resume yet: `--last` follows what an interactive \
+             `gossip follow` was following when it quit, kept as the template `{name}`"
+        ),
+        Some(name) => crate::templates::find(config, &name)?.clone(),
         None => SessionSpec::default(),
     };
     let mut settings = asked.or(template).or(config.base()).resolve();
@@ -104,11 +113,19 @@ fn settings_and_filter(
     };
     settings.filter = filter.filter();
     if settings.targets.is_empty()
-        && let Some(name) = &args.template
+        && let Some(name) = template_name(args)
     {
         bail!("the template `{name}` has no targets");
     }
     Ok((settings, filter))
+}
+
+/// The template a run starts from: the one `--template` names, or with
+/// `--last` the one that holds the session as it was when Gossip last quit.
+fn template_name(args: &FollowArgs) -> Option<String> {
+    args.template
+        .clone()
+        .or_else(|| args.last.then(|| LAST.to_string()))
 }
 
 /// The filter the flags stand for: every one of them must hold for a line.
@@ -217,6 +234,13 @@ impl Printer {
             Rendered::Aside(line) => eprintln!("{line}"),
         }
         Ok(())
+    }
+
+    /// The output as a template names it: JSON, or none for the text
+    /// output, which is the default, and for the raw output, which only a
+    /// flag asks for.
+    pub fn output(&self) -> Option<Output> {
+        matches!(self.mode, Mode::Json).then_some(Output::Json)
     }
 
     /// The renderer of the text output; none for JSON and raw output,
@@ -627,6 +651,39 @@ container = "api"
             super::settings(&follow_args(&["flowcpt", "--since", "1m"]), &config()).unwrap();
         assert_eq!(overridden.since, Some(Duration::from_secs(60)));
         assert_eq!(overridden.tail, None);
+    }
+
+    #[test]
+    fn last_is_the_template_of_that_name() {
+        let config = Config::from_toml(
+            r#"
+            [templates.last]
+            targets = ["fc-stg/fc-api"]
+            filter = { field = "level", op = ">=", value = "warn" }
+            fields = ["tenant_id"]
+            columns = { pod = { width = 40 } }
+            "#,
+        )
+        .unwrap();
+        let from_last = settings(&follow_args(&["--last"]), &config).unwrap();
+        let from_template = settings(&follow_args(&["--template", "last"]), &config).unwrap();
+        assert_eq!(from_last, from_template);
+        assert_eq!(from_last.targets, ["fc-stg/fc-api".parse().unwrap()]);
+        assert_eq!(from_last.filter, Some(Filter::level_at_least(Level::Warn)));
+        assert_eq!(from_last.columns.pod.width, 40);
+        // A flag beside it overrides, and a filter flag narrows, as beside
+        // any template.
+        let narrowed = settings(&follow_args(&["--last", "--grep", "x"]), &config).unwrap();
+        assert!(matches!(narrowed.filter, Some(Filter::All(parts)) if parts.len() == 2));
+
+        // Before any session was kept there is nothing to resume.
+        let error = settings(&follow_args(&["--last"]), &Config::default()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with("there is no session to resume yet"),
+            "{error}"
+        );
     }
 
     #[test]

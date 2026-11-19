@@ -39,6 +39,15 @@ pub enum Command {
     ColumnsDefault,
     /// `:columns pod=24:middle,container=8`
     Columns(ColumnsSetting),
+    /// `:save <name>`, or `:save` alone for the template the session was
+    /// started from.
+    Save(Option<String>),
+    /// `:load <name>`
+    Load(String),
+    /// `:templates`
+    Templates,
+    /// `:templates show <name>`
+    ShowTemplate(String),
     /// `:clear`
     Clear,
     /// `:q`
@@ -74,6 +83,9 @@ pub const HELP: &[&str] = &[
     "  :container <glob> only containers whose name matches; :container off",
     "  :fields <a,b,c>   the fields shown; :fields all, :fields default",
     "  :columns <spec>   the column widths, as pod=24:middle,container=8; :columns default",
+    "  :save [name]      save the session as a template; alone, the one it was started from",
+    "  :load <name>      replace the session with a template",
+    "  :templates        list the templates; :templates show <name> prints one",
     "  :clear            clear the screen",
     "  :q                quit",
 ];
@@ -165,6 +177,25 @@ pub fn parse(line: &str) -> Result<Command, String> {
                 .parse()
                 .map(Command::Columns)
                 .map_err(|error: gossip_core::ColumnsError| error.to_string()),
+        },
+        "save" => match rest.split_whitespace().collect::<Vec<_>>()[..] {
+            [] => Ok(Command::Save(None)),
+            [name] => Ok(Command::Save(Some(name.to_string()))),
+            _ => Err(format!(
+                "`:save` takes one name, of letters, digits, `-` and `_`; `{rest}` is more"
+            )),
+        },
+        "load" => match rest.split_whitespace().collect::<Vec<_>>()[..] {
+            [name] => Ok(Command::Load(name.to_string())),
+            _ => Err("`:load` takes the name of one template; `:templates` lists them".to_string()),
+        },
+        "templates" => match rest.split_whitespace().collect::<Vec<_>>()[..] {
+            [] => Ok(Command::Templates),
+            ["show", name] => Ok(Command::ShowTemplate(name.to_string())),
+            _ => Err(
+                "`:templates` lists the templates and `:templates show <name>` prints one"
+                    .to_string(),
+            ),
         },
         "clear" => nothing_more(Command::Clear),
         "q" | "quit" => nothing_more(Command::Quit),
@@ -415,6 +446,31 @@ mod tests {
     }
 
     #[test]
+    fn save_load_and_templates() {
+        assert_eq!(parse("save"), Ok(Command::Save(None)));
+        assert_eq!(
+            parse("save dev-api"),
+            Ok(Command::Save(Some("dev-api".into())))
+        );
+        assert!(parse("save dev api").unwrap_err().contains("one name"));
+        assert_eq!(
+            parse("load staging-all"),
+            Ok(Command::Load("staging-all".into()))
+        );
+        for bad in ["load", "load a b"] {
+            assert!(parse(bad).unwrap_err().contains("one template"), "{bad}");
+        }
+        assert_eq!(parse("templates"), Ok(Command::Templates));
+        assert_eq!(
+            parse("templates show dev-api"),
+            Ok(Command::ShowTemplate("dev-api".into()))
+        );
+        for bad in ["templates show", "templates dev-api", "templates show a b"] {
+            assert!(parse(bad).unwrap_err().contains("prints one"), "{bad}");
+        }
+    }
+
+    #[test]
     fn clear_quit_and_help() {
         assert_eq!(parse("clear"), Ok(Command::Clear));
         assert_eq!(parse("q"), Ok(Command::Quit));
@@ -462,6 +518,9 @@ mod tests {
             ":container",
             ":fields",
             ":columns",
+            ":save",
+            ":load",
+            ":templates",
             ":clear",
             ":q",
         ] {
