@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
-use gossip_core::{Level, Output, Pattern, Target, parse_duration};
+use gossip_core::{ColumnsSetting, Level, Output, Pattern, Target, parse_duration};
 
 /// Follow Kubernetes pod logs and cluster events across restarts and rollouts.
 #[derive(Debug, Parser)]
@@ -134,9 +134,12 @@ pub struct FollowArgs {
     #[arg(long, value_name = "KEYS", value_delimiter = ',')]
     pub fields: Option<Vec<String>>,
 
-    /// Keep pod names whole instead of shortening them to hash and suffix.
-    #[arg(long)]
-    pub long_names: bool,
+    /// The widths of the columns time, pod, container and level, in terminal
+    /// cells, and the side a longer value is cut on (start, end, middle or
+    /// none): pod=24:middle,container=8. A width of 0 hides the column
+    /// [default: time=12:none,pod=20:middle,container=10:end,level=5:end].
+    #[arg(long, value_name = "COLUMNS")]
+    pub columns: Option<ColumnsSetting>,
 
     /// Mark events with `EVNT` instead of an emoji [default: emoji when
     /// stdout is a terminal and the locale is UTF-8].
@@ -238,10 +241,11 @@ mod tests {
             "--no-color",
             "--fields",
             "tenant_id,request_id",
-            "--long-names",
             "--no-events",
             "--no-emoji",
             "--no-filter",
+            "--columns",
+            "pod=24:middle,container=8",
         ])
         .unwrap();
         assert_eq!(args.targets.len(), 2);
@@ -261,10 +265,13 @@ mod tests {
             args.fields,
             Some(vec!["tenant_id".to_string(), "request_id".to_string()])
         );
-        assert!(args.long_names);
         assert!(args.no_events);
         assert!(args.no_emoji);
         assert!(args.no_filter);
+        assert_eq!(
+            args.columns,
+            Some("pod=24:middle,container=8".parse().unwrap())
+        );
     }
 
     #[test]
@@ -275,7 +282,8 @@ mod tests {
         assert_eq!(args.tail, None);
         assert_eq!(args.output, None);
         assert_eq!(args.fields, None);
-        assert!(!args.raw && !args.no_color && !args.long_names);
+        assert_eq!(args.columns, None);
+        assert!(!args.raw && !args.no_color);
         assert!(!args.no_events && !args.no_emoji && !args.no_filter);
     }
 
@@ -316,5 +324,12 @@ mod tests {
         assert!(follow(&["flowcpt", "--level", "loud"]).is_err());
         assert!(follow(&["flowcpt", "--output", "xml"]).is_err());
         assert!(follow(&["flowcpt", "--container", "a b"]).is_err());
+        assert!(follow(&["flowcpt", "--columns", "node=24"]).is_err());
+        assert!(follow(&["flowcpt", "--columns", "pod=wide"]).is_err());
+        assert!(follow(&["flowcpt", "--columns", "pod=24:left"]).is_err());
+        assert!(follow(&["flowcpt", "--columns", "pod"]).is_err());
+        // Pod names are never shortened, so the flag that kept them whole is
+        // gone.
+        assert!(follow(&["flowcpt", "--long-names"]).is_err());
     }
 }

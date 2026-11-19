@@ -50,6 +50,47 @@ fn seed(fake: &FakeCluster) {
     }
 }
 
+/// The command `gossip follow` with these arguments against the stand-in,
+/// with a config file of this content, and the two files it reads. Stdout
+/// and stderr are pipes, and stdin is closed: no terminal on any side.
+fn follow_command(
+    fake: &FakeCluster,
+    test: &str,
+    config_text: &str,
+    args: &[&str],
+) -> (Command, PathBuf, PathBuf) {
+    let kubeconfig =
+        std::env::temp_dir().join(format!("gossip-{}-{test}.kubeconfig", std::process::id()));
+    std::fs::write(&kubeconfig, fake.kubeconfig()).unwrap();
+    // A config file of the test's own, so that the one of whoever runs
+    // the tests stays out of them.
+    let config = std::env::temp_dir().join(format!("gossip-{}-{test}.toml", std::process::id()));
+    std::fs::write(&config, config_text).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_gossip"));
+    command
+        .arg("follow")
+        .args(args)
+        .env("KUBECONFIG", &kubeconfig)
+        // Times are printed in the local zone; pin it down.
+        .env("TZ", "UTC")
+        .env("GOSSIP_CONFIG", &config)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    for variable in [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
+        command.env_remove(variable);
+    }
+    (command, kubeconfig, config)
+}
+
 /// A running `gossip follow`.
 struct Follow {
     child: Child,
@@ -72,35 +113,7 @@ impl Follow {
         config_text: &str,
         args: &[&str],
     ) -> Follow {
-        let kubeconfig =
-            std::env::temp_dir().join(format!("gossip-{}-{test}.kubeconfig", std::process::id()));
-        std::fs::write(&kubeconfig, fake.kubeconfig()).unwrap();
-        // A config file of the test's own, so that the one of whoever runs
-        // the tests stays out of them.
-        let config =
-            std::env::temp_dir().join(format!("gossip-{}-{test}.toml", std::process::id()));
-        std::fs::write(&config, config_text).unwrap();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_gossip"));
-        command
-            .arg("follow")
-            .args(args)
-            .env("KUBECONFIG", &kubeconfig)
-            // Times are printed in the local zone; pin it down.
-            .env("TZ", "UTC")
-            .env("GOSSIP_CONFIG", &config)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        for variable in [
-            "HTTPS_PROXY",
-            "https_proxy",
-            "HTTP_PROXY",
-            "http_proxy",
-            "ALL_PROXY",
-            "all_proxy",
-        ] {
-            command.env_remove(variable);
-        }
+        let (mut command, kubeconfig, config) = follow_command(fake, test, config_text, args);
         let mut child = command.spawn().expect("gossip should start");
         let stdout = BufReader::new(child.stdout.take().unwrap()).lines();
         Follow {
@@ -167,11 +180,13 @@ async fn follow_prints_the_last_20_lines_of_every_container_and_then_new_lines()
     let mut follow = Follow::start(&fake, "tail", &["flowcpt/flowcpt-api", "--no-color"]);
     let history = follow.lines(80).await;
     // Twenty lines for each of the four containers, none older than line 6.
-    for pod in ["7d9f-xk2p1", "7d9f-m4q8z"] {
+    // The pod column holds the full name, cut in the middle: the workload
+    // and the pod suffix.
+    for pod in ["flowcpt-api…xk2p1", "flowcpt-api…m4q8z"] {
         for container in ["api", "envoy"] {
             let of_container: Vec<&String> = history
                 .iter()
-                .filter(|line| line.contains(&format!(" {pod} {container}")))
+                .filter(|line| line.contains(&format!(" {pod:<20} {container:<10} ")))
                 .collect();
             assert_eq!(of_container.len(), 20, "{pod} {container}");
             assert!(
@@ -187,19 +202,18 @@ async fn follow_prints_the_last_20_lines_of_every_container_and_then_new_lines()
         }
     }
     // Ordered by time across the four streams, with a prefix per source.
-    // The pod names are shortened: every pod belongs to a deployment.
+    // Every column has its width, whichever names have been seen.
     assert_eq!(
         history[0],
-        // The container column is as wide as the widest name seen so far.
-        "14:00:06.000 7d9f-xk2p1 api        api line 6"
+        "14:00:06.000 flowcpt-api…xk2p1    api               api line 6"
     );
     assert_eq!(
         history[1],
-        "14:00:06.010 7d9f-xk2p1 envoy        envoy line 6"
+        "14:00:06.010 flowcpt-api…xk2p1    envoy             envoy line 6"
     );
     assert_eq!(
         history[2],
-        "14:00:06.020 7d9f-m4q8z api          api line 6"
+        "14:00:06.020 flowcpt-api…m4q8z    api               api line 6"
     );
     let mut sorted = history.clone();
     sorted.sort();
@@ -210,7 +224,7 @@ async fn follow_prints_the_last_20_lines_of_every_container_and_then_new_lines()
     fake.log(NS, POD_B, "api", at(60_000), "WARN something new");
     assert_eq!(
         follow.line().await,
-        "14:01:00.000 7d9f-m4q8z api    WARN  WARN something new"
+        "14:01:00.000 flowcpt-api…m4q8z    api         WARN  WARN something new"
     );
 }
 
@@ -241,10 +255,10 @@ async fn a_json_line_is_rendered_as_level_fields_and_message() {
     assert_eq!(
         follow.lines(4).await,
         [
-            "14:00:01.000 redis-0 api  INFO  tenant_id=t_123 request_id=8b1c  request done",
-            "14:00:02.000 redis-0 api  WARN  tenant_id=t_123 request_id=8b1d  payment intent expired",
-            "14:00:03.000 redis-0 api  ERROR tenant_id=t_999 request_id=8b1e  card declined",
-            "14:00:04.000 redis-0 api        a plain line with no level",
+            "14:00:01.000 redis-0              api         INFO  tenant_id=t_123 request_id=8b1c  request done",
+            "14:00:02.000 redis-0              api         WARN  tenant_id=t_123 request_id=8b1d  payment intent expired",
+            "14:00:03.000 redis-0              api         ERROR tenant_id=t_999 request_id=8b1e  card declined",
+            "14:00:04.000 redis-0              api               a plain line with no level",
         ]
     );
 }
@@ -268,8 +282,8 @@ async fn the_field_flag_keeps_only_that_tenants_lines() {
     assert_eq!(
         follow.lines(2).await,
         [
-            "14:00:01.000 redis-0 api  INFO  request_id=8b1c  request done",
-            "14:00:02.000 redis-0 api  WARN  request_id=8b1d  payment intent expired",
+            "14:00:01.000 redis-0              api         INFO  request_id=8b1c  request done",
+            "14:00:02.000 redis-0              api         WARN  request_id=8b1d  payment intent expired",
         ]
     );
     follow.expect_quiet().await;
@@ -311,9 +325,9 @@ async fn the_fields_of_a_tracing_span_are_shown_as_fields_of_the_line() {
     assert_eq!(
         follow.lines(3).await,
         [
-            "14:00:01.000 fc-api-0 api  INFO  http.method=GET http.route=/api/v1/sources http.status_code=200 tenant_id=3K6ehNLhnRsPfWhzjugmea user_id=auth0|6a86204723ca712d0c11f85a request_id=32e49c93-4c57-43a0-9439-c554e5fff1f6 time.busy=5.53ms  close",
-            "14:00:02.000 fc-api-0 api  WARN  http.method=POST http.route=/api/v1/flows http.status_code=404 tenant_id=8Hq2mVxWc4TzPb7LdYn3Ka request_id=9d0e7a55-0b0e-4c0c-8a4f-2f1f3f2b6c11 time.busy=1.21ms  close",
-            "14:00:03.000 fc-api-0 api  INFO  http.method=GET http.route=/api/v1/sources tenant_id=3K6ehNLhnRsPfWhzjugmea request_id=32e49c93-4c57-43a0-9439-c554e5fff1f6 rows=3 table=sources  sources loaded",
+            "14:00:01.000 fc-api-0             api         INFO  http.method=GET http.route=/api/v1/sources http.status_code=200 tenant_id=3K6ehNLhnRsPfWhzjugmea user_id=auth0|6a86204723ca712d0c11f85a request_id=32e49c93-4c57-43a0-9439-c554e5fff1f6 time.busy=5.53ms  close",
+            "14:00:02.000 fc-api-0             api         WARN  http.method=POST http.route=/api/v1/flows http.status_code=404 tenant_id=8Hq2mVxWc4TzPb7LdYn3Ka request_id=9d0e7a55-0b0e-4c0c-8a4f-2f1f3f2b6c11 time.busy=1.21ms  close",
+            "14:00:03.000 fc-api-0             api         INFO  http.method=GET http.route=/api/v1/sources tenant_id=3K6ehNLhnRsPfWhzjugmea request_id=32e49c93-4c57-43a0-9439-c554e5fff1f6 rows=3 table=sources  sources loaded",
         ]
     );
 
@@ -332,9 +346,9 @@ async fn the_fields_of_a_tracing_span_are_shown_as_fields_of_the_line() {
     assert_eq!(
         follow.lines(3).await,
         [
-            "14:00:01.000 fc-api-0 api  INFO  time.idle=36.3ms target=flowcpt_telemetry http.route=/api/v1/sources timestamp=2026-11-18T20:39:01.187944Z  close",
-            "14:00:02.000 fc-api-0 api  WARN  time.idle=9.04ms target=flowcpt_telemetry http.route=/api/v1/flows timestamp=2026-11-18T20:39:01.412307Z  close",
-            "14:00:03.000 fc-api-0 api  INFO  target=flowcpt_api::sources http.route=/api/v1/sources timestamp=2026-11-18T20:39:01.180112Z  sources loaded",
+            "14:00:01.000 fc-api-0             api         INFO  time.idle=36.3ms target=flowcpt_telemetry http.route=/api/v1/sources timestamp=2026-11-18T20:39:01.187944Z  close",
+            "14:00:02.000 fc-api-0             api         WARN  time.idle=9.04ms target=flowcpt_telemetry http.route=/api/v1/flows timestamp=2026-11-18T20:39:01.412307Z  close",
+            "14:00:03.000 fc-api-0             api         INFO  target=flowcpt_api::sources http.route=/api/v1/sources timestamp=2026-11-18T20:39:01.180112Z  sources loaded",
         ]
     );
 
@@ -347,9 +361,9 @@ async fn the_fields_of_a_tracing_span_are_shown_as_fields_of_the_line() {
     assert_eq!(
         follow.lines(3).await,
         [
-            "14:00:01.000 fc-api-0 api  INFO  http.method=GET http.route=/api/v1/sources http.status_code=200 tenant_id=3K6ehNLhnRsPfWhzjugmea user_id=auth0|6a86204723ca712d0c11f85a request_id=32e49c93-4c57-43a0-9439-c554e5fff1f6 time.busy=5.53ms otel.name=\"GET /api/v1/sources\" target=flowcpt_telemetry time.idle=36.3ms timestamp=2026-11-18T20:39:01.187944Z  close",
-            "14:00:02.000 fc-api-0 api  WARN  http.method=POST http.route=/api/v1/flows http.status_code=404 tenant_id=8Hq2mVxWc4TzPb7LdYn3Ka request_id=9d0e7a55-0b0e-4c0c-8a4f-2f1f3f2b6c11 time.busy=1.21ms otel.name=\"POST /api/v1/flows\" target=flowcpt_telemetry time.idle=9.04ms timestamp=2026-11-18T20:39:01.412307Z  close",
-            "14:00:03.000 fc-api-0 api  INFO  http.method=GET http.route=/api/v1/sources tenant_id=3K6ehNLhnRsPfWhzjugmea request_id=32e49c93-4c57-43a0-9439-c554e5fff1f6 name=load_sources rows=3 table=sources target=flowcpt_api::sources timestamp=2026-11-18T20:39:01.180112Z  sources loaded",
+            "14:00:01.000 fc-api-0             api         INFO  http.method=GET http.route=/api/v1/sources http.status_code=200 tenant_id=3K6ehNLhnRsPfWhzjugmea user_id=auth0|6a86204723ca712d0c11f85a request_id=32e49c93-4c57-43a0-9439-c554e5fff1f6 time.busy=5.53ms otel.name=\"GET /api/v1/sources\" target=flowcpt_telemetry time.idle=36.3ms timestamp=2026-11-18T20:39:01.187944Z  close",
+            "14:00:02.000 fc-api-0             api         WARN  http.method=POST http.route=/api/v1/flows http.status_code=404 tenant_id=8Hq2mVxWc4TzPb7LdYn3Ka request_id=9d0e7a55-0b0e-4c0c-8a4f-2f1f3f2b6c11 time.busy=1.21ms otel.name=\"POST /api/v1/flows\" target=flowcpt_telemetry time.idle=9.04ms timestamp=2026-11-18T20:39:01.412307Z  close",
+            "14:00:03.000 fc-api-0             api         INFO  http.method=GET http.route=/api/v1/sources tenant_id=3K6ehNLhnRsPfWhzjugmea request_id=32e49c93-4c57-43a0-9439-c554e5fff1f6 name=load_sources rows=3 table=sources target=flowcpt_api::sources timestamp=2026-11-18T20:39:01.180112Z  sources loaded",
         ]
     );
 }
@@ -373,7 +387,7 @@ async fn the_field_flag_sees_the_fields_of_a_tracing_span() {
     );
     assert_eq!(
         follow.line().await,
-        "14:00:01.000 fc-api-0 api  INFO  http.route=/api/v1/sources  close"
+        "14:00:01.000 fc-api-0             api         INFO  http.route=/api/v1/sources  close"
     );
     follow.expect_quiet().await;
 
@@ -392,7 +406,7 @@ async fn the_field_flag_sees_the_fields_of_a_tracing_span() {
     );
     assert_eq!(
         follow.line().await,
-        "14:00:02.000 fc-api-0 api  WARN  http.route=/api/v1/flows  close"
+        "14:00:02.000 fc-api-0             api         WARN  http.route=/api/v1/flows  close"
     );
     follow.expect_quiet().await;
 
@@ -410,7 +424,7 @@ async fn the_field_flag_sees_the_fields_of_a_tracing_span() {
     );
     assert_eq!(
         follow.line().await,
-        "14:00:02.000 fc-api-0 api  WARN  http.method=POST http.route=/api/v1/flows http.status_code=404 tenant_id=8Hq2mVxWc4TzPb7LdYn3Ka request_id=9d0e7a55-0b0e-4c0c-8a4f-2f1f3f2b6c11 time.busy=1.21ms  close"
+        "14:00:02.000 fc-api-0             api         WARN  http.method=POST http.route=/api/v1/flows http.status_code=404 tenant_id=8Hq2mVxWc4TzPb7LdYn3Ka request_id=9d0e7a55-0b0e-4c0c-8a4f-2f1f3f2b6c11 time.busy=1.21ms  close"
     );
     follow.expect_quiet().await;
 }
@@ -441,8 +455,8 @@ async fn the_field_flag_finds_a_line_logged_in_a_span_inside_the_span_of_a_reque
     assert_eq!(
         follow.lines(2).await,
         [
-            "14:00:01.000 fc-api-0 api  INFO  request_id=32e49c93-4c57-43a0-9439-c554e5fff1f6  close",
-            "14:00:03.000 fc-api-0 api  INFO  name=load_sources table=sources rows=3 request_id=32e49c93-4c57-43a0-9439-c554e5fff1f6  sources loaded",
+            "14:00:01.000 fc-api-0             api         INFO  request_id=32e49c93-4c57-43a0-9439-c554e5fff1f6  close",
+            "14:00:03.000 fc-api-0             api         INFO  name=load_sources table=sources rows=3 request_id=32e49c93-4c57-43a0-9439-c554e5fff1f6  sources loaded",
         ]
     );
     follow.expect_quiet().await;
@@ -502,9 +516,9 @@ async fn the_level_flag_hides_info_lines_and_keeps_lines_with_no_level() {
     assert_eq!(
         follow.lines(3).await,
         [
-            "14:00:02.000 redis-0 api  WARN  request_id=8b1d  payment intent expired",
-            "14:00:03.000 redis-0 api  ERROR request_id=8b1e  card declined",
-            "14:00:04.000 redis-0 api        a plain line with no level",
+            "14:00:02.000 redis-0              api         WARN  request_id=8b1d  payment intent expired",
+            "14:00:03.000 redis-0              api         ERROR request_id=8b1e  card declined",
+            "14:00:04.000 redis-0              api               a plain line with no level",
         ]
     );
     follow.expect_quiet().await;
@@ -575,10 +589,10 @@ async fn a_panic_does_not_vanish_under_a_level_filter() {
     // The two info lines are hidden. The panic has no level and stays, and
     // so does the blank line before it.
     let lines = follow.lines(8).await;
-    assert_eq!(lines[0], "14:00:01.001 redis-0 api");
+    assert_eq!(lines[0], "14:00:01.001 redis-0              api");
     assert_eq!(
         lines[1],
-        "14:00:01.002 redis-0 api        thread 'tokio-runtime-worker' (241) panicked at src/payments.rs:42:19:"
+        "14:00:01.002 redis-0              api               thread 'tokio-runtime-worker' (241) panicked at src/payments.rs:42:19:"
     );
     assert_eq!(lines[2], "tenant t_123 not found");
     assert_eq!(
@@ -609,8 +623,8 @@ async fn grep_and_match_filter_on_the_message() {
     assert_eq!(
         follow.lines(2).await,
         [
-            "14:00:03.000 redis-0 api  ERROR request_id=8b1e  card declined",
-            "14:00:04.000 redis-0 api        a plain line with no level",
+            "14:00:03.000 redis-0              api         ERROR request_id=8b1e  card declined",
+            "14:00:04.000 redis-0              api               a plain line with no level",
         ]
     );
     follow.expect_quiet().await;
@@ -777,16 +791,16 @@ async fn events_are_merged_into_the_stream() {
     // column of the container.
     assert!(
         line.ends_with(
-            " redis-0 EVNT        Killing: Container api failed liveness probe, will be restarted"
+            " redis-0              EVNT              Killing: Container api failed liveness probe, will be restarted"
         ),
         "{line}"
     );
 
-    // A line after it is aligned to the wider column.
+    // A line after it stands in the same columns.
     fake.log(NS, "redis-0", "api", Utc::now(), "INFO back again");
     let line = follow.line().await;
     assert!(
-        line.ends_with(" redis-0 api   INFO  INFO back again"),
+        line.ends_with(" redis-0              api         INFO  INFO back again"),
         "{line}"
     );
 }
@@ -812,7 +826,7 @@ async fn the_filter_flags_hide_lines_and_events_still_show() {
     // Of the four lines only the warning of that tenant is left.
     assert_eq!(
         follow.line().await,
-        "14:00:02.000 redis-0 api  WARN  request_id=8b1d  payment intent expired"
+        "14:00:02.000 redis-0              api         WARN  request_id=8b1d  payment intent expired"
     );
 
     add_event(
@@ -946,7 +960,7 @@ async fn a_template_behaves_as_the_flags_spelt_out_in_it() {
 
     assert_eq!(
         from_template,
-        "14:00:02.000 redis-0 api  WARN  request_id=8b1d  payment intent expired"
+        "14:00:02.000 redis-0              api         WARN  request_id=8b1d  payment intent expired"
     );
     assert_eq!(from_template, from_flags);
 }
@@ -967,8 +981,8 @@ async fn the_fields_of_a_template_are_the_fields_shown_in_that_order() {
     assert_eq!(
         follow.lines(2).await,
         [
-            "14:00:01.000 fc-api-0 api  INFO  request_id=32e49c93-4c57-43a0-9439-c554e5fff1f6 http.status_code=200 time.idle=36.3ms http.route=/api/v1/sources  close",
-            "14:00:02.000 fc-api-0 api  WARN  request_id=9d0e7a55-0b0e-4c0c-8a4f-2f1f3f2b6c11 http.status_code=404 time.idle=9.04ms http.route=/api/v1/flows  close",
+            "14:00:01.000 fc-api-0             api         INFO  request_id=32e49c93-4c57-43a0-9439-c554e5fff1f6 http.status_code=200 time.idle=36.3ms http.route=/api/v1/sources  close",
+            "14:00:02.000 fc-api-0             api         WARN  request_id=9d0e7a55-0b0e-4c0c-8a4f-2f1f3f2b6c11 http.status_code=404 time.idle=9.04ms http.route=/api/v1/flows  close",
         ]
     );
 
@@ -981,7 +995,7 @@ async fn the_fields_of_a_template_are_the_fields_shown_in_that_order() {
     );
     assert_eq!(
         follow.line().await,
-        "14:00:02.000 fc-api-0 api  WARN  http.method=POST http.route=/api/v1/flows http.status_code=404 tenant_id=8Hq2mVxWc4TzPb7LdYn3Ka request_id=9d0e7a55-0b0e-4c0c-8a4f-2f1f3f2b6c11 time.busy=1.21ms otel.name=\"POST /api/v1/flows\" target=flowcpt_telemetry time.idle=9.04ms timestamp=2026-11-18T20:39:01.412307Z  close"
+        "14:00:02.000 fc-api-0             api         WARN  http.method=POST http.route=/api/v1/flows http.status_code=404 tenant_id=8Hq2mVxWc4TzPb7LdYn3Ka request_id=9d0e7a55-0b0e-4c0c-8a4f-2f1f3f2b6c11 time.busy=1.21ms otel.name=\"POST /api/v1/flows\" target=flowcpt_telemetry time.idle=9.04ms timestamp=2026-11-18T20:39:01.412307Z  close"
     );
 
     // An empty list is the message only.
@@ -994,8 +1008,8 @@ async fn the_fields_of_a_template_are_the_fields_shown_in_that_order() {
     assert_eq!(
         follow.lines(2).await,
         [
-            "14:00:01.000 fc-api-0 api  INFO  close",
-            "14:00:02.000 fc-api-0 api  WARN  close",
+            "14:00:01.000 fc-api-0             api         INFO  close",
+            "14:00:02.000 fc-api-0             api         WARN  close",
         ]
     );
 
@@ -1015,8 +1029,8 @@ async fn the_fields_of_a_template_are_the_fields_shown_in_that_order() {
     assert_eq!(
         follow.lines(2).await,
         [
-            "14:00:01.000 fc-api-0 api  INFO  time.idle=36.3ms  close",
-            "14:00:02.000 fc-api-0 api  WARN  time.idle=9.04ms  close",
+            "14:00:01.000 fc-api-0             api         INFO  time.idle=36.3ms  close",
+            "14:00:02.000 fc-api-0             api         WARN  time.idle=9.04ms  close",
         ]
     );
 }
@@ -1036,8 +1050,8 @@ async fn the_defaults_fill_in_what_a_template_leaves_out_and_a_flag_overrides() 
     assert_eq!(
         follow.lines(2).await,
         [
-            "14:00:03.000 redis-0 api  ERROR card declined",
-            "14:00:04.000 redis-0 api        a plain line with no level",
+            "14:00:03.000 redis-0              api         ERROR card declined",
+            "14:00:04.000 redis-0              api               a plain line with no level",
         ]
     );
     follow.expect_quiet().await;
@@ -1085,9 +1099,343 @@ async fn the_defaults_fill_in_what_a_template_leaves_out_and_a_flag_overrides() 
     assert_eq!(
         follow.lines(2).await,
         [
-            "14:00:03.000 redis-0 api  ERROR request_id=8b1e  card declined",
-            "14:00:04.000 redis-0 api        a plain line with no level",
+            "14:00:03.000 redis-0              api         ERROR request_id=8b1e  card declined",
+            "14:00:04.000 redis-0              api               a plain line with no level",
         ]
     );
     follow.expect_quiet().await;
+}
+
+// ---- columns ----------------------------------------------------------
+
+const FC: &str = "fc-stg";
+const FC_API_POD: &str = "fc-api-7f698fb95f-vxfgs";
+const FC_WEB_POD: &str = "fc-web-api-5c8b6d7f9-m4q8z";
+
+/// The deployments `fc-api` and `fc-web-api` of the namespace `fc-stg`, one
+/// pod each; the second pod has a sidecar with a long name.
+fn seed_fc(fake: &FakeCluster) {
+    for (deployment, set, pod, containers) in [
+        ("fc-api", "fc-api-7f698fb95f", FC_API_POD, &["api"][..]),
+        (
+            "fc-web-api",
+            "fc-web-api-5c8b6d7f9",
+            FC_WEB_POD,
+            &["api", "linkerd-proxy"],
+        ),
+    ] {
+        let labels = [("app", deployment)];
+        fake.apply(
+            &deployments(FC),
+            workload_object(FC, deployment, &labels, None),
+        );
+        fake.apply(
+            &replica_sets(FC),
+            workload_object(FC, set, &labels, Some(owner("Deployment", deployment))),
+        );
+        fake.apply(
+            &pods(FC),
+            pod_object(FC, pod, &labels, Some(owner("ReplicaSet", set)), containers),
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_long_pod_name_is_cut_in_the_middle_and_the_columns_flag_changes_that() {
+    let fake = FakeCluster::start().await;
+    seed_fc(&fake);
+    fake.log(FC, FC_API_POD, "api", at(1_000), "INFO ready");
+
+    // Acceptance 6, with no flag at all: in the 20 cells of the pod column
+    // the name keeps the workload and the pod suffix. Every pod here is a
+    // deployment's, and the name is not shortened to hash and suffix.
+    let mut follow = Follow::start(&fake, "columns-cut", &["fc-stg/fc-api"]);
+    assert_eq!(
+        follow.line().await,
+        "14:00:01.000 fc-api…vxfgs         api         INFO  INFO ready"
+    );
+
+    // A column that is wide enough shows it whole.
+    let mut follow = Follow::start(
+        &fake,
+        "columns-wide",
+        &["fc-stg/fc-api", "--columns", "pod=40"],
+    );
+    assert_eq!(
+        follow.line().await,
+        "14:00:01.000 fc-api-7f698fb95f-vxfgs                  api         INFO  INFO ready"
+    );
+
+    // A width of zero hides the column, and the message moves left.
+    let mut follow = Follow::start(
+        &fake,
+        "columns-hidden",
+        &["fc-stg/fc-api", "--columns", "pod=0"],
+    );
+    assert_eq!(
+        follow.line().await,
+        "14:00:01.000 api         INFO  INFO ready"
+    );
+
+    // A column that just holds the name shows it whole too, hash and all.
+    let mut follow = Follow::start(
+        &fake,
+        "columns-exact",
+        &["fc-stg/fc-api", "--columns", "pod=23"],
+    );
+    assert_eq!(
+        follow.line().await,
+        "14:00:01.000 fc-api-7f698fb95f-vxfgs api         INFO  INFO ready"
+    );
+
+    // A side to cut on, and several columns at once.
+    let mut follow = Follow::start(
+        &fake,
+        "columns-sides",
+        &[
+            "fc-stg/fc-api",
+            "--columns",
+            "time=0,pod=10:start,container=2,level=4",
+        ],
+    );
+    assert_eq!(follow.line().await, "…95f-vxfgs a…  INFO INFO ready");
+}
+
+#[tokio::test]
+async fn a_columns_flag_that_cannot_be_read_is_refused() {
+    let fake = FakeCluster::start().await;
+    for (columns, expected) in [
+        ("node=24", "`node` is not a column"),
+        ("pod=wide", "`wide` is not a width"),
+        ("pod=24:left", "`left` is not a side to cut on"),
+    ] {
+        let (mut command, kubeconfig, config) = follow_command(
+            &fake,
+            "columns-refused",
+            "",
+            &["fc-stg", "--columns", columns],
+        );
+        let output = timeout(Duration::from_secs(15), command.output())
+            .await
+            .expect("gossip should stop in time")
+            .unwrap();
+        let _ = std::fs::remove_file(kubeconfig);
+        let _ = std::fs::remove_file(config);
+        assert_eq!(output.status.code(), Some(2), "{columns}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(expected), "{columns}: {stderr}");
+    }
+}
+
+const COLUMNS_CONFIG: &str = r#"
+[columns]
+pod = { width = 12, cut = "end" }
+container = { width = 5 }
+
+[templates.narrow]
+targets = ["fc-stg/fc-web-api"]
+columns = { pod = { cut = "start" }, level = { width = 0 } }
+"#;
+
+#[tokio::test]
+async fn the_columns_of_the_config_file_and_of_a_template_apply_and_a_flag_goes_over_them() {
+    let fake = FakeCluster::start().await;
+    seed_fc(&fake);
+    fake.log(FC, FC_WEB_POD, "linkerd-proxy", at(1_000), "WARN refused");
+
+    // The `[columns]` of the config file, for a run without a template.
+    let mut follow = Follow::start_with_config(
+        &fake,
+        "columns-config",
+        COLUMNS_CONFIG,
+        &["fc-stg/fc-web-api"],
+    );
+    assert_eq!(
+        follow.line().await,
+        "14:00:01.000 fc-web-api-… link…  WARN  WARN refused"
+    );
+
+    // A template changes what it names, part by part: the side of the pod
+    // column, with the width of the config file, and no level column.
+    let mut follow = Follow::start_with_config(
+        &fake,
+        "columns-template",
+        COLUMNS_CONFIG,
+        &["--template", "narrow"],
+    );
+    assert_eq!(
+        follow.line().await,
+        "14:00:01.000 …6d7f9-m4q8z link… WARN refused"
+    );
+
+    // And a flag goes over both, again part by part.
+    let mut follow = Follow::start_with_config(
+        &fake,
+        "columns-flag",
+        COLUMNS_CONFIG,
+        &[
+            "--template",
+            "narrow",
+            "--columns",
+            "pod=8,container=13,level=5",
+        ],
+    );
+    assert_eq!(
+        follow.line().await,
+        "14:00:01.000 …9-m4q8z linkerd-proxy  WARN  WARN refused"
+    );
+}
+
+// ---- the output without a terminal, byte for byte -------------------------
+
+/// What `gossip follow` with these arguments writes to stdout, as bytes:
+/// read until `lines` line ends have come, then until it has been quiet for
+/// a moment.
+async fn stdout_bytes(fake: &FakeCluster, test: &str, args: &[&str], lines: usize) -> String {
+    use tokio::io::AsyncReadExt;
+
+    let (mut command, kubeconfig, config) = follow_command(fake, test, "", args);
+    let mut child = command.spawn().expect("gossip should start");
+    let mut stdout = child.stdout.take().unwrap();
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let complete = bytes.iter().filter(|byte| **byte == b'\n').count() >= lines;
+        let wait = if complete {
+            Duration::from_millis(600)
+        } else {
+            Duration::from_secs(15)
+        };
+        match timeout(wait, stdout.read(&mut chunk)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(count)) => bytes.extend_from_slice(&chunk[..count]),
+            Ok(Err(error)) => panic!("cannot read from gossip: {error}"),
+            Err(_) if complete => break,
+            Err(_) => panic!(
+                "gossip wrote less than {lines} lines in time:\n{}",
+                String::from_utf8_lossy(&bytes)
+            ),
+        }
+    }
+    let _ = std::fs::remove_file(kubeconfig);
+    let _ = std::fs::remove_file(config);
+    String::from_utf8(bytes).expect("the output is UTF-8")
+}
+
+/// A little of everything a stream carries: events about pods and about a
+/// workload, JSON, logfmt and plain lines, and a panic of several lines.
+fn seed_pinned(fake: &FakeCluster) {
+    seed_fc(fake);
+    fake.apply(&pods(FC), pod_object(FC, "redis-0", &[], None, &["redis"]));
+    // The events are older than every line, and each has a second of its
+    // own, so the order of the stream does not hang on which watch answers
+    // first.
+    for (name, regarding, container, reason, note, kind, count, time) in [
+        (
+            "scaled",
+            ("Deployment", "fc-web-api"),
+            None,
+            "ScalingReplicaSet",
+            "Scaled up replica set fc-web-api-5c8b6d7f9 to 1",
+            "Normal",
+            1,
+            at(-3_000),
+        ),
+        (
+            "killing",
+            ("Pod", FC_API_POD),
+            Some("api"),
+            "Killing",
+            "Container api failed liveness probe, will be restarted",
+            "Normal",
+            1,
+            at(-2_000),
+        ),
+        (
+            "backoff",
+            ("Pod", FC_WEB_POD),
+            Some("api"),
+            "BackOff",
+            "Back-off restarting failed container",
+            "Warning",
+            3,
+            at(-1_000),
+        ),
+    ] {
+        let event = event_object(
+            FC, name, regarding, container, reason, note, kind, count, time,
+        );
+        fake.apply(&events(FC), event);
+    }
+    fake.log(FC, FC_API_POD, "api", at(1_000), SPAN_LINES[0]);
+    fake.log(
+        FC,
+        FC_WEB_POD,
+        "linkerd-proxy",
+        at(2_000),
+        r#"time=2026-11-18T14:00:02Z level=warn msg="connection refused" peer=10.0.0.7:8080"#,
+    );
+    fake.log(
+        FC,
+        "redis-0",
+        "redis",
+        at(3_000),
+        "1:M 18 Nov 2026 14:00:03.000 * Ready to accept connections",
+    );
+    fake.log(FC, FC_WEB_POD, "api", at(4_000), "ERROR upstream is gone");
+    // A panic, and the JSON line that ends its block.
+    for (index, line) in [
+        "thread 'main' (7) panicked at src/main.rs:5:5:",
+        "boom",
+        "stack backtrace:",
+        "   0: fc_api::main",
+        r#"{"level":"DEBUG","message":"worker restarted","attempt":2}"#,
+    ]
+    .iter()
+    .enumerate()
+    {
+        fake.log(FC, FC_API_POD, "api", at(5_000 + index as i64), line);
+    }
+}
+
+/// The whole history, events included: everything since long before the
+/// fixed times of the test.
+const PINNED_ARGS: [&str; 3] = ["fc-stg", "--since", "36500d"];
+
+/// THE OUTPUT WITHOUT A TERMINAL IS PINNED HERE, byte for byte. With stdout
+/// or stdin not a terminal, nothing of the interactive mode may show: no
+/// escape code, no carriage return, no status line, no prompt.
+///
+/// The JSON and the raw output are what the prototype wrote, to the byte:
+/// the two files were written by the prototype's own binary. The text
+/// output is what the prototype wrote apart from the prefix columns of
+/// SPEC-interactive 5: their fixed widths, and the pod column, which holds
+/// the full name of the pod cut in the middle where the prototype shortened
+/// it to hash and suffix. None of the three may change without the spec
+/// saying so.
+const PINNED_TEXT: &str = include_str!("pinned/follow.txt");
+const PINNED_JSON: &str = include_str!("pinned/follow.jsonl");
+const PINNED_RAW: &str = include_str!("pinned/follow.raw");
+
+#[tokio::test]
+async fn the_output_without_a_terminal_is_pinned_byte_for_byte() {
+    let fake = FakeCluster::start().await;
+    seed_pinned(&fake);
+
+    let lines = |text: &str| text.matches('\n').count();
+    let text = stdout_bytes(&fake, "pinned-text", &PINNED_ARGS, lines(PINNED_TEXT)).await;
+    let args = [&PINNED_ARGS[..], &["--output", "json"]].concat();
+    let json = stdout_bytes(&fake, "pinned-json", &args, lines(PINNED_JSON)).await;
+    let args = [&PINNED_ARGS[..], &["--raw"]].concat();
+    let raw = stdout_bytes(&fake, "pinned-raw", &args, lines(PINNED_RAW)).await;
+
+    assert_eq!(text, PINNED_TEXT, "the text output:\n{text}");
+    assert_eq!(json, PINNED_JSON, "the JSON output:\n{json}");
+    assert_eq!(raw, PINNED_RAW, "the raw output:\n{raw}");
+
+    // Nothing in any of them that only a terminal would want.
+    for output in [&text, &json, &raw] {
+        assert!(!output.contains('\u{1b}'), "an escape code: {output:?}");
+        assert!(!output.contains('\r'), "a carriage return: {output:?}");
+    }
 }

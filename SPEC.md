@@ -210,16 +210,18 @@ The filter flags (`--level`, `--grep`, `--match`, `--field`) combine with `and`.
 Text output, one line per record:
 
 ```
-14:02:11.482 flowcpt-api-7d9f-xk2p1 api  WARN  tenant_id=t_123 request_id=8b1c  payment intent expired
-14:02:11.490 flowcpt-api-7d9f-xk2p1 💀         Killing: Container api failed liveness probe, will be restarted
-14:02:13.004 flowcpt-api-7d9f-xk2p1 🚀         Started: Started container api
-14:02:13.210 flowcpt-api-7d9f-xk2p1 api  INFO  environment=staging version=0.14.2  starting
+14:02:11.482 flowcpt-api…xk2p1    api         WARN  tenant_id=t_123 request_id=8b1c  payment intent expired
+14:02:11.490 flowcpt-api…xk2p1    💀                Killing: Container api failed liveness probe, will be restarted
+14:02:13.004 flowcpt-api…xk2p1    🚀                Started: Started container api
+14:02:13.210 flowcpt-api…xk2p1    api         INFO  environment=staging version=0.14.2  starting
 ```
+
+The time, the pod, the container and the level stand in columns of a fixed width; `SPEC-interactive.md` 5 defines them.
 
 A request line of a service that logs with `tracing` (4.6), with no flags:
 
 ```
-14:00:01.000 fc-api-0 api  INFO  http.method=GET http.route=/api/v1/sources http.status_code=200 tenant_id=3K6ehNLhnRsPfWhzjugmea user_id=auth0|6a86204723ca712d0c11f85a request_id=32e49c93-4c57-43a0-9439-c554e5fff1f6 time.busy=5.53ms  close
+14:00:01.000 fc-api-0             api         INFO  http.method=GET http.route=/api/v1/sources http.status_code=200 tenant_id=3K6ehNLhnRsPfWhzjugmea user_id=auth0|6a86204723ca712d0c11f85a request_id=32e49c93-4c57-43a0-9439-c554e5fff1f6 time.busy=5.53ms  close
 ```
 
 - Time in the local zone, pod and container as a prefix in a colour per pod (stable for the life of the pod), the level coloured, then the fields of a JSON line that are not the message, then the message.
@@ -230,7 +232,7 @@ A request line of a service that logs with `tracing` (4.6), with no flags:
 - Hidden by default: `timestamp` and `target`, because the time is on the record already and where in the code a line was logged is rarely what one reads for; and `otel.name`, `otel.kind`, `otel.status_code`, `http.target`, `http.scheme`, `http.flavor`, `http.host`, `http.user_agent`, `http.client_ip`, `time.idle`, `name` and `spans`, because they repeat the route or the status, or are noise on every line.
 - `--fields <a,b,c>` replaces all of this with the fields named, in that order, a hidden one like any other. `--fields all` shows every field, the hidden ones too, in the default order.
 - The well-known and the hidden names are one table in the CLI crate, the only place to change them. All of this is a matter of the text output: the record and the JSON output keep every field.
-- Pod names are shortened to the replica-set hash and pod suffix (`7d9f-xk2p1`) when every followed pod belongs to a deployment; `--long-names` keeps them whole.
+- The pod column always holds the full name of the pod. A name that is longer than its column is cut by the rule of the column (`SPEC-interactive.md` 5): in the middle by default, which keeps the workload and the pod suffix and drops the replica-set hash, so `flowcpt-api-7d9f-xk2p1` shows as `flowcpt-api…xk2p1` in the 20 cells of the column and whole in a wider one. A name is never shortened to hash and suffix, and there is no `--long-names`: the beginning of the name says which workload it is, the end which pod, and the hash in the middle is the part nobody needs.
 
 JSON output (`--output json`): one record per line as JSON, every field of 4.7, for `jq` and for the GUI later.
 

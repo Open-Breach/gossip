@@ -7,8 +7,9 @@ use anstyle::{AnsiColor, Style};
 use chrono::{DateTime, Local, Utc};
 use gossip_core::record::{event_field, value_text};
 use gossip_core::resolver::EXITED;
-use gossip_core::{Kind, Level, Record, Value};
+use gossip_core::{Columns, Cut, Kind, Level, Record, Value};
 
+use crate::columns::{cells, fit, keep_ends};
 use crate::fields::FieldChoice;
 
 /// The colours a pod prefix can take. Red and yellow are left to the levels.
@@ -43,66 +44,60 @@ pub struct TextOptions {
     pub colour: bool,
     /// Which fields of a line are shown, and in which order.
     pub fields: FieldChoice,
-    /// Keep pod names whole.
-    pub long_names: bool,
     /// Mark events with an emoji per reason; with `EVNT` otherwise.
     pub emoji: bool,
     pub zone: Zone,
+    /// The widths of the columns of the prefix, and where a value that is
+    /// too long for its column is cut.
+    pub columns: Columns,
 }
 
 /// Renders records as text, one line per record:
 ///
 /// ```text
-/// 14:02:11.482 flowcpt-api-7d9f-xk2p1 api  WARN  tenant_id=t_123 request_id=8b1c  payment intent expired
+/// 14:02:11.482 fc-api…vxfgs         api         WARN  tenant_id=t_123 request_id=8b1c  payment intent expired
 /// ```
 ///
-/// The renderer remembers how wide the pod and container columns have
-/// become, so that the lines stay aligned.
+/// The time, the pod, the container and the level each stand in a column
+/// of a fixed width, so the message starts at the same place on every line.
+/// The pod column always gets the full name of the pod; a name that is too
+/// long for it is cut by the rule of the column.
 #[derive(Debug)]
 pub struct TextRenderer {
     options: TextOptions,
-    pod_width: usize,
-    container_width: usize,
-    /// Every pod seen so far is named like the pod of a deployment, so the
-    /// names can be shortened to the replica-set hash and the pod suffix.
-    only_deployment_pods: bool,
 }
 
 impl TextRenderer {
     pub fn new(options: TextOptions) -> Self {
-        TextRenderer {
-            options,
-            pod_width: 0,
-            container_width: 0,
-            only_deployment_pods: true,
-        }
+        TextRenderer { options }
     }
 
     /// The text of a record, without a line ending. A record whose message
     /// holds several lines gives several lines.
-    pub fn render(&mut self, record: &Record) -> String {
-        let time = self.time(record.time);
+    pub fn render(&self, record: &Record) -> String {
+        let columns = self.options.columns;
+        let time = fit(&self.time(record.time), columns.time);
         if record.kind == Kind::Notice {
             let quiet = Style::new().dimmed();
-            return self.paint(quiet, &format!("{time} -- {}", record.message));
+            let line = join(&[
+                ("", time.as_deref()),
+                (" ", Some(&format!("-- {}", record.message))),
+            ]);
+            return self.paint(quiet, &line);
         }
 
         if record.kind == Kind::Event {
-            return self.render_event(record, &time);
+            return self.render_event(record, time.as_deref());
         }
 
-        let pod = self.pod_name(&record.pod);
-        self.pod_width = self.pod_width.max(pod.chars().count());
-        let container = record.container.as_deref().unwrap_or("");
-        self.container_width = self.container_width.max(container.chars().count());
-        let prefix = format!(
-            "{pod:<pod_width$} {container:<container_width$}",
-            pod_width = self.pod_width,
-            container_width = self.container_width
-        );
+        let pod = self.pod_cell(&record.pod);
+        let container = fit(record.container.as_deref().unwrap_or(""), columns.container);
+        // The pod and the container are one run of the pod's colour.
+        let source = join(&[("", pod.as_deref()), (" ", container.as_deref())]);
+        let source = (!source.is_empty()).then_some(source);
         let level = match record.level {
-            Some(level) => format!("{:<5}", level.as_str().to_uppercase()),
-            None => " ".repeat(5),
+            Some(level) => fit(&level.as_str().to_uppercase(), columns.level),
+            None => fit("", columns.level),
         };
         let fields = self.fields(&record.fields);
         let cut = if record.truncated {
@@ -118,7 +113,12 @@ impl TextRenderer {
                 .map(|(key, value)| format!("{key}={value}"))
                 .collect();
             let body = join_body(&fields.join(" "), &record.message);
-            let line = format!("{time} {prefix}  {level} {body}{cut}");
+            let line = join(&[
+                ("", time.as_deref()),
+                (" ", source.as_deref()),
+                ("  ", level.as_deref()),
+                (" ", Some(&format!("{body}{cut}"))),
+            ]);
             return self.paint(Style::new().dimmed(), line.trim_end());
         }
 
@@ -129,22 +129,24 @@ impl TextRenderer {
             .map(|(key, value)| format!("{}{value}", self.paint(dim, &format!("{key}="))))
             .collect();
         let body = join_body(&fields.join(" "), &record.message);
-        let line = format!(
-            "{} {}  {} {body}{}",
-            self.paint(dim, &time),
-            self.paint(pod_style, &prefix),
-            self.paint(level_style(record.level), &level),
-            self.paint(dim, cut),
-        );
+        let time = time.map(|time| self.paint(dim, &time));
+        let source = source.map(|source| self.paint(pod_style, &source));
+        let level = level.map(|level| self.paint(level_style(record.level), &level));
+        let line = join(&[
+            ("", time.as_deref()),
+            (" ", source.as_deref()),
+            ("  ", level.as_deref()),
+            (" ", Some(&format!("{body}{}", self.paint(dim, cut)))),
+        ]);
         line.trim_end().to_string()
     }
 
     /// An event: a mark in place of the container, then reason and message.
     ///
     /// ```text
-    /// 14:02:11.490 flowcpt-api-7d9f-xk2p1 💀         Killing: Container api failed liveness probe
+    /// 14:02:11.490 fc-api…vxfgs         💀               Killing: Container api failed liveness probe
     /// ```
-    fn render_event(&mut self, record: &Record, time: &str) -> String {
+    fn render_event(&self, record: &Record, time: Option<&str>) -> String {
         let field = |key: &str| record.fields.get(key).map(value_text).unwrap_or_default();
         let reason = field(event_field::REASON);
         let warning = record.level == Some(Level::Warn);
@@ -158,24 +160,27 @@ impl TextRenderer {
                 None => regarding.into_owned(),
             }
         } else {
-            self.pod_name(&record.pod)
+            record.pod.clone()
         };
-        self.pod_width = self.pod_width.max(subject.chars().count());
+        let subject = self.pod_cell(&subject);
 
-        // An emoji is two cells wide in most terminals.
-        let (mark, mark_width) = if self.options.emoji {
-            (event_emoji(&reason, warning), 2)
+        // The mark stands in the column of the container. An emoji is two
+        // cells wide in most terminals, and is measured as that.
+        let columns = self.options.columns;
+        let mark = if self.options.emoji {
+            event_emoji(&reason, warning)
         } else {
-            ("EVNT", 4)
+            EVENT_TAG
         };
-        self.container_width = self.container_width.max(mark_width);
-        let line = format!(
-            "{time} {subject:<pod_width$} {mark}{padding}  {level} {reason}: {message}",
-            pod_width = self.pod_width,
-            padding = " ".repeat(self.container_width - mark_width),
-            level = " ".repeat(5),
-            message = record.message,
-        );
+        let mark = fit(mark, columns.container);
+        let level = fit("", columns.level);
+        let line = join(&[
+            ("", time),
+            (" ", subject.as_deref()),
+            (" ", mark.as_deref()),
+            ("  ", level.as_deref()),
+            (" ", Some(&format!("{reason}: {}", record.message))),
+        ]);
         // Normal events are dimmed; warnings take the warning colour.
         let style = if warning {
             level_style(Some(Level::Warn))
@@ -193,19 +198,30 @@ impl TextRenderer {
         }
     }
 
-    /// The name a pod is shown under: whole, or shortened to the replica-set
-    /// hash and the pod suffix while every pod seen is a deployment's.
-    fn pod_name(&mut self, pod: &str) -> String {
-        let short = deployment_pod_suffix(pod);
-        if short.is_none() {
-            self.only_deployment_pods = false;
-        }
-        match short {
-            Some(short) if self.only_deployment_pods && !self.options.long_names => {
-                short.to_string()
+    /// A pod name, or what stands in its place, as it stands in the column
+    /// of the pod: always the full name, cut when it is too long. Cut in
+    /// the middle, the name of a deployment's pod keeps the workload and the
+    /// pod suffix and loses the hash of the replica set between them:
+    /// `fc-api…vxfgs`. The start of the name says which workload it is, the
+    /// end which pod; the hash in the middle is the part nobody needs.
+    fn pod_cell(&self, name: &str) -> Option<String> {
+        let column = self.options.columns.pod;
+        let width = usize::from(column.width);
+        if column.cut == Cut::Middle
+            && cells(name) > width
+            && let Some(suffix) = deployment_pod_suffix(name)
+            && let Some((_, pod_suffix)) = suffix.rsplit_once('-')
+        {
+            let workload = name.len() - suffix.len() - 1;
+            // The ellipsis and the pod suffix, and at least one cell of the
+            // workload before them.
+            let room = width.saturating_sub(1 + pod_suffix.len());
+            if room > 0 {
+                let head = room.min(workload);
+                return Some(keep_ends(name, head, pod_suffix.len(), width));
             }
-            _ => pod.to_string(),
         }
+        fit(name, column)
     }
 
     /// The fields to show, as key and value, in the order to show them in.
@@ -225,6 +241,26 @@ impl TextRenderer {
             text.to_string()
         }
     }
+}
+
+/// What marks an event where emoji are not wanted or would not show.
+const EVENT_TAG: &str = "EVNT";
+
+/// The parts of a line that are there, each after its separator. The first
+/// one stands at the margin, without its separator; a part that is not
+/// there, the cell of a hidden column, takes its separator with it.
+fn join(parts: &[(&str, Option<&str>)]) -> String {
+    let mut line = String::new();
+    for (separator, part) in parts {
+        let Some(part) = part else {
+            continue;
+        };
+        if !line.is_empty() {
+            line.push_str(separator);
+        }
+        line.push_str(part);
+    }
+    line
 }
 
 /// The emoji of an event, one per reason, so that the eye reads the life of
@@ -326,9 +362,20 @@ mod tests {
         TextOptions {
             colour: false,
             fields: FieldChoice::Default,
-            long_names: true,
             emoji: true,
             zone: Zone::Utc,
+            columns: Columns::default(),
+        }
+    }
+
+    /// The plain options with these columns over the built-in ones.
+    fn with_columns(columns: &str) -> TextOptions {
+        TextOptions {
+            columns: columns
+                .parse::<gossip_core::ColumnsSetting>()
+                .unwrap()
+                .resolve(),
+            ..plain()
         }
     }
 
@@ -361,7 +408,7 @@ mod tests {
 
     #[test]
     fn an_event_carries_an_emoji_in_place_of_the_container() {
-        let mut renderer = TextRenderer::new(plain());
+        let renderer = TextRenderer::new(plain());
         // The four lines of the example of the spec, section 5.3.
         let warn = with_fields(
             line(POD, "api", Some(Level::Warn), "payment intent expired"),
@@ -396,17 +443,17 @@ mod tests {
         assert_eq!(
             lines,
             [
-                "14:02:11.482 flowcpt-api-7d9f-xk2p1 api  WARN  tenant_id=t_123  payment intent expired",
-                "14:02:11.490 flowcpt-api-7d9f-xk2p1 💀         Killing: Container api failed liveness probe, will be restarted",
-                "14:02:11.490 flowcpt-api-7d9f-xk2p1 🚀         Started: Started container api",
-                "14:02:11.482 flowcpt-api-7d9f-xk2p1 api  INFO  starting  version=0.14.2 environment=staging",
+                "14:02:11.482 flowcpt-api…xk2p1    api         WARN  tenant_id=t_123  payment intent expired",
+                "14:02:11.490 flowcpt-api…xk2p1    💀                Killing: Container api failed liveness probe, will be restarted",
+                "14:02:11.490 flowcpt-api…xk2p1    🚀                Started: Started container api",
+                "14:02:11.482 flowcpt-api…xk2p1    api         INFO  starting  version=0.14.2 environment=staging",
             ]
         );
     }
 
     #[test]
     fn without_emoji_an_event_is_marked_evnt_in_the_same_column() {
-        let mut renderer = TextRenderer::new(TextOptions {
+        let renderer = TextRenderer::new(TextOptions {
             emoji: false,
             ..plain()
         });
@@ -419,12 +466,13 @@ mod tests {
         );
         assert_eq!(
             renderer.render(&killing),
-            "14:02:11.490 flowcpt-api-7d9f-xk2p1 EVNT        Killing: Stopping container api"
+            "14:02:11.490 flowcpt-api…xk2p1    EVNT              Killing: Stopping container api"
         );
-        // The column is four wide from here on, so the lines stay aligned.
+        // The mark stands in the column of the container, so the lines stay
+        // aligned.
         assert_eq!(
             renderer.render(&line(POD, "api", Some(Level::Info), "ready")),
-            "14:02:11.482 flowcpt-api-7d9f-xk2p1 api   INFO  ready"
+            "14:02:11.482 flowcpt-api…xk2p1    api         INFO  ready"
         );
     }
 
@@ -460,18 +508,14 @@ mod tests {
         );
         assert_eq!(
             TextRenderer::new(plain()).render(&scaled),
-            "14:02:11.490 deployment/flowcpt-api ℹ️        ScalingReplicaSet: Scaled up replica set flowcpt-api-7d9f to 2"
+            "14:02:11.490 deployment…owcpt-api ℹ️                ScalingReplicaSet: Scaled up replica set flowcpt-api-7d9f to 2"
         );
-        // It does not stop pod names from being shortened.
-        let mut renderer = TextRenderer::new(TextOptions {
-            long_names: false,
-            ..plain()
-        });
-        renderer.render(&scaled);
-        assert!(
-            renderer
-                .render(&line(POD, "api", None, "x"))
-                .contains(" 7d9f-xk2p1 "),
+        // An event about a pod stands under the name of the pod, cut as it
+        // is on a line of that pod.
+        let started = event(FC_POD, "Pod/x", "Started", false, "Started container api");
+        assert_eq!(
+            TextRenderer::new(plain()).render(&started),
+            "14:02:11.490 fc-api…vxfgs         🚀                Started: Started container api"
         );
     }
 
@@ -545,7 +589,7 @@ mod tests {
         // The example of the spec, section 5.3.
         assert_eq!(
             TextRenderer::new(plain()).render(&record),
-            "14:02:11.482 flowcpt-api-7d9f-xk2p1 api  WARN  tenant_id=t_123 request_id=8b1c  payment intent expired"
+            "14:02:11.482 flowcpt-api…xk2p1    api         WARN  tenant_id=t_123 request_id=8b1c  payment intent expired"
         );
     }
 
@@ -559,7 +603,7 @@ mod tests {
         );
         assert_eq!(
             TextRenderer::new(plain()).render(&record),
-            "14:02:11.482 flowcpt-api-7d9f-xk2p1 api  INFO  starting  version=0.14.2 environment=staging"
+            "14:02:11.482 flowcpt-api…xk2p1    api         INFO  starting  version=0.14.2 environment=staging"
         );
     }
 
@@ -568,12 +612,12 @@ mod tests {
         let record = line(POD, "api", None, "listening on 0.0.0.0:8080");
         assert_eq!(
             TextRenderer::new(plain()).render(&record),
-            "14:02:11.482 flowcpt-api-7d9f-xk2p1 api        listening on 0.0.0.0:8080"
+            "14:02:11.482 flowcpt-api…xk2p1    api               listening on 0.0.0.0:8080"
         );
         let error = line(POD, "api", Some(Level::Error), "boom");
         assert_eq!(
             TextRenderer::new(plain()).render(&error),
-            "14:02:11.482 flowcpt-api-7d9f-xk2p1 api  ERROR boom"
+            "14:02:11.482 flowcpt-api…xk2p1    api         ERROR boom"
         );
     }
 
@@ -599,7 +643,7 @@ mod tests {
         // What a request is read by first, then the rest by name.
         assert_eq!(
             TextRenderer::new(plain()).render(&record),
-            "14:02:11.482 flowcpt-api-7d9f-xk2p1 api  INFO  http.method=GET tenant_id=t_123 request_id=8b1c empty=\"\" module=flowcpt_api::payments note=\"two words\" ok=true status=200  done"
+            "14:02:11.482 flowcpt-api…xk2p1    api         INFO  http.method=GET tenant_id=t_123 request_id=8b1c empty=\"\" module=flowcpt_api::payments note=\"two words\" ok=true status=200  done"
         );
 
         let chosen = TextOptions {
@@ -608,7 +652,7 @@ mod tests {
         };
         assert_eq!(
             TextRenderer::new(chosen).render(&record),
-            "14:02:11.482 flowcpt-api-7d9f-xk2p1 api  INFO  status=200 ok=true tenant_id=t_123  done"
+            "14:02:11.482 flowcpt-api…xk2p1    api         INFO  status=200 ok=true tenant_id=t_123  done"
         );
 
         let none = TextOptions {
@@ -617,7 +661,7 @@ mod tests {
         };
         assert_eq!(
             TextRenderer::new(none).render(&record),
-            "14:02:11.482 flowcpt-api-7d9f-xk2p1 api  INFO  done"
+            "14:02:11.482 flowcpt-api…xk2p1    api         INFO  done"
         );
     }
 
@@ -634,7 +678,7 @@ mod tests {
         );
         assert_eq!(
             TextRenderer::new(plain()).render(&record),
-            "14:02:11.482 flowcpt-api-7d9f-xk2p1 api  INFO  status=200  done"
+            "14:02:11.482 flowcpt-api…xk2p1    api         INFO  status=200  done"
         );
 
         // By name.
@@ -644,7 +688,7 @@ mod tests {
         };
         assert_eq!(
             TextRenderer::new(by_name).render(&record),
-            "14:02:11.482 flowcpt-api-7d9f-xk2p1 api  INFO  target=flowcpt_api::payments status=200 timestamp=2026-11-18T14:02:11.482Z  done"
+            "14:02:11.482 flowcpt-api…xk2p1    api         INFO  target=flowcpt_api::payments status=200 timestamp=2026-11-18T14:02:11.482Z  done"
         );
 
         // Or all of them at once, in the default order.
@@ -654,7 +698,7 @@ mod tests {
         };
         assert_eq!(
             TextRenderer::new(all).render(&record),
-            "14:02:11.482 flowcpt-api-7d9f-xk2p1 api  INFO  name=request status=200 target=flowcpt_api::payments timestamp=2026-11-18T14:02:11.482Z  done"
+            "14:02:11.482 flowcpt-api…xk2p1    api         INFO  name=request status=200 target=flowcpt_api::payments timestamp=2026-11-18T14:02:11.482Z  done"
         );
 
         // A line with nothing but hidden fields is its message only.
@@ -667,7 +711,7 @@ mod tests {
         );
         assert_eq!(
             TextRenderer::new(plain()).render(&record),
-            "14:02:11.482 flowcpt-api-7d9f-xk2p1 api  INFO  done"
+            "14:02:11.482 flowcpt-api…xk2p1    api         INFO  done"
         );
     }
 
@@ -676,25 +720,283 @@ mod tests {
         let record = with_fields(line(POD, "api", None, ""), &[("status", json!(200))]);
         assert_eq!(
             TextRenderer::new(plain()).render(&record),
-            "14:02:11.482 flowcpt-api-7d9f-xk2p1 api        status=200"
+            "14:02:11.482 flowcpt-api…xk2p1    api               status=200"
         );
     }
 
     #[test]
-    fn the_columns_grow_with_the_widest_name_seen() {
-        let mut renderer = TextRenderer::new(plain());
-        assert_eq!(
+    fn the_columns_have_fixed_widths_whatever_the_names() {
+        let renderer = TextRenderer::new(plain());
+        let lines = [
             renderer.render(&line("redis-0", "redis", Some(Level::Info), "ready")),
-            "14:02:11.482 redis-0 redis  INFO  ready"
+            renderer.render(&line(POD, "api", Some(Level::Error), "ready")),
+            renderer.render(&line("redis-0", "linkerd-proxy", None, "ready")),
+        ];
+        assert_eq!(
+            lines,
+            [
+                "14:02:11.482 redis-0              redis       INFO  ready",
+                "14:02:11.482 flowcpt-api…xk2p1    api         ERROR ready",
+                "14:02:11.482 redis-0              linkerd-p…        ready",
+            ]
+        );
+        // Twelve cells of time, twenty of pod, ten of container, five of
+        // level: the message starts in the same cell on every line.
+        for line in &lines {
+            assert_eq!(cells(line.strip_suffix("ready").unwrap()), 52, "{line}");
+        }
+    }
+
+    /// The pod of acceptance point 6.
+    const FC_POD: &str = "fc-api-7f698fb95f-vxfgs";
+
+    #[test]
+    fn a_pod_name_cut_in_the_middle_keeps_the_workload_and_the_pod_suffix() {
+        let record = line(FC_POD, "api", Some(Level::Info), "ready");
+        assert_eq!(
+            TextRenderer::new(plain()).render(&record),
+            "14:02:11.482 fc-api…vxfgs         api         INFO  ready"
+        );
+        // A column that holds the name shows it whole.
+        assert_eq!(
+            TextRenderer::new(with_columns("pod=40")).render(&record),
+            "14:02:11.482 fc-api-7f698fb95f-vxfgs                  api         INFO  ready"
         );
         assert_eq!(
-            renderer.render(&line(POD, "api", Some(Level::Info), "ready")),
-            "14:02:11.482 flowcpt-api-7d9f-xk2p1 api    INFO  ready"
+            TextRenderer::new(with_columns("pod=23")).render(&record),
+            "14:02:11.482 fc-api-7f698fb95f-vxfgs api         INFO  ready"
         );
-        // The first pod again, now in the wider columns.
+        // A workload too long for the column gives way; the pod suffix stays.
+        let web = line(
+            "flowcpt-web-api-5c8b6d7f9-m4q8z",
+            "api",
+            Some(Level::Info),
+            "ready",
+        );
         assert_eq!(
-            renderer.render(&line("redis-0", "redis", Some(Level::Info), "ready")),
-            "14:02:11.482 redis-0                redis  INFO  ready"
+            TextRenderer::new(plain()).render(&web),
+            "14:02:11.482 flowcpt-web-ap…m4q8z api         INFO  ready"
+        );
+        assert_eq!(
+            TextRenderer::new(with_columns("pod=8")).render(&web),
+            "14:02:11.482 fl…m4q8z api         INFO  ready"
+        );
+        // No room for more than the ellipsis and the suffix: cut like any
+        // other text.
+        assert_eq!(
+            TextRenderer::new(with_columns("pod=6")).render(&web),
+            "14:02:11.482 flo…8z api         INFO  ready"
+        );
+    }
+
+    #[test]
+    fn a_name_that_is_not_a_deployments_is_cut_like_any_other_text() {
+        let job = line(
+            "nightly-sync-29391840-x7k2p",
+            "sync",
+            Some(Level::Info),
+            "ready",
+        );
+        assert_eq!(
+            TextRenderer::new(plain()).render(&job),
+            "14:02:11.482 nightly-sy…840-x7k2p sync        INFO  ready"
+        );
+    }
+
+    #[test]
+    fn the_pod_column_can_be_cut_on_either_side_or_not_at_all() {
+        let record = line(FC_POD, "api", Some(Level::Info), "ready");
+        let render = |columns: &str| TextRenderer::new(with_columns(columns)).render(&record);
+        assert_eq!(
+            render("pod=10:start"),
+            "14:02:11.482 …95f-vxfgs api         INFO  ready"
+        );
+        assert_eq!(
+            render("pod=13:end"),
+            "14:02:11.482 fc-api-7f698… api         INFO  ready"
+        );
+        assert_eq!(
+            render("pod=12:middle"),
+            "14:02:11.482 fc-api…vxfgs api         INFO  ready"
+        );
+        assert_eq!(
+            render("pod=10:none"),
+            "14:02:11.482 fc-api-7f698fb95f-vxfgs api         INFO  ready"
+        );
+    }
+
+    #[test]
+    fn the_pod_column_always_gets_the_full_name() {
+        // Every pod here is a deployment's, and none of the names is
+        // shortened to its hash and suffix: each is the full name, cut.
+        let renderer = TextRenderer::new(plain());
+        let lines = [
+            renderer.render(&line(FC_POD, "api", Some(Level::Info), "one")),
+            renderer.render(&line(POD, "api", Some(Level::Info), "two")),
+            renderer.render(&line(
+                "fc-app-6d5c7b8f4-q7w2x",
+                "app",
+                Some(Level::Info),
+                "three",
+            )),
+        ];
+        assert_eq!(
+            lines,
+            [
+                "14:02:11.482 fc-api…vxfgs         api         INFO  one",
+                "14:02:11.482 flowcpt-api…xk2p1    api         INFO  two",
+                "14:02:11.482 fc-app…q7w2x         app         INFO  three",
+            ]
+        );
+        // A name that fits its column is whole, hash and all.
+        let fits = line("api-7d9f-xk2p1", "api", Some(Level::Info), "four");
+        assert_eq!(
+            renderer.render(&fits),
+            "14:02:11.482 api-7d9f-xk2p1       api         INFO  four"
+        );
+        // Which pods came before changes nothing: the same pod is the same
+        // text on every line.
+        let other = line("redis-0", "redis", Some(Level::Info), "five");
+        assert_eq!(
+            renderer.render(&other),
+            "14:02:11.482 redis-0              redis       INFO  five"
+        );
+        assert_eq!(
+            renderer.render(&line(FC_POD, "api", Some(Level::Info), "one")),
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn a_width_of_zero_hides_a_column_and_the_message_moves_left() {
+        let record = line(FC_POD, "api", Some(Level::Warn), "ready");
+        let render = |columns: &str| TextRenderer::new(with_columns(columns)).render(&record);
+        assert_eq!(render("pod=0"), "14:02:11.482 api         WARN  ready");
+        assert_eq!(
+            render("container=0"),
+            "14:02:11.482 fc-api…vxfgs          WARN  ready"
+        );
+        assert_eq!(
+            render("level=0"),
+            "14:02:11.482 fc-api…vxfgs         api        ready"
+        );
+        assert_eq!(
+            render("time=0"),
+            "fc-api…vxfgs         api         WARN  ready"
+        );
+        assert_eq!(render("pod=0,container=0"), "14:02:11.482  WARN  ready");
+        assert_eq!(render("time=0,pod=0,container=0,level=0"), "ready");
+
+        // An event and a notice lose the same columns.
+        let killing = event(FC_POD, "Pod/x", "Killing", false, "Stopping container api");
+        let render = |columns: &str| TextRenderer::new(with_columns(columns)).render(&killing);
+        assert_eq!(
+            render("pod=0"),
+            "14:02:11.490 💀                Killing: Stopping container api"
+        );
+        assert_eq!(
+            render("container=0,level=0"),
+            "14:02:11.490 fc-api…vxfgs         Killing: Stopping container api"
+        );
+        assert_eq!(
+            render("time=0,pod=0,container=0,level=0"),
+            "Killing: Stopping container api"
+        );
+        let time = Utc.with_ymd_and_hms(2026, 11, 18, 14, 2, 11).unwrap();
+        let notice = Record::notice("c", "flowcpt", "", None, time, "reconnecting");
+        assert_eq!(
+            TextRenderer::new(with_columns("time=0")).render(&notice),
+            "-- reconnecting"
+        );
+    }
+
+    #[test]
+    fn the_container_and_the_level_are_cut_at_the_end() {
+        let record = line("redis-0", "linkerd-proxy", Some(Level::Error), "ready");
+        assert_eq!(
+            TextRenderer::new(plain()).render(&record),
+            "14:02:11.482 redis-0              linkerd-p…  ERROR ready"
+        );
+        assert_eq!(
+            TextRenderer::new(with_columns("container=13,level=3")).render(&record),
+            "14:02:11.482 redis-0              linkerd-proxy  ER… ready"
+        );
+        assert_eq!(
+            TextRenderer::new(with_columns("container=6:start,level=8")).render(&record),
+            "14:02:11.482 redis-0              …proxy  ERROR    ready"
+        );
+    }
+
+    #[test]
+    fn the_mark_of_an_event_stands_in_the_column_of_the_container() {
+        let back_off = event(POD, "Pod/x", "BackOff", true, "Back-off");
+        let render = |options: TextOptions| TextRenderer::new(options).render(&back_off);
+        // An emoji takes two cells of the ten; `EVNT` takes four.
+        assert_eq!(
+            render(plain()),
+            "14:02:11.490 flowcpt-api…xk2p1    🔥                BackOff: Back-off"
+        );
+        let tag = |columns: &str| TextOptions {
+            emoji: false,
+            ..with_columns(columns)
+        };
+        assert_eq!(
+            render(tag("container=10")),
+            "14:02:11.490 flowcpt-api…xk2p1    EVNT              BackOff: Back-off"
+        );
+        // In the same cells, whichever of the two it is.
+        assert_eq!(cells(&render(plain())), cells(&render(tag("container=10"))));
+        // A column too narrow for the mark cuts it like any other value.
+        assert_eq!(
+            render(tag("container=3")),
+            "14:02:11.490 flowcpt-api…xk2p1    EV…        BackOff: Back-off"
+        );
+        assert_eq!(
+            render(with_columns("container=2")),
+            "14:02:11.490 flowcpt-api…xk2p1    🔥        BackOff: Back-off"
+        );
+        assert_eq!(
+            render(with_columns("container=1")),
+            "14:02:11.490 flowcpt-api…xk2p1    …        BackOff: Back-off"
+        );
+    }
+
+    #[test]
+    fn every_mark_is_measured_as_wide_as_a_terminal_shows_it() {
+        for reason in [
+            "Scheduled",
+            "Pulling",
+            "Started",
+            "Killing",
+            "Exited",
+            "BackOff",
+            "Evicted",
+            "Unhealthy",
+            "Created",
+        ] {
+            for warning in [false, true] {
+                let emoji = event_emoji(reason, warning);
+                assert_eq!(cells(emoji), 2, "{reason}: {emoji}");
+            }
+        }
+        assert_eq!(cells(EVENT_TAG), 4);
+    }
+
+    #[test]
+    fn a_wider_time_column_pads_the_time() {
+        let record = line("redis-0", "api", Some(Level::Info), "ready");
+        assert_eq!(
+            TextRenderer::new(with_columns("time=14")).render(&record),
+            "14:02:11.482   redis-0              api         INFO  ready"
+        );
+        // It is not cut unless a side is named.
+        assert_eq!(
+            TextRenderer::new(with_columns("time=8")).render(&record),
+            "14:02:11.482 redis-0              api         INFO  ready"
+        );
+        assert_eq!(
+            TextRenderer::new(with_columns("time=9:end")).render(&record),
+            "14:02:11… redis-0              api         INFO  ready"
         );
     }
 
@@ -725,7 +1027,7 @@ mod tests {
         );
         assert_eq!(
             TextRenderer::new(plain()).render(&record),
-            "14:02:11.482 flowcpt-api-7d9f-xk2p1 api  ERROR boom\n   0: main\n   1: start"
+            "14:02:11.482 flowcpt-api…xk2p1    api         ERROR boom\n   0: main\n   1: start"
         );
     }
 
@@ -737,43 +1039,6 @@ mod tests {
             TextRenderer::new(plain())
                 .render(&record)
                 .ends_with("xxxx [line cut at 1 MiB]")
-        );
-    }
-
-    #[test]
-    fn pod_names_are_shortened_while_every_pod_is_a_deployments() {
-        let short = TextOptions {
-            long_names: false,
-            ..plain()
-        };
-        let mut renderer = TextRenderer::new(short.clone());
-        assert_eq!(
-            renderer.render(&line(POD, "api", Some(Level::Info), "one")),
-            "14:02:11.482 7d9f-xk2p1 api  INFO  one"
-        );
-        assert_eq!(
-            renderer.render(&line(
-                "flowcpt-web-api-5c8b6d7f9-m4q8z",
-                "api",
-                Some(Level::Info),
-                "two"
-            )),
-            "14:02:11.482 5c8b6d7f9-m4q8z api  INFO  two"
-        );
-        // A pod of something else: from here on the names are whole.
-        assert_eq!(
-            renderer.render(&line("redis-0", "redis", Some(Level::Info), "three")),
-            "14:02:11.482 redis-0         redis  INFO  three"
-        );
-        assert_eq!(
-            renderer.render(&line(POD, "api", Some(Level::Info), "four")),
-            "14:02:11.482 flowcpt-api-7d9f-xk2p1 api    INFO  four"
-        );
-
-        // With --long-names they are whole from the start.
-        assert_eq!(
-            TextRenderer::new(plain()).render(&line(POD, "api", Some(Level::Info), "one")),
-            "14:02:11.482 flowcpt-api-7d9f-xk2p1 api  INFO  one"
         );
     }
 
@@ -825,7 +1090,7 @@ mod tests {
         let pod_style = Style::new().fg_color(Some(pod_colour(POD).into()));
         assert!(
             text.contains(&format!(
-                "{}{POD} api{}",
+                "{}flowcpt-api…xk2p1    api       {}",
                 pod_style.render(),
                 pod_style.render_reset()
             )),
@@ -869,7 +1134,7 @@ mod tests {
         assert_eq!(
             TextRenderer::new(coloured).render(&record),
             format!(
-                "{}14:02:11.482 flowcpt-api-7d9f-xk2p1 api  ERROR tenant_id=t_123  the panic{}",
+                "{}14:02:11.482 flowcpt-api…xk2p1    api         ERROR tenant_id=t_123  the panic{}",
                 dim.render(),
                 dim.render_reset()
             )
@@ -877,7 +1142,7 @@ mod tests {
         // Without colours it reads like any other line.
         assert_eq!(
             TextRenderer::new(plain()).render(&record),
-            "14:02:11.482 flowcpt-api-7d9f-xk2p1 api  ERROR tenant_id=t_123  the panic"
+            "14:02:11.482 flowcpt-api…xk2p1    api         ERROR tenant_id=t_123  the panic"
         );
     }
 

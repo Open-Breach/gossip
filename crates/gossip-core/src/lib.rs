@@ -26,10 +26,13 @@
 //!   line and joins continuation lines.
 //! - [`filter`]: filters, trees of rules applied to records.
 //! - [`config`]: the config file with its defaults and templates.
+//! - [`columns`]: the columns of the prefix of a line, their widths and the
+//!   side a value that is too long is cut on.
 //! - [`merge`]: the reorder buffer that orders records of many sources.
 //! - [`duration`]: durations as the command line and the config write them.
 
 pub mod cluster;
+pub mod columns;
 pub mod config;
 pub mod discovery;
 pub mod duration;
@@ -46,6 +49,7 @@ pub mod target;
 pub mod testing;
 
 pub use cluster::{Cluster, ContextInfo};
+pub use columns::{Column, ColumnSetting, Columns, ColumnsError, ColumnsSetting, Cut};
 pub use config::{Config, ConfigError, Defaults, FormatSetting, Output, Settings, Template};
 pub use discovery::{ContainerInfo, DeploymentInfo, NamespaceInfo, PodInfo};
 pub use duration::{DurationError, format_duration, parse_duration};
