@@ -57,7 +57,7 @@ impl FromStr for Subject {
 
 pub async fn run(args: &ListArgs, out: &mut impl Write) -> anyhow::Result<()> {
     let subject: Subject = args.what.parse()?;
-    let now = Utc::now();
+    let now = gossip_core::clock::now();
 
     if subject == Subject::Contexts {
         let contexts = Cluster::contexts()?;

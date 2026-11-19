@@ -178,7 +178,8 @@ pub struct OutputFlags {
     #[arg(long)]
     pub raw: bool,
 
-    /// The rendering: text, or json with one record per line.
+    /// The rendering: text, or json with one record per line [default:
+    /// text].
     #[arg(long, value_name = "text|json")]
     pub output: Option<Output>,
 

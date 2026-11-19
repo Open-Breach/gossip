@@ -264,7 +264,7 @@ impl TextRenderer {
 }
 
 /// What marks an event where emoji are not wanted or would not show.
-const EVENT_TAG: &str = "EVNT";
+pub const EVENT_TAG: &str = "EVNT";
 
 /// The parts of a line that are there, each after its separator. The first
 /// one stands at the margin, without its separator; a part that is not
@@ -283,22 +283,38 @@ fn join(parts: &[(&str, Option<&str>)]) -> String {
     line
 }
 
-/// The emoji of an event, one per reason, so that the eye reads the life of
-/// a pod without reading words.
+/// The emoji of the reasons that have one of their own, so that the eye
+/// reads the life of a pod without reading words. `Exited` is the end of a
+/// run with an exit code other than zero; `BackOff` is a crash loop and an
+/// image pull back-off.
+///
+/// THIS TABLE AND THE TWO MARKS BELOW IT ARE THE ONLY PLACE TO CHANGE the
+/// emoji of an event. The README repeats them for the reader, from here.
+pub const EVENT_EMOJI: &[(&[&str], &str)] = &[
+    (&["Scheduled"], "📍"),
+    (&["Pulling", "Pulled"], "📦"),
+    (&["Started"], "🚀"),
+    (&["Killing", EXITED], "💀"),
+    (&["BackOff"], "🔥"),
+    (&["Evicted", "Preempted"], "🧹"),
+];
+
+/// The emoji of every other warning, `Unhealthy` among them.
+pub const WARNING_EMOJI: &str = "⚠️";
+
+/// The emoji of every other event.
+pub const OTHER_EMOJI: &str = "ℹ️";
+
+/// The emoji of an event.
 fn event_emoji(reason: &str, warning: bool) -> &'static str {
-    match reason {
-        "Scheduled" => "📍",
-        "Pulling" | "Pulled" => "📦",
-        "Started" => "🚀",
-        // `Exited` is the end of a run with an exit code other than zero.
-        "Killing" => "💀",
-        reason if reason == EXITED => "💀",
-        // A crash loop and an image pull back-off.
-        "BackOff" => "🔥",
-        "Evicted" | "Preempted" => "🧹",
-        // `Unhealthy`, and every other warning.
-        _ if warning => "⚠️",
-        _ => "ℹ️",
+    let own = EVENT_EMOJI
+        .iter()
+        .find(|(reasons, _)| reasons.contains(&reason))
+        .map(|(_, emoji)| *emoji);
+    match own {
+        Some(emoji) => emoji,
+        None if warning => WARNING_EMOJI,
+        None => OTHER_EMOJI,
     }
 }
 

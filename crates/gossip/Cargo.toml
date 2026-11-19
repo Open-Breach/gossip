@@ -6,6 +6,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lib]
+name = "gossip"
+path = "src/lib.rs"
+
 [[bin]]
 name = "gossip"
 path = "src/main.rs"

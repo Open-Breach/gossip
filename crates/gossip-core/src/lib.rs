@@ -33,6 +33,7 @@
 //! - [`merge`]: the reorder buffer that orders records of many sources.
 //! - [`duration`]: durations as the command line and the config write them.
 
+pub mod clock;
 pub mod cluster;
 pub mod columns;
 pub mod config;

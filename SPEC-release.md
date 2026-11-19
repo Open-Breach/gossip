@@ -2,7 +2,7 @@
 
 Status: draft, 2026-11-18. Nothing of this is implemented yet. It adds to `SPEC.md` and `SPEC-interactive.md` and changes no behaviour of the tool.
 
-A tag builds Gossip for four platforms and publishes the archives as a GitHub release. The README becomes the front page for someone who has never seen Gossip, is brought up to date in every release, and is checked against the code instead of trusted. The model for both is the Rick repository (`Open-Breach/rick`: `.github/workflows/release.yml` and `specs/readme.md`), cut down to what a single command-line binary needs.
+A tag builds Gossip for four platforms and publishes the archives as a GitHub release. The README becomes the front page for someone who has never seen Gossip, is brought up to date with every change to what it describes, and is checked against the code instead of trusted. The model for both is the Rick repository (`Open-Breach/rick`: `.github/workflows/release.yml` and `specs/readme.md`), cut down to what a single command-line binary needs.
 
 ## 1. Scope
 
@@ -94,15 +94,15 @@ No cluster is involved. The release job runs only when every smoke test passed.
 
 `README.md` is written for someone who runs Kubernetes and has never heard of Gossip. In a minute they know what it is and how to install it; in ten they have followed the walkthrough and know how to work with it; after that it is the reference they come back to.
 
-- The README describes the latest release, never the state of `main`.
+- The README follows `main`: it describes what the code on `main` does.
 - Terse. Sentences that say what Gossip does, not what it aims to do. No sentence that says nothing.
 - No issue numbers, pull request numbers or commit hashes.
-- Nothing is described that the release does not do. Lists of flags, keys and commands come from the code.
+- Nothing is described that the code does not do. Lists of flags, keys and commands come from the code.
 - Every name in an example (cluster, namespace, workload, tenant) is made up and the same throughout the README: one namespace `shop` with the deployments `api` and `web`. No name from a real cluster.
 
 ### 4.2 Structure
 
-In this order. Parts marked *fixed* are verbatim and are not reworded without Serge; parts marked *regenerated* are rewritten in every release pull request between `<!-- generated:<name> -->` and `<!-- /generated:<name> -->` markers.
+In this order. Parts marked *fixed* are verbatim and are not reworded without Serge; parts marked *regenerated* are written by `cargo xtask readme` between `<!-- generated:<name> -->` and `<!-- /generated:<name> -->` markers, in every pull request that changes what they show.
 
 **Title block** (fixed, version regenerated)
 
@@ -136,7 +136,7 @@ When Trebuchet ships packages, the steps change with it.
 
 **3. Using Gossip** (walkthrough fixed in shape, output regenerated)
 
-Heading `## Using Gossip`. One session read top to bottom. Each step is a sentence or two, the command, and a few lines of what it prints, produced by the release's own binary against the stand-in API server of the tests, never typed by hand. The steps, in this order:
+Heading `## Using Gossip`. One session read top to bottom. Each step is a sentence or two, the command, and a few lines of what it prints, produced by the built binary against the stand-in API server of the tests, never typed by hand. The steps, in this order:
 
 1. Find your way: `gossip list contexts`, `gossip list namespaces`, `gossip list shop`.
 2. Follow one deployment: `gossip follow shop/api`.
@@ -191,7 +191,7 @@ The current *Status* section (the crate table, how the tests run), *Development*
 ### 4.4 Rules for the release
 
 - A release is prepared in one **release pull request**: it sets the version in `Cargo.toml`, regenerates the README, and nothing else. Serge merges it and pushes the tag on the merge commit.
-- Between releases the README is not touched, however far `main` moves, except to fix something in it that is wrong about the latest release.
+- The README follows `main`. A pull request that adds or changes a command, a flag, a key or a `:` command, or that changes what the walkthrough prints, regenerates the README in that same pull request; the test of 4.5 fails until it has.
 - Regenerated: the version in the status line, the Install section, the output shown in the walkthrough, the Reference.
 - Left alone: the tagline, the paragraph of what it is, the status text, the warning, the shape and order of the walkthrough, the known limits, the closing lines. A change to any of them is listed in the pull request under **Decisions made**.
 - Proposed, not decided: new wording for the status text, and changes to the known limits, under **Needs a decision**.

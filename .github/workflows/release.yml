@@ -34,13 +34,17 @@ env:
   TAG: ${{ inputs.tag || github.ref_name }}
 jobs:
   # First, before anything is built: a release cut from a commit that is
-  # another version stops here.
+  # another version, or whose README describes another one, stops here.
   check:
     name: the tag against the repository
     runs-on: ${{ vars.RUNNER_LINUX_X64 || 'ubuntu-24.04' }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5
+      # The README the archives carry describes this release: the version in
+      # its status line and in its Install links is the tag's.
+      - name: the README describes this release
+        run: .github/scripts/check-readme.sh "$TAG"
       - name: the tag is the version of Cargo.toml
         run: .github/scripts/check-version.sh "$TAG"
 
@@ -235,6 +239,36 @@ jobs:
               *) echo "the binary has dynamic dependencies"; exit 1 ;;
             esac
           fi
+      # The steps the Install section of the README gives for this platform,
+      # from the archive on: they are tried here, not assumed. A test holds
+      # the README and these lines together (crates/xtask/tests/readme.rs).
+      - name: the install steps of the README (Linux, macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          mkdir install && cd install
+          cp ../dist/gossip-$version-${{ matrix.platform }}.tar.gz .
+          tar xzf gossip-$version-${{ matrix.platform }}.tar.gz
+          sudo install gossip-$version-${{ matrix.platform }}/gossip /usr/local/bin/
+          cd /
+          test "$(command -v gossip)" = "/usr/local/bin/gossip"
+          test "$(gossip --version)" = "gossip $version"
+      - name: the install steps of the README (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = $env:TAG.TrimStart("v")
+          New-Item -ItemType Directory install | Out-Null
+          Set-Location install
+          Copy-Item ..\dist\gossip-$version-windows-x64.zip .
+          Expand-Archive gossip-$version-windows-x64.zip -DestinationPath .
+          $env:Path += ";$PWD\gossip-$version-windows-x64"
+          Set-Location \
+          $reported = gossip --version
+          if ($reported -ne "gossip $version") { throw "gossip --version printed: $reported" }
       # SPEC-release.md, acceptance 3: the Linux x64 binary starts on these
       # distributions as their images come, with nothing installed.
       - name: the binary starts on Debian, Ubuntu, Fedora and Alpine
