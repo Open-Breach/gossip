@@ -10,7 +10,14 @@ use crate::replay::TimeArg;
 
 /// Follow Kubernetes pod logs and cluster events across restarts and rollouts.
 #[derive(Debug, Parser)]
-#[command(name = "gossip", version, about, arg_required_else_help = true)]
+#[command(
+    name = "gossip",
+    // The tag's version in a release build, the version of `Cargo.toml`
+    // with `-dev` otherwise: `build.rs` works it out.
+    version = env!("GOSSIP_BUILD_VERSION"),
+    about,
+    arg_required_else_help = true
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,

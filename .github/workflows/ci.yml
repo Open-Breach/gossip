@@ -28,3 +28,7 @@ jobs:
         run: cargo clippy --workspace -- -D warnings
       - name: cargo test
         run: cargo test --workspace
+      # SPEC-release.md 3: a build that is handed a version reports that
+      # version. The tests above ran on a build without one.
+      - name: the version of a release build
+        run: test "$(GOSSIP_VERSION=9.9.9 cargo run --quiet -p gossip -- --version)" = "gossip 9.9.9"
