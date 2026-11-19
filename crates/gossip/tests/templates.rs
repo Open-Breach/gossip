@@ -177,12 +177,17 @@ fn follow_takes_targets_or_a_template_not_both() {
 #[test]
 fn the_config_example_of_the_readme_is_a_valid_config() {
     let readme = include_str!("../../../README.md");
+    // The example begins with the one key that stands outside every table.
     let start = readme
-        .find("```toml\n[defaults]")
+        .find("```toml\npause_buffer")
         .expect("the README has a config example");
     let example = &readme[start + "```toml\n".len()..];
     let example = &example[..example.find("```").expect("the example ends")];
 
+    // It shows everything the file can hold beside the templates.
+    for part in ["pause_buffer = ", "[defaults]", "[columns]", "[templates."] {
+        assert!(example.contains(part), "the example has no {part}");
+    }
     let config = config_file("readme", example);
     let output = gossip(&config, &["templates"]);
     assert!(output.status.success(), "{}", text(&output.stderr));

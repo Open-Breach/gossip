@@ -1,6 +1,6 @@
 # Gossip — Interactive mode and columns (round two)
 
-Status: draft, 2026-11-18. Nothing of this is implemented yet. It adds to `SPEC.md`.
+Status: built (PRs 10 to 15). Sections 2 to 6 and 9 are implemented, and every acceptance point of sections 7 and 9 is covered by a test or has a hand check written out in its pull request. The hand checks against the cluster and in a real terminal are pending. It adds to `SPEC.md`, and changes one rule of it: the pod column holds the full pod name, cut by the column's rule, where SPEC 5.3 shortened it to hash and suffix (section 5).
 
 Round two makes a running `gossip follow` changeable from the keyboard: filters, targets and events can be changed while the stream runs, the output can be paused and cleared, the session can be saved as a template and loaded again, and the prefix columns get fixed widths. It adds to the prototype of `SPEC.md` and changes none of its behaviour when nobody presses a key.
 
