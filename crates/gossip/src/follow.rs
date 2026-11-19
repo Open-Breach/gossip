@@ -9,10 +9,11 @@ use gossip_core::{
     Cluster, Config, Kind, Output, Record, Session, SessionOptions, SessionSpec, Settings,
 };
 
-use crate::cli::FollowArgs;
+use crate::cli::{FollowArgs, OutputFlags};
 use crate::fields::FieldChoice;
 use crate::filters::{FilterState, LineRules};
 use crate::interactive;
+use crate::record::{Failures, Recorder};
 use crate::render::{TextOptions, TextRenderer, Zone, json_line};
 
 pub async fn run(args: FollowArgs) -> anyhow::Result<()> {
@@ -25,16 +26,28 @@ pub async fn run(args: FollowArgs) -> anyhow::Result<()> {
     cluster.check().await?;
 
     let stdout_is_terminal = io::stdout().is_terminal();
-    let printer = Printer::new(&args, &settings, stdout_is_terminal);
+    let printer = Printer::new(&args.output, &settings, stdout_is_terminal);
     let session = Session::start(
         &cluster,
         settings.targets.clone(),
         settings.filter.clone(),
         SessionOptions::from(&settings),
     );
+    // A recording gets every record from the first one on, before the
+    // filter. It is beside the output and changes nothing of it.
+    let failures = Failures::new();
+    let recorder = match &args.record {
+        Some(file) => {
+            let (recorder, tap) = Recorder::start(file, failures.tx.clone())
+                .with_context(|| format!("cannot record to {}", file.display()))?;
+            session.handle().set_tap(Some(tap));
+            Some(recorder)
+        }
+        None => None,
+    };
     // The interactive mode is for a terminal on both sides. Without one,
     // nothing of it shows: the lines are printed as they always were.
-    if interactive::wanted(&args, io::stdin().is_terminal(), stdout_is_terminal) {
+    if interactive::wanted(&args.output, io::stdin().is_terminal(), stdout_is_terminal) {
         let setup = interactive::Setup {
             printer,
             filter,
@@ -42,27 +55,43 @@ pub async fn run(args: FollowArgs) -> anyhow::Result<()> {
             // `last` is no template to save back into by its name.
             template: template.filter(|name| name != LAST),
             config_path: Config::path()?,
+            recorder,
+            failures,
         };
         return interactive::run(session, setup).await;
     }
-    follow_plainly(session, printer).await
+    follow_plainly(session, printer, recorder, failures).await
 }
 
 /// Prints the records of a session as they come, until Ctrl-C.
-async fn follow_plainly(mut session: Session, mut printer: Printer) -> anyhow::Result<()> {
+async fn follow_plainly(
+    mut session: Session,
+    mut printer: Printer,
+    recorder: Option<Recorder>,
+    mut failures: Failures,
+) -> anyhow::Result<()> {
     let interrupt = tokio::signal::ctrl_c();
     tokio::pin!(interrupt);
     loop {
         tokio::select! {
             // Ctrl-C stops the session, which closes every stream, and is
             // a normal way to end.
-            _ = &mut interrupt => return Ok(()),
+            _ = &mut interrupt => break,
             record = session.next() => match record {
                 Some(record) => printer.print(&record)?,
-                None => return Ok(()),
+                None => break,
             },
+            // A recording that stopped by itself; the stream goes on.
+            Some(failure) = failures.rx.recv() => eprintln!("gossip: {failure}"),
         }
     }
+    // The session goes, and its tap with it; then the last records of a
+    // recording reach the file.
+    drop(session);
+    if let Some(recorder) = recorder {
+        recorder.finish();
+    }
+    Ok(())
 }
 
 /// What to follow and how: the flags, over the template when one is named,
@@ -92,9 +121,9 @@ fn settings_and_filter(
         events: args.no_events.then_some(false),
         format: None,
         filter: None,
-        fields: args.fields.clone(),
-        output: args.output,
-        columns: args.columns.unwrap_or_default(),
+        fields: args.output.fields.clone(),
+        output: args.output.output,
+        columns: args.output.columns.unwrap_or_default(),
     };
     let template = match template_name(args) {
         Some(name) if args.last && !config.templates.contains_key(LAST) => bail!(
@@ -108,8 +137,8 @@ fn settings_and_filter(
     // What is left in `filter` is the filter of the config file: the
     // template's, or the one of the defaults.
     let filter = FilterState {
-        base: settings.filter.take().filter(|_| !args.no_filter),
-        rules: LineRules::from_args(args)?,
+        base: settings.filter.take().filter(|_| !args.filter.no_filter),
+        rules: LineRules::from_args(&args.filter)?,
     };
     settings.filter = filter.filter();
     if settings.targets.is_empty()
@@ -133,7 +162,7 @@ fn template_name(args: &FollowArgs) -> Option<String> {
 /// leaves events out.
 #[cfg(test)]
 fn filter(args: &FollowArgs) -> anyhow::Result<Option<gossip_core::Filter>> {
-    Ok(LineRules::from_args(args)?.filter())
+    Ok(LineRules::from_args(&args.filter)?.filter())
 }
 
 /// Whether the terminal can be trusted with emoji: the locale says UTF-8.
@@ -195,7 +224,9 @@ impl Printer {
         Printer { mode: Mode::Raw }
     }
 
-    fn new(args: &FollowArgs, settings: &Settings, stdout_is_terminal: bool) -> Self {
+    /// The printer the output flags ask for, with the fields, the output
+    /// and the columns as the config file and the flags settle them.
+    pub fn new(args: &OutputFlags, settings: &Settings, stdout_is_terminal: bool) -> Self {
         if args.raw {
             return Printer { mode: Mode::Raw };
         }
@@ -228,7 +259,8 @@ impl Printer {
         })
     }
 
-    fn print(&mut self, record: &Record) -> anyhow::Result<()> {
+    /// Prints a record to stdout, or what goes beside the output to stderr.
+    pub fn print(&mut self, record: &Record) -> anyhow::Result<()> {
         match self.render(record)? {
             Rendered::Out(line) => writeln!(io::stdout().lock(), "{line}")?,
             Rendered::Aside(line) => eprintln!("{line}"),
@@ -749,7 +781,7 @@ container = "api"
         let text = |extra: &[&str], terminal: bool| {
             let args = args(extra);
             let settings = settings(&args, &Config::default()).unwrap();
-            match Printer::new(&args, &settings, terminal).mode {
+            match Printer::new(&args.output, &settings, terminal).mode {
                 Mode::Text(_) => "text",
                 Mode::Json => "json",
                 Mode::Raw => "raw",

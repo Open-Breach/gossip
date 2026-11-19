@@ -11,7 +11,9 @@ mod filters;
 mod follow;
 mod interactive;
 mod list;
+mod record;
 mod render;
+mod replay;
 mod table;
 mod templates;
 
@@ -40,6 +42,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::List(args) => list::run(&args, &mut io::stdout().lock()).await,
         Command::Follow(args) => follow::run(*args).await,
+        Command::Replay(args) => replay::run(*args).await,
         Command::Templates(args) => templates::run(&args, &mut io::stdout().lock()),
     }
 }

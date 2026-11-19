@@ -30,7 +30,7 @@ use std::path::PathBuf;
 use chrono::Utc;
 use gossip_core::save::LAST;
 use gossip_core::{
-    Columns, ColumnsSetting, Config, ConfigError, DEFAULT_PAUSE_BUFFER, Record, Session,
+    Columns, ColumnsSetting, Config, ConfigError, DEFAULT_PAUSE_BUFFER, Filter, Record, Session,
     SessionHandle, SessionSpec, is_template_name, template_toml,
 };
 
@@ -38,16 +38,18 @@ use self::command::Command;
 use self::keys::{Action, Key, Keyboard};
 use self::pause::{PauseBuffer, lines, with_thousands};
 use self::screen::{Screen, Status};
-use crate::cli::FollowArgs;
+use crate::cli::OutputFlags;
 use crate::fields::FieldChoice;
 use crate::filters::{FilterState, LineRules};
 use crate::follow::{Printer, Rendered};
+use crate::record::{Failures, Recorder, records_text};
+use crate::replay::{Played, Recording};
 
 /// Whether the interactive mode is on: with a terminal on both sides, or,
 /// when `--interactive` forces it, with stdout a terminal alone. Without a
 /// terminal for the output it is never on, and `--no-interactive` turns it
 /// off wherever it would be.
-pub fn wanted(args: &FollowArgs, stdin_is_terminal: bool, stdout_is_terminal: bool) -> bool {
+pub fn wanted(args: &OutputFlags, stdin_is_terminal: bool, stdout_is_terminal: bool) -> bool {
     !args.no_interactive && stdout_is_terminal && (stdin_is_terminal || args.interactive)
 }
 
@@ -64,6 +66,47 @@ pub struct Setup {
     pub template: Option<String>,
     /// The config file, which `:save` writes and `:load` reads.
     pub config_path: PathBuf,
+    /// The recording that `--record` started, if any.
+    pub recorder: Option<Recorder>,
+    /// Where a recording says that it has failed.
+    pub failures: Failures,
+}
+
+/// Where the records come from, and what can be asked of it.
+pub enum Source {
+    /// A session on a cluster, which is changed through its handle.
+    Live(SessionHandle),
+    /// A recording. Nothing can be asked of it: its source is the file. The
+    /// filter is applied here, to every record it plays.
+    Replay {
+        file: PathBuf,
+        filter: Option<Filter>,
+    },
+}
+
+/// The stream of records behind the interactive mode.
+enum Feed {
+    Live(Session),
+    Replay(Box<Recording>),
+}
+
+impl Feed {
+    fn source(&self, filter: &FilterState) -> Source {
+        match self {
+            Feed::Live(session) => Source::Live(session.handle()),
+            Feed::Replay(recording) => Source::Replay {
+                file: recording.path().to_path_buf(),
+                filter: filter.filter(),
+            },
+        }
+    }
+
+    async fn next(&mut self) -> Option<Played> {
+        match self {
+            Feed::Live(session) => session.next().await.map(Played::Record),
+            Feed::Replay(recording) => recording.next().await,
+        }
+    }
 }
 
 /// Whether to go on after a key.
@@ -74,16 +117,30 @@ pub enum Flow {
 }
 
 /// Follows a session with the keyboard at hand, until it is quit.
-pub async fn run(mut session: Session, setup: Setup) -> anyhow::Result<()> {
+pub async fn run(session: Session, setup: Setup) -> anyhow::Result<()> {
+    follow(Feed::Live(session), setup).await
+}
+
+/// Plays a recording with the keyboard at hand, to its end or until it is
+/// quit.
+pub async fn replay(recording: Recording, setup: Setup) -> anyhow::Result<()> {
+    follow(Feed::Replay(Box::new(recording)), setup).await
+}
+
+async fn follow(mut feed: Feed, setup: Setup) -> anyhow::Result<()> {
     // Raw mode is taken back when this is dropped: on every way out of
     // this function, and on a panic.
     let raw_mode = terminal::RawMode::enable()?;
     let mut keys = terminal::keys();
+    let source = feed.source(&setup.filter);
+    // A recording is a file, not a stream that goes on by itself: while
+    // the output is paused it is simply not read.
+    let waits_while_paused = matches!(feed, Feed::Replay(_));
     let mut console = Console::new(
         io::stdout(),
         terminal::width,
         setup,
-        session.handle(),
+        source,
         io::stderr().is_terminal(),
     );
 
@@ -101,10 +158,13 @@ pub async fn run(mut session: Session, setup: Setup) -> anyhow::Result<()> {
                 killed = true;
                 break;
             }
-            record = session.next() => match record {
-                Some(record) => console.record(record)?,
+            played = feed.next(), if !(waits_while_paused && console.is_paused()) => match played {
+                Some(Played::Record(record)) => console.record(record)?,
+                Some(Played::Unreadable(what)) => console.say_one(what)?,
+                // A session was stopped, or a recording is at its end.
                 None => break,
             },
+            Some(failure) = console.recording_failure() => console.recording_failed(failure)?,
             key = keys.recv(), if keys_open => match key {
                 Some(key) => {
                     if console.key(key)? == Flow::Quit {
@@ -119,8 +179,15 @@ pub async fn run(mut session: Session, setup: Setup) -> anyhow::Result<()> {
     // On every quit the session is kept as it is now, for `--last`.
     let last = console.last_session();
     let config_path = console.config_path.clone();
+    let recorder = console.recorder.take();
     console.leave()?;
     drop(raw_mode);
+    // The session goes, and its tap with it; then the last records of a
+    // recording reach the file.
+    drop(feed);
+    if let Some(recorder) = recorder {
+        recorder.finish();
+    }
     if let Some(session) = last
         && let Err(error) = Config::save_template(&config_path, LAST, &session)
     {
@@ -159,7 +226,7 @@ pub struct Console<W: Write> {
     printer: Printer,
     keyboard: Keyboard,
     filter: FilterState,
-    session: SessionHandle,
+    source: Source,
     /// The records that wait while the output is paused.
     waiting: PauseBuffer,
     paused: bool,
@@ -176,6 +243,9 @@ pub struct Console<W: Write> {
     config_path: PathBuf,
     /// The template whose overwriting waits for a `y` or an `n`.
     overwriting: Option<String>,
+    /// The recording that runs, if one does.
+    recorder: Option<Recorder>,
+    failures: Failures,
 }
 
 impl<W: Write> Console<W> {
@@ -183,17 +253,20 @@ impl<W: Write> Console<W> {
         out: W,
         width: impl Fn() -> usize + Send + 'static,
         mut setup: Setup,
-        session: SessionHandle,
+        source: Source,
         asides_on_screen: bool,
     ) -> Console<W> {
         let columns_at_start = setup.printer.text().map(|renderer| renderer.columns());
-        let cluster = session.spec().context.unwrap_or_default();
+        let cluster = match &source {
+            Source::Live(session) => session.spec().context.unwrap_or_default(),
+            Source::Replay { .. } => String::new(),
+        };
         Console {
             screen: Screen::new(out, width),
             printer: setup.printer,
             keyboard: Keyboard::default(),
             filter: setup.filter,
-            session,
+            source,
             waiting: PauseBuffer::new(setup.pause_buffer.unwrap_or(DEFAULT_PAUSE_BUFFER)),
             paused: false,
             columns_at_start,
@@ -202,12 +275,42 @@ impl<W: Write> Console<W> {
             template: setup.template,
             config_path: setup.config_path,
             overwriting: None,
+            recorder: setup.recorder,
+            failures: setup.failures,
         }
     }
 
+    /// Whether the output is paused.
+    pub fn is_paused(&self) -> bool {
+        self.paused
+    }
+
+    /// The next failure of a recording, when there is one.
+    pub async fn recording_failure(&mut self) -> Option<String> {
+        self.failures.rx.recv().await
+    }
+
+    /// A recording has stopped by itself: says so, and lets go of it.
+    pub fn recording_failed(&mut self, failure: String) -> anyhow::Result<()> {
+        self.recorder = None;
+        if let Source::Live(session) = &self.source {
+            session.set_tap(None);
+        }
+        self.say_one(failure)
+    }
+
     /// Takes a record of the stream: prints it, or keeps it while the
-    /// output is paused.
+    /// output is paused. A record of a recording is first held against the
+    /// filter; a session has done that itself.
     pub fn record(&mut self, record: Record) -> anyhow::Result<()> {
+        if let Source::Replay {
+            filter: Some(filter),
+            ..
+        } = &self.source
+            && !filter.accepts(&record)
+        {
+            return Ok(());
+        }
         if self.paused {
             self.waiting.push(record);
             self.show_status()
@@ -258,10 +361,21 @@ impl<W: Write> Console<W> {
             });
         }
         self.paused.then(|| {
-            let mut text = format!("paused · {} waiting", lines(self.waiting.len() as u64));
+            // A recording waits while it is paused, so nothing piles up.
+            let mut text = match &self.source {
+                Source::Live(_) => {
+                    format!("paused · {} waiting", lines(self.waiting.len() as u64))
+                }
+                Source::Replay { .. } => "paused".to_string(),
+            };
             if self.waiting.dropped() > 0 {
                 let dropped = with_thousands(self.waiting.dropped());
                 text.push_str(&format!(" · {dropped} dropped"));
+            }
+            // A recording left running fills the disk at the rate of the
+            // stream; here is how far it has come.
+            if let Some(recorder) = &self.recorder {
+                text.push_str(&format!(" · recording {}", recorder.size()));
             }
             Status::plain(text)
         })
@@ -301,7 +415,7 @@ impl<W: Write> Console<W> {
         self.print(&notices)
     }
 
-    fn say_one(&mut self, message: impl Into<String>) -> anyhow::Result<()> {
+    pub fn say_one(&mut self, message: impl Into<String>) -> anyhow::Result<()> {
         self.say(&[message.into()])
     }
 
@@ -350,26 +464,26 @@ impl<W: Write> Console<W> {
         match command {
             Command::Level(level) => {
                 self.filter.rules.set_level(level);
-                self.apply_filter();
+                self.apply_filter()?;
             }
             Command::Grep(text) => {
                 self.filter.rules.set_grep(text.as_deref());
-                self.apply_filter();
+                self.apply_filter()?;
             }
             Command::Match(regex) => match self.filter.rules.set_match(regex.as_deref()) {
-                Ok(()) => self.apply_filter(),
+                Ok(()) => self.apply_filter()?,
                 Err(error) => self.say_one(on_one_line(&format!("{error:#}")))?,
             },
             Command::Field {
                 key,
                 value: Some(value),
             } => match self.filter.rules.set_field(&key, &value) {
-                Ok(()) => self.apply_filter(),
+                Ok(()) => self.apply_filter()?,
                 Err(error) => self.say_one(on_one_line(&format!("{error:#}")))?,
             },
             Command::Field { key, value: None } => {
                 if self.filter.rules.remove_field(&key) {
-                    self.apply_filter();
+                    self.apply_filter()?;
                 } else {
                     self.say_one(format!("there is no rule on the field {key}"))?;
                 }
@@ -385,25 +499,39 @@ impl<W: Write> Console<W> {
             }
             Command::FilterOff => {
                 self.filter.clear();
-                self.apply_filter();
+                self.apply_filter()?;
             }
             // The session answers these with a notice of its own, when the
             // cluster has been asked.
             Command::Add(targets) => {
-                for target in targets {
-                    self.session.add_target(target);
+                if let Some(session) = self.session("add")? {
+                    for target in targets {
+                        session.add_target(target);
+                    }
                 }
             }
             Command::Drop(targets) => {
-                for target in targets {
-                    self.session.remove_target(target);
+                if let Some(session) = self.session("drop")? {
+                    for target in targets {
+                        session.remove_target(target);
+                    }
                 }
             }
-            Command::Events(events) => self.session.set_events(events),
-            Command::Container(container) => self.session.set_container(container),
+            Command::Events(events) => {
+                if let Some(session) = self.session("events")? {
+                    session.set_events(events);
+                }
+            }
+            Command::Container(container) => {
+                if let Some(session) = self.session("container")? {
+                    session.set_container(container);
+                }
+            }
             Command::Targets => {
-                let mut targets: Vec<String> = self
-                    .session
+                let Some(session) = self.session("targets")? else {
+                    return Ok(Flow::Continue);
+                };
+                let mut targets: Vec<String> = session
                     .targets()
                     .iter()
                     .map(|status| match status.pods {
@@ -435,14 +563,59 @@ impl<W: Write> Console<W> {
             Command::ShowColumns => self.set_columns(|columns, _| columns)?,
             Command::ColumnsDefault => self.set_columns(|_, at_start| at_start)?,
             Command::Columns(setting) => self.set_columns(|columns, _| setting.over(columns))?,
-            Command::Save(None) => match self.template.clone() {
-                Some(name) => self.save(&name)?,
-                // Without a template to write back to, the name is asked
-                // for: the command line opens again, to take it.
-                None => self.keyboard.open_with("save "),
-            },
-            Command::Save(Some(name)) => self.save_as(name)?,
-            Command::Load(name) => self.load(&name)?,
+            Command::Save(name) => {
+                if self.session("save")?.is_some() {
+                    match (name, self.template.clone()) {
+                        // A name that is given is asked about when a
+                        // template of that name is there.
+                        (Some(name), _) => self.save_as(name)?,
+                        // Alone, it writes back to the template the session
+                        // is, without a question: that is what it is for.
+                        (None, Some(name)) => self.save(&name)?,
+                        // Without a template to write back to, the name is
+                        // asked for: the command line opens again, to take
+                        // it.
+                        (None, None) => self.keyboard.open_with("save "),
+                    }
+                }
+            }
+            Command::Load(name) => {
+                if let Some(session) = self.session("load")? {
+                    self.load(&name, &session)?;
+                }
+            }
+            Command::RecordStatus => {
+                if self.session("record")?.is_some() {
+                    let status = match &self.recorder {
+                        Some(recorder) => recorder.describe(),
+                        None => "not recording".to_string(),
+                    };
+                    self.say_one(status)?;
+                }
+            }
+            Command::Record(file) => {
+                if let Some(session) = self.session("record")? {
+                    self.start_recording(&file, &session)?;
+                }
+            }
+            Command::RecordOff => {
+                if let Some(session) = self.session("record")? {
+                    let message = match self.recorder.take() {
+                        Some(recorder) => {
+                            // The tap goes, and the recording ends when the
+                            // records on their way to it are written.
+                            session.set_tap(None);
+                            format!(
+                                "the recording to {} has stopped, with {} since it started",
+                                recorder.path().display(),
+                                records_text(recorder.records())
+                            )
+                        }
+                        None => "not recording".to_string(),
+                    };
+                    self.say_one(message)?;
+                }
+            }
             Command::Templates => match self.config() {
                 Ok(config) if config.templates.is_empty() => self.say_one(format!(
                     "the config file {} holds no templates",
@@ -478,6 +651,44 @@ impl<W: Write> Console<W> {
         Ok(Flow::Continue)
     }
 
+    /// The session, for a command that asks something of it. A replay has
+    /// none: the command is refused with a notice, and nothing changes.
+    fn session(&mut self, command: &str) -> anyhow::Result<Option<SessionHandle>> {
+        let file = match &self.source {
+            Source::Live(session) => return Ok(Some(session.clone())),
+            Source::Replay { file, .. } => file.display().to_string(),
+        };
+        self.say_one(format!(
+            "`:{command}` is for a session on a cluster; this is a replay, and its source is the \
+             file {file}"
+        ))?;
+        Ok(None)
+    }
+
+    /// `:record <file>`: every record from here on goes to the file as
+    /// well, before the filter.
+    fn start_recording(
+        &mut self,
+        file: &std::path::Path,
+        session: &SessionHandle,
+    ) -> anyhow::Result<()> {
+        if let Some(recorder) = &self.recorder {
+            let message = format!(
+                "already recording to {}; `:record off` stops it",
+                recorder.path().display()
+            );
+            return self.say_one(message);
+        }
+        match Recorder::start(file, self.failures.tx.clone()) {
+            Ok((recorder, tap)) => {
+                session.set_tap(Some(tap));
+                self.recorder = Some(recorder);
+                self.say_one(format!("recording to {}", file.display()))
+            }
+            Err(error) => self.say_one(format!("cannot record to {}: {error}", file.display())),
+        }
+    }
+
     /// The config file as it is on disk right now; another terminal may
     /// have written to it since this one started.
     fn config(&self) -> Result<Config, ConfigError> {
@@ -489,8 +700,8 @@ impl<W: Write> Console<W> {
 
     /// The session as it is now, as a template holds it: what the session
     /// follows, with the fields and the columns of the output.
-    fn session_spec(&mut self) -> SessionSpec {
-        let mut spec = self.session.spec();
+    fn session_spec(&mut self, session: &SessionHandle) -> SessionSpec {
+        let mut spec = session.spec();
         // The filter as it was last asked for; the session has the same,
         // unless the change is still on its way to it.
         spec.filter = self.filter.filter();
@@ -511,7 +722,11 @@ impl<W: Write> Console<W> {
     /// The session as it is when the program quits, to be kept for
     /// `--last`. None when nothing is followed: there is nothing to resume.
     pub fn last_session(&mut self) -> Option<SessionSpec> {
-        let spec = self.session_spec();
+        let Source::Live(session) = &self.source else {
+            // A replay is no session to resume.
+            return None;
+        };
+        let spec = self.session_spec(&session.clone());
         (!spec.targets.is_empty()).then_some(spec)
     }
 
@@ -553,7 +768,10 @@ impl<W: Write> Console<W> {
     }
 
     fn save(&mut self, name: &str) -> anyhow::Result<()> {
-        let spec = self.session_spec();
+        let Source::Live(session) = &self.source else {
+            return Ok(());
+        };
+        let spec = self.session_spec(&session.clone());
         match Config::save_template(&self.config_path, name, &spec) {
             Ok(()) => {
                 self.template = Some(name.to_string());
@@ -570,7 +788,7 @@ impl<W: Write> Console<W> {
     /// the session follows changes through its handle; the filter, the
     /// fields and the columns of the template take the place of what the
     /// flags and the commands had made of them.
-    fn load(&mut self, name: &str) -> anyhow::Result<()> {
+    fn load(&mut self, name: &str, session: &SessionHandle) -> anyhow::Result<()> {
         let config = match self.config() {
             Ok(config) => config,
             Err(error) => return self.say_one(error.to_string()),
@@ -613,18 +831,30 @@ impl<W: Write> Console<W> {
         self.template = (name != LAST).then(|| name.to_string());
         self.say_one(format!("loading the template {name}"))?;
         // The session answers when the cluster has been asked.
-        self.session.load(spec);
+        session.load(spec);
         Ok(())
     }
 
     /// Hands the filter as it is now to the session, which answers with a
     /// notice, and applies it to what waits while the output is paused.
-    fn apply_filter(&mut self) {
+    fn apply_filter(&mut self) -> anyhow::Result<()> {
         let filter = self.filter.filter();
         if self.paused {
             self.waiting.narrow(filter.as_ref());
         }
-        self.session.set_filter(filter);
+        match &mut self.source {
+            Source::Live(session) => session.set_filter(filter),
+            Source::Replay { filter: shown, .. } => {
+                // What a session would have answered.
+                let answer = match &filter {
+                    Some(filter) => format!("filter: {filter}"),
+                    None => "filter off".to_string(),
+                };
+                *shown = filter;
+                self.say_one(answer)?;
+            }
+        }
+        Ok(())
     }
 
     /// Changes the columns of the text output, from the columns as they

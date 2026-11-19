@@ -27,4 +27,4 @@ unicode-width.workspace = true
 [dev-dependencies]
 gossip-core = { workspace = true, features = ["testing"] }
 
-tokio = { workspace = true, features = ["io-util", "process"] }
+tokio = { workspace = true, features = ["io-util", "process", "test-util"] }

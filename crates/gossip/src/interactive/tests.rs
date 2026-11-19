@@ -10,7 +10,7 @@ use chrono::{DateTime, TimeDelta, TimeZone, Utc};
 use gossip_core::testing::{
     FakeCluster, deployments, owner, pod_object, pods, replica_sets, workload_object,
 };
-use gossip_core::{Columns, Config, Filter, Level, Session, SessionOptions, Target};
+use gossip_core::{Columns, Config, Filter, Level, Record, Session, SessionOptions, Target};
 use tokio::time::timeout;
 
 use super::screen::testing::Tape;
@@ -124,8 +124,11 @@ impl Run {
             pause_buffer,
             template: None,
             config_path: config_path.clone(),
+            recorder: None,
+            failures: Failures::new(),
         };
-        let console = Console::new(tape.clone(), || 80, setup, session.handle(), true);
+        let source = Source::Live(session.handle());
+        let console = Console::new(tape.clone(), || 80, setup, source, true);
         Run {
             fake,
             session,
@@ -1078,6 +1081,10 @@ async fn save_alone_without_a_template_asks_for_a_name() {
     run.command("save");
     assert_eq!(run.status(), "");
     assert_eq!(run.config().templates["mine"].events, Some(true));
+    // With its name spelt out it is a template that is there, and asked about.
+    run.command("save mine");
+    assert_eq!(run.status(), "overwrite the template mine? y/n");
+    run.press(Key::Esc);
 
     // `Esc` instead of a name saves nothing.
     let mut other = Run::start().await;
@@ -1287,6 +1294,372 @@ async fn the_session_as_it_is_at_the_end_is_what_is_kept_for_last() {
     assert_eq!(run.console.last_session(), None);
 }
 
+// ---- recording ---------------------------------------------------------------------
+
+/// A file of its own for one recording.
+fn recording_file(test: &str) -> PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "gossip-console-{}-{test}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    path
+}
+
+/// The records a recording holds, once it has this many lines.
+async fn recorded(path: &std::path::Path, count: usize) -> Vec<Record> {
+    for _ in 0..500 {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        if text.lines().count() >= count && text.ends_with('\n') {
+            return text
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("every line is a record"))
+                .collect();
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!(
+        "the recording never came to {count} lines: {:?}",
+        std::fs::read_to_string(path)
+    );
+}
+
+#[tokio::test]
+async fn record_writes_every_record_to_a_file_also_what_the_filter_hides() {
+    let mut run = Run::start().await;
+    let file = recording_file("record");
+    run.command("level warn");
+    run.pump(1).await;
+
+    run.command("record");
+    run.command(&format!("record {}", file.display()));
+    assert_eq!(
+        run.lines()[1..],
+        [
+            "-- not recording".to_string(),
+            format!("-- recording to {}", file.display()),
+            String::new()
+        ]
+    );
+    run.log(0, "INFO hidden by the filter");
+    run.log(100, "WARN shown");
+    run.pump(1).await;
+    // On the screen the filter still applies; the recording holds more.
+    assert_eq!(run.lines()[3], "WARN shown");
+    let records = recorded(&file, 2).await;
+    let messages: Vec<&str> = records
+        .iter()
+        .map(|record| record.message.as_str())
+        .collect();
+    assert_eq!(messages, ["INFO hidden by the filter", "WARN shown"]);
+    // Each is the whole record.
+    assert_eq!(records[0].pod, API_POD);
+    assert_eq!(records[0].container.as_deref(), Some("api"));
+    assert_eq!(records[0].level, Some(Level::Info));
+    assert_eq!(records[0].time, at(0));
+    assert_eq!(records[0].raw, "INFO hidden by the filter");
+
+    // Alone, the command says that one runs and how much it holds.
+    run.command("record");
+    let lines = run.lines();
+    assert!(
+        lines[4].starts_with(&format!(
+            "-- recording to {}: 2 records since it started, ",
+            file.display()
+        )),
+        "{}",
+        lines[4]
+    );
+    assert!(lines[4].ends_with(" in the file"), "{}", lines[4]);
+    // One at a time.
+    run.command("record /tmp/another.jsonl");
+    assert_eq!(
+        run.lines()[5],
+        format!(
+            "-- already recording to {}; `:record off` stops it",
+            file.display()
+        )
+    );
+
+    // While it runs, the status line of the pause shows its size.
+    run.press(Key::Char(' '));
+    assert!(
+        run.status()
+            .starts_with("paused · 0 lines waiting · recording "),
+        "{}",
+        run.status()
+    );
+    // Pausing the output does not pause the recording.
+    run.log(1_000, "WARN while paused");
+    run.pump(1).await;
+    assert_eq!(recorded(&file, 3).await[2].message, "WARN while paused");
+    run.press(Key::Char(' '));
+
+    run.command("record off");
+    let lines = run.lines();
+    assert_eq!(
+        lines[lines.len() - 2],
+        format!(
+            "-- the recording to {} has stopped, with 3 records since it started",
+            file.display()
+        )
+    );
+    run.log(2_000, "WARN after the recording");
+    run.pump(1).await;
+    run.expect_quiet().await;
+    assert_eq!(recorded(&file, 3).await.len(), 3);
+    run.command("record off");
+    run.command("record");
+    let lines = run.lines();
+    assert_eq!(
+        lines[lines.len() - 3..],
+        ["-- not recording", "-- not recording", ""]
+    );
+    std::fs::remove_file(&file).unwrap();
+}
+
+#[tokio::test]
+async fn a_file_that_cannot_be_recorded_to_says_so_and_nothing_runs() {
+    let mut run = Run::start().await;
+    run.command("record /no/such/directory/api.jsonl");
+    let lines = run.lines();
+    assert!(
+        lines[0].starts_with("-- cannot record to /no/such/directory/api.jsonl: "),
+        "{lines:?}"
+    );
+    run.command("record");
+    assert_eq!(run.lines()[1], "-- not recording");
+}
+
+#[tokio::test]
+async fn a_recording_that_stops_by_itself_is_let_go_with_a_notice() {
+    let mut run = Run::start().await;
+    let file = recording_file("failed");
+    run.command(&format!("record {}", file.display()));
+    // As when the disk is full: the writer reports it, and the loop hands
+    // it to the console.
+    run.console
+        .recording_failed(format!(
+            "the recording to {} has stopped: no space left on device",
+            file.display()
+        ))
+        .unwrap();
+    run.command("record");
+    assert_eq!(
+        run.lines()[1..],
+        [
+            format!(
+                "-- the recording to {} has stopped: no space left on device",
+                file.display()
+            ),
+            "-- not recording".to_string(),
+            String::new()
+        ]
+    );
+    // The stream goes on.
+    run.log(0, "one");
+    run.pump(1).await;
+    assert_eq!(run.lines()[3], "one");
+    let _ = std::fs::remove_file(&file);
+}
+
+// ---- replay ------------------------------------------------------------------------
+
+/// A console in front of a recording: no session, no cluster.
+fn replaying(filter: FilterState) -> (Console<Tape>, Tape) {
+    let tape = Tape::default();
+    let source = Source::Replay {
+        file: PathBuf::from("api.jsonl"),
+        filter: filter.filter(),
+    };
+    let setup = Setup {
+        printer: Printer::text_with(bare()),
+        filter,
+        pause_buffer: None,
+        template: None,
+        config_path: PathBuf::from("/no/such/gossip.toml"),
+        recorder: None,
+        failures: Failures::new(),
+    };
+    (Console::new(tape.clone(), || 80, setup, source, true), tape)
+}
+
+/// A record as a recording holds it.
+fn played(millis: i64, level: Level, message: &str) -> Record {
+    let mut record = Record::notice("aks-vulcan-01", NS, API_POD, None, at(millis), message);
+    record.kind = gossip_core::Kind::Line;
+    record.container = Some("api".to_string());
+    record.level = Some(level);
+    record
+}
+
+fn enter(console: &mut Console<Tape>, line: &str) -> Flow {
+    console.key(Key::Char(':')).unwrap();
+    for character in line.chars() {
+        console.key(Key::Char(character)).unwrap();
+    }
+    console.key(Key::Enter).unwrap()
+}
+
+#[test]
+fn the_filter_commands_work_on_a_replay_from_the_next_record_on() {
+    let (mut console, tape) = replaying(FilterState::default());
+    console.record(played(0, Level::Info, "one")).unwrap();
+
+    // The console answers as a session would have.
+    enter(&mut console, "level warn");
+    console.record(played(100, Level::Info, "two")).unwrap();
+    console.record(played(200, Level::Warn, "three")).unwrap();
+    enter(&mut console, "grep four");
+    console
+        .record(played(300, Level::Warn, "three again"))
+        .unwrap();
+    console.record(played(400, Level::Error, "four")).unwrap();
+    enter(&mut console, "field tenant_id=t_1");
+    console
+        .record(played(500, Level::Error, "four, without the field"))
+        .unwrap();
+    enter(&mut console, "filter off");
+    console.record(played(600, Level::Info, "five")).unwrap();
+    assert_eq!(
+        tape.lines(),
+        [
+            "one",
+            "-- filter: (kind == event or level >= warn)",
+            "three",
+            "-- filter: (kind == event or (level >= warn and message contains four))",
+            "four",
+            "-- filter: (kind == event or (level >= warn and message contains four and \
+             f.tenant_id == t_1))",
+            "-- filter off",
+            "five",
+            ""
+        ]
+    );
+}
+
+#[test]
+fn a_replay_starts_with_the_filter_of_its_flags() {
+    // As after `gossip replay api.jsonl --level warn`.
+    let mut rules = LineRules::default();
+    rules.set_level(Some(Level::Warn));
+    let (mut console, tape) = replaying(FilterState { base: None, rules });
+    console.record(played(0, Level::Info, "one")).unwrap();
+    console.record(played(100, Level::Warn, "two")).unwrap();
+    // A record without a level passes, as it does live.
+    let mut plain = played(200, Level::Info, "three");
+    plain.level = None;
+    console.record(plain).unwrap();
+    // A command replaces the rule of the flag.
+    enter(&mut console, "level error");
+    console.record(played(300, Level::Warn, "four")).unwrap();
+    assert_eq!(
+        tape.lines(),
+        [
+            "two",
+            "three",
+            "-- filter: (kind == event or level >= error)",
+            ""
+        ]
+    );
+}
+
+#[test]
+fn what_asks_something_of_a_cluster_is_refused_in_a_replay() {
+    let (mut console, tape) = replaying(FilterState::default());
+    for (line, command) in [
+        ("add fc-stg/fc-web-api", "add"),
+        ("drop fc-stg/fc-api", "drop"),
+        ("targets", "targets"),
+        ("events off", "events"),
+        ("container api", "container"),
+        ("save dev-api", "save"),
+        ("save", "save"),
+        ("load web", "load"),
+        ("record other.jsonl", "record"),
+        ("record", "record"),
+        ("record off", "record"),
+    ] {
+        let before = tape.lines().len();
+        assert_eq!(enter(&mut console, line), Flow::Continue, "{line}");
+        let lines = tape.lines();
+        assert_eq!(lines.len(), before + 1, "{line}: {lines:?}");
+        assert_eq!(
+            lines[before - 1],
+            format!(
+                "-- `:{command}` is for a session on a cluster; this is a replay, and its source \
+                 is the file api.jsonl"
+            ),
+            "{line}"
+        );
+    }
+    // Nothing is kept for `--last` either: a replay is no session to resume.
+    assert_eq!(console.last_session(), None);
+    assert_eq!(tape.terminal().last_line(), "");
+}
+
+#[test]
+fn the_rest_of_the_interactive_mode_works_on_a_replay() {
+    let (mut console, tape) = replaying(FilterState::default());
+    console.record(played(0, Level::Info, "one")).unwrap();
+
+    // The fields, the columns, help, clear and quit.
+    enter(&mut console, "columns level=5");
+    console.record(played(100, Level::Warn, "two")).unwrap();
+    assert_eq!(
+        tape.lines()[1..],
+        [
+            "-- columns: time=0:none,pod=0:middle,container=0:end,level=5:end",
+            "WARN  two",
+            ""
+        ]
+    );
+    console.key(Key::Ctrl('l')).unwrap();
+    assert_eq!(tape.lines(), [""]);
+    console.key(Key::Char('?')).unwrap();
+    assert_eq!(tape.lines().len(), command::HELP.len() + 1);
+    assert_eq!(console.key(Key::Char('q')).unwrap(), Flow::Quit);
+    assert_eq!(enter(&mut console, "q"), Flow::Quit);
+
+    // Space pauses: a recording is not read on while paused, so nothing
+    // waits and nothing is dropped. The loop asks whether it is paused.
+    assert!(!console.is_paused());
+    console.key(Key::Char(' ')).unwrap();
+    assert!(console.is_paused());
+    assert_eq!(tape.terminal().last_line(), "paused");
+    // One can pause, narrow and resume.
+    enter(&mut console, "level error");
+    assert_eq!(tape.terminal().last_line(), "paused");
+    console.key(Key::Char(' ')).unwrap();
+    assert!(!console.is_paused());
+    console.record(played(200, Level::Warn, "three")).unwrap();
+    console.record(played(300, Level::Error, "four")).unwrap();
+    let lines = tape.lines();
+    assert_eq!(
+        lines[lines.len() - 3..],
+        [
+            "-- filter: (kind == event or level >= error)",
+            "ERROR four",
+            ""
+        ]
+    );
+}
+
+#[test]
+fn a_line_of_a_recording_that_is_no_record_is_said_as_a_notice() {
+    let (mut console, tape) = replaying(FilterState::default());
+    console
+        .say_one("line 2 of the recording api.jsonl is not a record: expected value at line 1")
+        .unwrap();
+    assert_eq!(
+        tape.lines(),
+        [
+            "-- line 2 of the recording api.jsonl is not a record: expected value at line 1",
+            ""
+        ]
+    );
+}
+
 // ---- when it is on ---------------------------------------------------------------
 
 #[test]
@@ -1298,7 +1671,7 @@ fn the_interactive_mode_is_on_only_with_a_terminal_on_both_sides() {
     let args = |flags: &[&str]| {
         let cli = Cli::try_parse_from(["gossip", "follow", "fc-stg"].iter().chain(flags)).unwrap();
         match cli.command {
-            Command::Follow(args) => *args,
+            Command::Follow(args) => args.output,
             other => panic!("expected the follow command, got {other:?}"),
         }
     };
