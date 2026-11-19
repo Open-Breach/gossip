@@ -53,6 +53,17 @@ fn the_licences_are_collected_for_the_targets_that_are_built() {
 }
 
 #[test]
+fn the_licences_are_those_of_the_crate_of_the_binary() {
+    // Not of the workspace: a crate that is in the workspace and not in
+    // the binary has no place in the archive's list.
+    let workflow = read(".github/workflows/release.yml");
+    assert!(workflow.contains(
+        "cargo about generate --manifest-path crates/gossip/Cargo.toml -c about.toml about.hbs"
+    ));
+    assert_eq!(workflow.matches("cargo about generate").count(), 1);
+}
+
+#[test]
 fn only_the_release_job_may_write_to_the_repository() {
     let workflow = read(".github/workflows/release.yml");
     // Read-only for the workflow, and one job that asks for more.
