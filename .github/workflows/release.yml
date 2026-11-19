@@ -50,7 +50,9 @@ jobs:
 
   # The licence texts of every crate compiled into the binary, for the
   # archives. about.toml lists the four targets, so one run covers them all;
-  # it fails when a crate has a licence about.toml does not accept.
+  # it fails when a crate has a licence about.toml does not accept. The
+  # crate of the binary is named, so that no other crate of the workspace
+  # and nothing only it needs gets into the list.
   licenses:
     name: third-party licences
     needs: check
@@ -62,8 +64,8 @@ jobs:
         run: rustup toolchain install || rustup show active-toolchain
       - uses: taiki-e/install-action@v2
         with: { tool: cargo-about }
-      - run: cargo about generate about.hbs -o THIRD-PARTY-LICENSES.html
-      - uses: actions/upload-artifact@v4
+      - run: cargo about generate --manifest-path crates/gossip/Cargo.toml -c about.toml about.hbs -o THIRD-PARTY-LICENSES.html
+      - uses: actions/upload-artifact@v7
         with:
           name: third-party-licenses
           path: THIRD-PARTY-LICENSES.html
@@ -90,6 +92,11 @@ jobs:
       CC_x86_64_unknown_linux_musl: musl-gcc
       CC_aarch64_unknown_linux_musl: musl-gcc
     steps:
+      # README.md and LICENSE go into the archive as the repository has
+      # them, byte for byte, on Windows too.
+      - name: no conversion of line ends
+        if: runner.os == 'Windows'
+        run: git config --global core.autocrlf false
       - uses: actions/checkout@v5
       - name: the toolchain of rust-toolchain.toml, and the target
         shell: bash
@@ -113,7 +120,7 @@ jobs:
       - name: build
         shell: bash
         run: GOSSIP_VERSION="$VERSION" cargo build --release --locked -p gossip --target "${{ matrix.target }}"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with: { name: third-party-licenses }
       # One top-level folder named like the archive: the binary, README.md
       # and LICENSE of this commit, and the third-party licences. Beside the
@@ -153,7 +160,7 @@ jobs:
           fi
           cat "$archive.sha256"
           rm -r "$NAME"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: archive-${{ matrix.platform }}
           path: dist/
@@ -175,7 +182,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with: { name: "archive-${{ matrix.platform }}", path: dist }
       - name: smoke test
         shell: bash
@@ -287,7 +294,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with: { pattern: "archive-*", path: dist, merge-multiple: true }
       # The checksums of the builds merged into one file, sorted by file
       # name, in the format `sha256sum -c` reads.
@@ -315,6 +322,14 @@ jobs:
               wanted="$name/ $name/LICENSE $name/README.md $name/THIRD-PARTY-LICENSES.html $name/gossip "
             fi
             test "$listed" = "$wanted" || { echo "$name holds: $listed"; echo "expected: $wanted"; exit 1; }
+          done
+          # README.md, LICENSE and the licences are the same files in all
+          # four: none was changed on its way through a platform.
+          for file in README.md LICENSE THIRD-PARTY-LICENSES.html; do
+            sums="$(for platform in linux-arm64 linux-x64 macos-arm64; do
+              tar xzOf "gossip-$version-$platform.tar.gz" "gossip-$version-$platform/$file" | sha256sum
+            done; unzip -p "gossip-$version-windows-x64.zip" "gossip-$version-windows-x64/$file" | sha256sum)"
+            test "$(printf '%s\n' "$sums" | sort -u | wc -l)" -eq 1 || { echo "$file differs between the archives:"; echo "$sums"; exit 1; }
           done
       # Title: the tag. Body: GitHub's generated notes since the previous
       # tag. A draft when run by hand, a pre-release for a tag with a suffix.
