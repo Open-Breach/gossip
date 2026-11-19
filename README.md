@@ -10,11 +10,11 @@ gossip follow flowcpt/flowcpt-api
 ```
 
 ```
-14:02:11.482 7d9f-xk2p1           api         WARN  tenant_id=t_123 request_id=8b1c  payment intent expired
-14:02:11.490 7d9f-xk2p1           💀                Killing: Container api failed liveness probe, will be restarted
-14:02:12.007 7d9f-m4q8z           api         INFO  tenant_id=t_456 request_id=8b1d  request done
-14:02:13.004 7d9f-xk2p1           🚀                Started: Started container api
-14:02:13.210 7d9f-xk2p1           api         INFO  version=0.14.2  starting
+14:02:11.482 flowcpt-api…xk2p1    api         WARN  tenant_id=t_123 request_id=8b1c  payment intent expired
+14:02:11.490 flowcpt-api…xk2p1    💀                Killing: Container api failed liveness probe, will be restarted
+14:02:12.007 flowcpt-api…m4q8z    api         INFO  tenant_id=t_456 request_id=8b1d  request done
+14:02:13.004 flowcpt-api…xk2p1    🚀                Started: Started container api
+14:02:13.210 flowcpt-api…xk2p1    api         INFO  version=0.14.2  starting
 ```
 
 On a terminal the stream can be changed while it runs: `Space` pauses it,
@@ -157,7 +157,6 @@ Gossip keeps watching until something matches.
 | `--match <regex>` | only lines whose message matches the regular expression | none |
 | `--field <key=value>` | only lines whose field has the value; repeatable | none |
 | `--fields <a,b,c>` | show only these fields of a line, in this order; `all` shows every field | the request's fields first, the rest by name, the noisy ones hidden: see [Output](#output) |
-| `--long-names` | keep pod names whole | shortened when every pod is a deployment's |
 | `--columns <columns>` | the widths of the columns and the side a longer value is cut on: `pod=24:middle,container=8`; see [Columns](#columns) | `time=12:none,pod=20:middle,container=10:end,level=5:end` |
 | `--no-emoji` | mark events with `EVNT` instead of an emoji | emoji when stdout is a terminal and the locale is UTF-8 |
 | `--output text\|json` | the rendering | `text` |
@@ -285,20 +284,25 @@ fixed width, measured in terminal cells; an emoji counts two.
 | Column | Width | Cut | Holds |
 | --- | --- | --- | --- |
 | `time` | 12 | `none` | `HH:MM:SS.mmm`, local zone |
-| `pod` | 20 | `middle` | the pod name, or what an event is about, as in `deployment/fc-api` |
+| `pod` | 20 | `middle` | the full pod name, or what an event is about, as in `deployment/fc-api` |
 | `container` | 10 | `end` | the container name; the emoji or `EVNT` for an event |
 | `level` | 5 | `end` | `TRACE` to `ERROR`; empty for events |
 
 A value shorter than its column is padded. A longer one is cut, and `…`
 marks the cut: `start` keeps the end (`…9c7-vxfgs`), `end` keeps the start
-(`fc-api-7f698…`), `middle` keeps both ends. Cut in the middle, the name of a
-deployment's pod keeps the workload and the pod suffix and loses the hash of
-the replica set: `fc-api-7f698fb95f-vxfgs` is `fc-api…vxfgs`. With `none` a
-value is never cut and pushes the rest of the line to the right. A width of
-`0` hides the column, and the message moves left.
+(`fc-api-7f698…`), `middle` keeps both ends. With `none` a value is never
+cut and pushes the rest of the line to the right. A width of `0` hides the
+column, and the message moves left.
+
+The pod column always gets the full name of the pod. Cut in the middle, the
+name of a deployment's pod keeps the workload and the pod suffix and loses
+the hash of the replica set: `fc-api-7f698fb95f-vxfgs` is `fc-api…vxfgs` in
+the 20 cells of the column, and whole in 40. The beginning of the name says
+which workload it is, the end which pod; the hash between them is the part
+nobody needs.
 
 ```bash
-gossip follow fc-stg/fc-api --long-names --columns pod=40
+gossip follow fc-stg/fc-api --columns pod=40
 ```
 
 ```bash
@@ -308,10 +312,7 @@ gossip follow fc-stg/fc-api --columns pod=0,container=6
 `pod=:start` changes the side and leaves the width. The columns come, part by
 part, from the `--columns` flag, then the `columns` of a template, then the
 `[columns]` table of the [config file](#config-file-and-templates), then the
-widths above. Pod names are still shortened to the hash of the replica set
-and the pod suffix while every pod followed is a deployment's, so such a name
-fits its column as it is; `--long-names` keeps names whole, and then the cut
-applies.
+widths above.
 
 #### Keys and commands
 
@@ -436,8 +437,7 @@ Replay plays a recording through the same output as `follow`: every line
 renders exactly as it did live. It takes the filter flags of `follow`
 (`--level`, `--grep`, `--match`, `--field`, `--no-filter`) and its output
 flags (`--fields`, `--columns`, `--output`, `--raw`, `--no-color`,
-`--long-names`, `--no-emoji`, `--interactive`, `--no-interactive`), and
-these of its own:
+`--no-emoji`, `--interactive`, `--no-interactive`), and these of its own:
 
 | Flag | Meaning | Default |
 | --- | --- | --- |
