@@ -572,7 +572,7 @@ impl Driver {
                     notice.namespace,
                     notice.pod.unwrap_or_default(),
                     None,
-                    Utc::now(),
+                    crate::clock::now(),
                     notice.message,
                 );
                 self.buffer.push(record, Instant::now().into_std());
@@ -744,7 +744,7 @@ impl Driver {
                 namespace,
                 pod,
                 None,
-                Utc::now(),
+                crate::clock::now(),
                 format!("pod {pod} is no longer selected by a target"),
             );
             self.buffer.push(record, Instant::now().into_std());
@@ -796,7 +796,14 @@ impl Driver {
 
     /// A notice of the session itself, in the stream like any other.
     fn say(&mut self, message: String) {
-        let record = Record::notice(self.cluster.name(), "", "", None, Utc::now(), message);
+        let record = Record::notice(
+            self.cluster.name(),
+            "",
+            "",
+            None,
+            crate::clock::now(),
+            message,
+        );
         self.buffer.push(record, Instant::now().into_std());
     }
 
@@ -830,7 +837,7 @@ const CHANGE_TOLERANCE: Duration = Duration::from_secs(5);
 /// The time a history that reaches this far back starts at. Many events
 /// carry their time in whole seconds, so it is a whole second too.
 fn history_start(back: Duration) -> DateTime<Utc> {
-    let start = Utc::now() - TimeDelta::from_std(back).unwrap_or_default();
+    let start = crate::clock::now() - TimeDelta::from_std(back).unwrap_or_default();
     DateTime::from_timestamp(start.timestamp(), 0).unwrap_or(start)
 }
 

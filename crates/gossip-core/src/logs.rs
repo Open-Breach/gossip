@@ -248,7 +248,7 @@ impl Follower {
                 // whether or not a line of it arrives.
                 let since = self.context.history.since.unwrap_or_default();
                 let back = TimeDelta::from_std(since).unwrap_or_default() + CLOCK_TOLERANCE;
-                self.floor = Some(Utc::now() - back);
+                self.floor = Some(crate::clock::now() - back);
             }
 
             match self.read(stream, Reading::Current).await? {
@@ -280,7 +280,7 @@ impl Follower {
                 // A connection can die without a word, and a log stream
                 // never writes, so silence is all there is to go by. Open
                 // the stream again; if it was alive this changes nothing.
-                End::Idle => self.stalled_at = Some(Utc::now()),
+                End::Idle => self.stalled_at = Some(crate::clock::now()),
             }
         }
     }
@@ -590,7 +590,7 @@ impl Follower {
             self.id.namespace.clone(),
             self.id.pod.clone(),
             Some(self.id.container.clone()),
-            Utc::now(),
+            crate::clock::now(),
             message,
         );
         self.context.records.send(record).await.map_err(|_| Gone)

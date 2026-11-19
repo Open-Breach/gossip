@@ -27,7 +27,6 @@ mod terminal;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 
-use chrono::Utc;
 use gossip_core::save::LAST;
 use gossip_core::{
     Columns, ColumnsSetting, Config, ConfigError, DEFAULT_PAUSE_BUFFER, Filter, Record, Session,
@@ -407,7 +406,7 @@ impl<W: Write> Console<W> {
     /// the core has no part in. It is printed at once, paused or not, since
     /// it is what was just asked for.
     fn say(&mut self, messages: &[String]) -> anyhow::Result<()> {
-        let now = Utc::now();
+        let now = gossip_core::clock::now();
         let notices: Vec<Record> = messages
             .iter()
             .map(|message| Record::notice(&self.cluster, "", "", None, now, message))

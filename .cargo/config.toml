@@ -1,0 +1,4 @@
+[alias]
+# `cargo xtask readme`: rewrite the generated parts of README.md
+# (crates/xtask, SPEC-release.md 4.5).
+xtask = "run --quiet -p xtask --"
