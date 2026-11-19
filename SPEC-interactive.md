@@ -23,7 +23,7 @@ Not in scope, unchanged from `SPEC.md`:
 - Output to a pipe or a file. Without a terminal, `gossip follow` behaves exactly as today; none of this activates.
 - The GUI, several clusters at once, scrolling back through history, search in what has already been printed. A terminal's own scrollback and `less` stay the tools for that.
 
-The rule for the whole round: a session nobody touches behaves as it does today, line for line, except for the column widths of section 5.
+The rule for the whole round: a session nobody touches behaves as it does today, line for line, except for the columns of section 5.
 
 ## 2. Core: the mutable session
 
@@ -112,11 +112,12 @@ Today the pod column is padded to the longest name seen, so every line carries a
 | Column | Default width | Default cut | Holds |
 | --- | --- | --- | --- |
 | time | 12 | none | `HH:MM:SS.mmm`, local zone |
-| pod | 20 | middle | the pod name, shortened as SPEC 5.3 says, or `replicaset/...` for an event on a workload |
+| pod | 20 | middle | the full pod name, or `replicaset/...` for an event on a workload |
 | container | 10 | end | the container name; the emoji or `EVNT` for an event |
 | level | 5 | end | `TRACE` to `ERROR`; empty for events and notices |
 
 - A value longer than its column is cut and an ellipsis `…` (one cell) marks the cut: `start` keeps the end (`…9c7-vxfgs`), `end` keeps the start (`fc-api-7f698…`), `middle` keeps both ends and drops the middle (`fc-api…vxfgs`), which for a pod name keeps the workload and the pod suffix and drops the replica-set hash.
+- The pod column always gets the full name of the pod, cut by the column's rule. The rule of the prototype that shortened a name to the replica-set hash and the pod suffix while every followed pod belonged to a deployment is dropped, and `--long-names` with it: the beginning of the name says which workload it is, the end which pod, and the hash in the middle is the part nobody needs. So `fc-api-7f698fb95f-vxfgs` shows as `fc-api…vxfgs` in 20 cells and whole in 40.
 - A value shorter than its column is padded to it. Width `0` hides the column.
 - With `--no-emoji`, `--no-color`, or no terminal, the same widths apply, with `EVNT` in the container column.
 - Configuration: a `[columns]` table in the config file, each entry `width` and `cut`, and a `--columns pod=24:middle,container=8` flag and `:columns` command with the same syntax for one run. A template may carry a `columns` table too.
@@ -128,7 +129,7 @@ container = { width = 10, cut = "end" }
 level = { width = 5 }
 ```
 
-- The widths are in terminal cells, not bytes: an emoji counts two, and the measurement uses the same width table as the fallback rule of SPEC 5.3. This is the one change that alters today's output without anyone pressing a key, and it is intended.
+- The widths are in terminal cells, not bytes: an emoji counts two, and the measurement uses the same width table as the fallback rule of SPEC 5.3. The fixed widths, and the full pod name cut in the middle in place of the shortened one, are the one change that alters today's output without anyone pressing a key, and it is intended.
 
 ## 6. Templates from inside
 
@@ -149,12 +150,12 @@ A saved session is a template: targets, filter, container, events, since, tail, 
 
 ## 7. Acceptance
 
-1. `gossip follow fc-stg/fc-api | cat` and `gossip follow ... > file` produce exactly what the prototype produces, apart from the column widths of section 5.
+1. `gossip follow fc-stg/fc-api | cat` and `gossip follow ... > file` produce exactly what the prototype produces, apart from the columns of section 5.
 2. On a terminal, `:level warn` while following hides the info lines from the next record on, with one notice; `:level off` brings them back.
 3. `:add fc-stg/fc-web-api` while following `fc-stg/fc-api` brings the second deployment's lines in without a restart; `:drop fc-stg/fc-api` stops the first and its pods' events; `:targets` shows the result.
 4. `Space` during a burst stops the scrolling; the status line counts; `Space` again prints the waiting lines in order, then live ones, with no gap and no repeat. With `pause_buffer = 100` and 150 lines arriving, resume shows 100 and one notice about 50 dropped.
 5. `Ctrl-L` clears the screen and the next line arrives at the top.
-6. Pod `fc-api-7f698fb95f-vxfgs` renders as `fc-api…vxfgs` in a 20-cell pod column; `--columns pod=40` shows it whole; `--columns pod=0` hides the column and the message moves left.
+6. `gossip follow fc-stg/fc-api`, with no other flag and although every followed pod belongs to a deployment, renders pod `fc-api-7f698fb95f-vxfgs` as `fc-api…vxfgs` in the 20-cell pod column; `--columns pod=40` shows the name whole; `--columns pod=0` hides the column and the message moves left. There is no `--long-names`.
 7. `:save dev-api` writes the template with the targets and filter as they are at that moment, preserving the other templates and the comments in the file; `gossip follow --template dev-api` in a new terminal reproduces the session.
 8. Quit with `Ctrl-C`, then `gossip follow --last` resumes the same targets and filter.
 9. `:load staging-all` switches the running session to that template; the old pods' streams close with a notice each.

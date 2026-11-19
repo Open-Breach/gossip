@@ -185,10 +185,6 @@ pub struct OutputFlags {
     #[arg(long, value_name = "KEYS", value_delimiter = ',')]
     pub fields: Option<Vec<String>>,
 
-    /// Keep pod names whole instead of shortening them to hash and suffix.
-    #[arg(long)]
-    pub long_names: bool,
-
     /// The widths of the columns time, pod, container and level, in terminal
     /// cells, and the side a longer value is cut on (start, end, middle or
     /// none): pod=24:middle,container=8. A width of 0 hides the column
@@ -347,7 +343,6 @@ mod tests {
             "--no-color",
             "--fields",
             "tenant_id,request_id",
-            "--long-names",
             "--no-events",
             "--no-emoji",
             "--no-filter",
@@ -373,7 +368,6 @@ mod tests {
             args.output.fields,
             Some(vec!["tenant_id".to_string(), "request_id".to_string()])
         );
-        assert!(args.output.long_names);
         assert!(args.no_events);
         assert!(args.output.no_emoji);
         assert!(args.filter.no_filter);
@@ -406,7 +400,7 @@ mod tests {
         assert_eq!(args.output.output, None);
         assert_eq!(args.output.fields, None);
         assert_eq!(args.output.columns, None);
-        assert!(!args.output.raw && !args.output.no_color && !args.output.long_names);
+        assert!(!args.output.raw && !args.output.no_color);
         assert!(!args.no_events && !args.output.no_emoji && !args.filter.no_filter);
     }
 
@@ -475,7 +469,6 @@ mod tests {
             "json",
             "--raw",
             "--no-color",
-            "--long-names",
             "--no-emoji",
             "--no-interactive",
         ])
@@ -494,7 +487,7 @@ mod tests {
         );
         assert_eq!(args.output.columns, Some("pod=0".parse().unwrap()));
         assert_eq!(args.output.output, Some(Output::Json));
-        assert!(args.output.raw && args.output.no_color && args.output.long_names);
+        assert!(args.output.raw && args.output.no_color);
         assert!(args.output.no_emoji && args.output.no_interactive);
     }
 
@@ -526,6 +519,8 @@ mod tests {
             &["--template", "dev-api"],
             &["--last"],
             &["--record", "other.jsonl"],
+            // And a flag that no command has any more.
+            &["--long-names"],
         ] {
             let mut args = vec!["api.jsonl"];
             args.extend(flag);
@@ -563,5 +558,8 @@ mod tests {
         assert!(follow(&["flowcpt", "--columns", "pod=wide"]).is_err());
         assert!(follow(&["flowcpt", "--columns", "pod=24:left"]).is_err());
         assert!(follow(&["flowcpt", "--columns", "pod"]).is_err());
+        // Pod names are never shortened, so the flag that kept them whole is
+        // gone.
+        assert!(follow(&["flowcpt", "--long-names"]).is_err());
     }
 }
