@@ -44,8 +44,6 @@ pub struct TextOptions {
     pub colour: bool,
     /// Which fields of a line are shown, and in which order.
     pub fields: FieldChoice,
-    /// Keep pod names whole.
-    pub long_names: bool,
     /// Mark events with an emoji per reason; with `EVNT` otherwise.
     pub emoji: bool,
     pub zone: Zone,
@@ -62,25 +60,21 @@ pub struct TextOptions {
 ///
 /// The time, the pod, the container and the level each stand in a column
 /// of a fixed width, so the message starts at the same place on every line.
+/// The pod column always gets the full name of the pod; a name that is too
+/// long for it is cut by the rule of the column.
 #[derive(Debug)]
 pub struct TextRenderer {
     options: TextOptions,
-    /// Every pod seen so far is named like the pod of a deployment, so the
-    /// names can be shortened to the replica-set hash and the pod suffix.
-    only_deployment_pods: bool,
 }
 
 impl TextRenderer {
     pub fn new(options: TextOptions) -> Self {
-        TextRenderer {
-            options,
-            only_deployment_pods: true,
-        }
+        TextRenderer { options }
     }
 
     /// The text of a record, without a line ending. A record whose message
     /// holds several lines gives several lines.
-    pub fn render(&mut self, record: &Record) -> String {
+    pub fn render(&self, record: &Record) -> String {
         let columns = self.options.columns;
         let time = fit(&self.time(record.time), columns.time);
         if record.kind == Kind::Notice {
@@ -96,8 +90,7 @@ impl TextRenderer {
             return self.render_event(record, time.as_deref());
         }
 
-        let pod = self.pod_name(&record.pod);
-        let pod = self.pod_cell(&pod);
+        let pod = self.pod_cell(&record.pod);
         let container = fit(record.container.as_deref().unwrap_or(""), columns.container);
         // The pod and the container are one run of the pod's colour.
         let source = join(&[("", pod.as_deref()), (" ", container.as_deref())]);
@@ -153,7 +146,7 @@ impl TextRenderer {
     /// ```text
     /// 14:02:11.490 fc-api…vxfgs         💀               Killing: Container api failed liveness probe
     /// ```
-    fn render_event(&mut self, record: &Record, time: Option<&str>) -> String {
+    fn render_event(&self, record: &Record, time: Option<&str>) -> String {
         let field = |key: &str| record.fields.get(key).map(value_text).unwrap_or_default();
         let reason = field(event_field::REASON);
         let warning = record.level == Some(Level::Warn);
@@ -167,7 +160,7 @@ impl TextRenderer {
                 None => regarding.into_owned(),
             }
         } else {
-            self.pod_name(&record.pod)
+            record.pod.clone()
         };
         let subject = self.pod_cell(&subject);
 
@@ -205,25 +198,12 @@ impl TextRenderer {
         }
     }
 
-    /// The name a pod is shown under: whole, or shortened to the replica-set
-    /// hash and the pod suffix while every pod seen is a deployment's.
-    fn pod_name(&mut self, pod: &str) -> String {
-        let short = deployment_pod_suffix(pod);
-        if short.is_none() {
-            self.only_deployment_pods = false;
-        }
-        match short {
-            Some(short) if self.only_deployment_pods && !self.options.long_names => {
-                short.to_string()
-            }
-            _ => pod.to_string(),
-        }
-    }
-
     /// A pod name, or what stands in its place, as it stands in the column
-    /// of the pod. Cut in the middle, the name of a deployment's pod keeps
-    /// the workload and the pod suffix and loses the hash of the replica
-    /// set between them: `fc-api…vxfgs`.
+    /// of the pod: always the full name, cut when it is too long. Cut in
+    /// the middle, the name of a deployment's pod keeps the workload and the
+    /// pod suffix and loses the hash of the replica set between them:
+    /// `fc-api…vxfgs`. The start of the name says which workload it is, the
+    /// end which pod; the hash in the middle is the part nobody needs.
     fn pod_cell(&self, name: &str) -> Option<String> {
         let column = self.options.columns.pod;
         let width = usize::from(column.width);
@@ -382,7 +362,6 @@ mod tests {
         TextOptions {
             colour: false,
             fields: FieldChoice::Default,
-            long_names: true,
             emoji: true,
             zone: Zone::Utc,
             columns: Columns::default(),
@@ -429,7 +408,7 @@ mod tests {
 
     #[test]
     fn an_event_carries_an_emoji_in_place_of_the_container() {
-        let mut renderer = TextRenderer::new(plain());
+        let renderer = TextRenderer::new(plain());
         // The four lines of the example of the spec, section 5.3.
         let warn = with_fields(
             line(POD, "api", Some(Level::Warn), "payment intent expired"),
@@ -474,7 +453,7 @@ mod tests {
 
     #[test]
     fn without_emoji_an_event_is_marked_evnt_in_the_same_column() {
-        let mut renderer = TextRenderer::new(TextOptions {
+        let renderer = TextRenderer::new(TextOptions {
             emoji: false,
             ..plain()
         });
@@ -531,16 +510,12 @@ mod tests {
             TextRenderer::new(plain()).render(&scaled),
             "14:02:11.490 deployment…owcpt-api ℹ️                ScalingReplicaSet: Scaled up replica set flowcpt-api-7d9f to 2"
         );
-        // It does not stop pod names from being shortened.
-        let mut renderer = TextRenderer::new(TextOptions {
-            long_names: false,
-            ..plain()
-        });
-        renderer.render(&scaled);
-        assert!(
-            renderer
-                .render(&line(POD, "api", None, "x"))
-                .contains(" 7d9f-xk2p1  "),
+        // An event about a pod stands under the name of the pod, cut as it
+        // is on a line of that pod.
+        let started = event(FC_POD, "Pod/x", "Started", false, "Started container api");
+        assert_eq!(
+            TextRenderer::new(plain()).render(&started),
+            "14:02:11.490 fc-api…vxfgs         🚀                Started: Started container api"
         );
     }
 
@@ -751,7 +726,7 @@ mod tests {
 
     #[test]
     fn the_columns_have_fixed_widths_whatever_the_names() {
-        let mut renderer = TextRenderer::new(plain());
+        let renderer = TextRenderer::new(plain());
         let lines = [
             renderer.render(&line("redis-0", "redis", Some(Level::Info), "ready")),
             renderer.render(&line(POD, "api", Some(Level::Error), "ready")),
@@ -851,26 +826,44 @@ mod tests {
     }
 
     #[test]
-    fn a_shortened_pod_name_is_what_stands_in_the_column() {
-        // Shortened to hash and suffix, the name fits and is not cut.
-        let short = TextOptions {
-            long_names: false,
-            ..plain()
-        };
-        let record = line(FC_POD, "api", Some(Level::Info), "ready");
+    fn the_pod_column_always_gets_the_full_name() {
+        // Every pod here is a deployment's, and none of the names is
+        // shortened to its hash and suffix: each is the full name, cut.
+        let renderer = TextRenderer::new(plain());
+        let lines = [
+            renderer.render(&line(FC_POD, "api", Some(Level::Info), "one")),
+            renderer.render(&line(POD, "api", Some(Level::Info), "two")),
+            renderer.render(&line(
+                "fc-app-6d5c7b8f4-q7w2x",
+                "app",
+                Some(Level::Info),
+                "three",
+            )),
+        ];
         assert_eq!(
-            TextRenderer::new(short.clone()).render(&record),
-            "14:02:11.482 7f698fb95f-vxfgs     api         INFO  ready"
+            lines,
+            [
+                "14:02:11.482 fc-api…vxfgs         api         INFO  one",
+                "14:02:11.482 flowcpt-api…xk2p1    api         INFO  two",
+                "14:02:11.482 fc-app…q7w2x         app         INFO  three",
+            ]
         );
-        // In a narrower column it is cut like any other text: the workload
-        // is not in it any more.
-        let narrow = TextOptions {
-            long_names: false,
-            ..with_columns("pod=8")
-        };
+        // A name that fits its column is whole, hash and all.
+        let fits = line("api-7d9f-xk2p1", "api", Some(Level::Info), "four");
         assert_eq!(
-            TextRenderer::new(narrow).render(&record),
-            "14:02:11.482 7f69…fgs api         INFO  ready"
+            renderer.render(&fits),
+            "14:02:11.482 api-7d9f-xk2p1       api         INFO  four"
+        );
+        // Which pods came before changes nothing: the same pod is the same
+        // text on every line.
+        let other = line("redis-0", "redis", Some(Level::Info), "five");
+        assert_eq!(
+            renderer.render(&other),
+            "14:02:11.482 redis-0              redis       INFO  five"
+        );
+        assert_eq!(
+            renderer.render(&line(FC_POD, "api", Some(Level::Info), "one")),
+            lines[0]
         );
     }
 
@@ -1046,43 +1039,6 @@ mod tests {
             TextRenderer::new(plain())
                 .render(&record)
                 .ends_with("xxxx [line cut at 1 MiB]")
-        );
-    }
-
-    #[test]
-    fn pod_names_are_shortened_while_every_pod_is_a_deployments() {
-        let short = TextOptions {
-            long_names: false,
-            ..plain()
-        };
-        let mut renderer = TextRenderer::new(short.clone());
-        assert_eq!(
-            renderer.render(&line(POD, "api", Some(Level::Info), "one")),
-            "14:02:11.482 7d9f-xk2p1           api         INFO  one"
-        );
-        assert_eq!(
-            renderer.render(&line(
-                "flowcpt-web-api-5c8b6d7f9-m4q8z",
-                "api",
-                Some(Level::Info),
-                "two"
-            )),
-            "14:02:11.482 5c8b6d7f9-m4q8z      api         INFO  two"
-        );
-        // A pod of something else: from here on the names are whole.
-        assert_eq!(
-            renderer.render(&line("redis-0", "redis", Some(Level::Info), "three")),
-            "14:02:11.482 redis-0              redis       INFO  three"
-        );
-        assert_eq!(
-            renderer.render(&line(POD, "api", Some(Level::Info), "four")),
-            "14:02:11.482 flowcpt-api…xk2p1    api         INFO  four"
-        );
-
-        // With --long-names they are whole from the start.
-        assert_eq!(
-            TextRenderer::new(plain()).render(&line(POD, "api", Some(Level::Info), "one")),
-            "14:02:11.482 flowcpt-api…xk2p1    api         INFO  one"
         );
     }
 
