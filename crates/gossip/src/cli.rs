@@ -49,7 +49,15 @@ Targets:
   flowcpt/flowcpt-api               the pods of a Deployment, StatefulSet, DaemonSet, Job or CronJob
   flowcpt/cronjob:nightly-sync      the same, of one kind only
   flowcpt/-/flowcpt-api-7d9f-xk2p1  one pod, given directly
-  monitoring/prometheus/*/exporter  one container of every pod of a workload";
+  monitoring/prometheus/*/exporter  one container of every pod of a workload
+
+Keys, with a terminal on both sides:
+  Space      pause the output, and resume it
+  Ctrl-L     clear the screen
+  :          open the command line: :level warn, :grep text, :add target, :save name, ...
+  /          open the command line with `grep ` typed
+  q, Ctrl-C  quit
+  ?          list the keys and the commands";
 
 const LIST_FORMS: &str = "\
 Forms:
