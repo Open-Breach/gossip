@@ -58,7 +58,7 @@ Two tables in the CLI crate are the only place to change what they hold, and the
 
 ## The README
 
-`README.md` describes the latest release, not `main`, and is checked against the code instead of trusted (SPEC-release.md, section 4). It has two kinds of text:
+`README.md` follows `main`: it describes what the code on `main` does, and it is checked against the code instead of trusted (SPEC-release.md, section 4). It has two kinds of text:
 
 - The fixed parts are written by hand: the tagline, the paragraph of what Gossip is, the status text, the warning, the sentences of the walkthrough, the known limits, the closing lines. They are not reworded without Serge.
 - The generated parts stand between `<!-- generated:name -->` and `<!-- /generated:name -->`: the status line with the version, the sample of the output, the Install section, what every step of the walkthrough prints, and the Reference.
@@ -83,13 +83,13 @@ Where the generated parts come from:
 
 For the output to be the same on every run, the binary reads the time from a file when the environment variable `GOSSIP_CLOCK` names one (`crates/gossip-core/src/clock.rs`). The generator moves that clock as the walkthrough goes. Nothing else uses the variable.
 
-`cargo test` fails when a command, a flag of `follow`, `replay` or `list`, a key or a `:` command is in the code and not in the Reference, or the other way round; when a default in the Reference differs from the code's; when a fixed text is not in the README word for word; and when a generated block differs from what the generator writes now (`crates/xtask/tests/readme.rs`). So after a change to a flag, a key, a command or what the walkthrough prints, `cargo test` fails until `cargo xtask readme` has been run.
+`cargo test` fails when a command, a flag of `follow`, `replay` or `list`, a key or a `:` command is in the code and not in the Reference, or the other way round; when a default in the Reference differs from the code's; when a fixed text is not in the README word for word; and when a generated block differs from what the generator writes now (`crates/xtask/tests/readme.rs`). So a pull request that adds or changes a command, a flag, a key or a `:` command, or that changes what the walkthrough prints, runs `cargo xtask readme` and commits the result in that same pull request; `cargo test` fails until it has.
 
 ## Releases
 
 A release is a tag `vX.Y.Z` on `main` (SPEC-release.md, sections 2 and 3). Serge pushes the tag.
 
-1. The release pull request sets the version in `Cargo.toml`, runs `cargo xtask readme`, and holds nothing else.
+1. The release pull request sets the version in `Cargo.toml`, runs `cargo xtask readme`, which writes that version into the status line and the Install links, and holds nothing else. For 0.1.0 the version was 0.1.0 from the start, so the pull request that brought the README was the release pull request.
 2. Serge merges it and pushes the tag on the merge commit.
 3. `.github/workflows/release.yml` checks the tag against `Cargo.toml` and the README, collects the licences of the crates with `cargo-about` (`about.toml`, `about.hbs`), builds the binary for Linux x64 and arm64 (static, musl), macOS arm64 and Windows x64, packs an archive for each, tests every archive on a clean runner of its platform, and creates the GitHub release with the archives and `SHA256SUMS.txt`.
 

@@ -75,7 +75,7 @@ Every archive holds the binary, this README, the licence and the licences of the
 
 ## Using Gossip
 
-One session, read top to bottom. The cluster in it is made up: a namespace `shop` with the deployments `api` and `web`. Every command below was run by this release's binary against a stand-in API server, and every line under it is what the binary printed.
+One session, read top to bottom. The cluster in it is made up: a namespace `shop` with the deployments `api` and `web`. Every command below was run by the built binary against a stand-in API server, and every line under it is what the binary printed.
 
 ### 1. Find your way
 
