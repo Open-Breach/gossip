@@ -9,7 +9,7 @@
 use anyhow::{Context, bail};
 use gossip_core::{Filter, Kind, Level};
 
-use crate::cli::FollowArgs;
+use crate::cli::FilterFlags;
 
 /// The rules about lines that the filter flags stand for, and that the
 /// filter commands change: every one of them must hold for a line.
@@ -26,8 +26,8 @@ pub struct LineRules {
 }
 
 impl LineRules {
-    /// The rules the flags of `gossip follow` stand for.
-    pub fn from_args(args: &FollowArgs) -> anyhow::Result<LineRules> {
+    /// The rules the filter flags stand for.
+    pub fn from_args(args: &FilterFlags) -> anyhow::Result<LineRules> {
         let mut rules = LineRules {
             level: args.level,
             grep: args.grep.clone(),
@@ -155,7 +155,7 @@ mod tests {
     fn rules(flags: &[&str]) -> LineRules {
         let cli = Cli::try_parse_from(["gossip", "follow", "flowcpt"].iter().chain(flags)).unwrap();
         match cli.command {
-            Command::Follow(args) => LineRules::from_args(&args).unwrap(),
+            Command::Follow(args) => LineRules::from_args(&args.filter).unwrap(),
             other => panic!("expected the follow command, got {other:?}"),
         }
     }

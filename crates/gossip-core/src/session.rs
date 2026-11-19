@@ -184,6 +184,7 @@ enum Command {
     SetEvents(bool),
     SetContainer(Option<Pattern>),
     Load(Box<SessionSpec>),
+    Tap(Option<mpsc::UnboundedSender<Record>>),
     Stop,
 }
 
@@ -242,6 +243,17 @@ impl SessionHandle {
     /// its context, except that a spec for another cluster is refused.
     pub fn load(&self, spec: SessionSpec) {
         self.send(Command::Load(Box::new(spec)));
+    }
+
+    /// Hands every record of the session to a tap as well, before the
+    /// filter: what passed the resolver, whether or not it is shown. This
+    /// is what a recording is made from. `None` takes the tap away; a tap
+    /// whose receiver is gone is forgotten.
+    ///
+    /// The tap is no change of what is followed or shown, and the one call
+    /// that is not answered with a notice: whoever taps says so itself.
+    pub fn set_tap(&self, tap: Option<mpsc::UnboundedSender<Record>>) {
+        self.send(Command::Tap(tap));
     }
 
     /// What the session follows right now, as a template would hold it:
@@ -394,6 +406,8 @@ struct Driver {
     /// that were told, so that a resolver that takes over repeats neither.
     said: Memory,
     told: Memory,
+    /// Where every record goes as well, before the filter.
+    tap: Option<mpsc::UnboundedSender<Record>>,
 }
 
 impl Driver {
@@ -445,6 +459,7 @@ impl Driver {
             matched: HashMap::new(),
             said: Memory::default(),
             told: Memory::default(),
+            tap: None,
         };
         driver.publish();
         driver
@@ -475,6 +490,12 @@ impl Driver {
             }
 
             for record in self.buffer.pop_ready(Instant::now().into_std()) {
+                if let Some(tap) = &self.tap
+                    && tap.send(record.clone()).is_err()
+                {
+                    // Nobody listens any more.
+                    self.tap = None;
+                }
                 let accepted = self
                     .filter
                     .as_ref()
@@ -619,6 +640,7 @@ impl Driver {
                 self.resolve_again(Answer::Following(message));
             }
             Command::Load(spec) => self.load(*spec),
+            Command::Tap(tap) => self.tap = tap,
             // Taken care of by the loop.
             Command::Stop => {}
         }

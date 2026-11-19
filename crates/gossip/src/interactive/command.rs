@@ -4,6 +4,8 @@
 //! `gossip follow`; a line that cannot be read is an error that says why,
 //! and changes nothing.
 
+use std::path::PathBuf;
+
 use gossip_core::{ColumnsSetting, Level, Pattern, Target};
 
 /// What a line of the command line asks for.
@@ -48,6 +50,12 @@ pub enum Command {
     Templates,
     /// `:templates show <name>`
     ShowTemplate(String),
+    /// `:record`: say whether a recording runs, and how much it holds.
+    RecordStatus,
+    /// `:record <file>`: start recording to a file.
+    Record(PathBuf),
+    /// `:record off`
+    RecordOff,
     /// `:clear`
     Clear,
     /// `:q`
@@ -86,6 +94,7 @@ pub const HELP: &[&str] = &[
     "  :save [name]      save the session as a template; alone, the one it was started from",
     "  :load <name>      replace the session with a template",
     "  :templates        list the templates; :templates show <name> prints one",
+    "  :record <file>    record every record to a file, also what the filter hides; :record off",
     "  :clear            clear the screen",
     "  :q                quit",
 ];
@@ -197,6 +206,11 @@ pub fn parse(line: &str) -> Result<Command, String> {
                     .to_string(),
             ),
         },
+        "record" => match unquoted(rest) {
+            "" => Ok(Command::RecordStatus),
+            "off" => Ok(Command::RecordOff),
+            file => Ok(Command::Record(path(file))),
+        },
         "clear" => nothing_more(Command::Clear),
         "q" | "quit" => nothing_more(Command::Quit),
         "help" => nothing_more(Command::Help),
@@ -224,6 +238,15 @@ fn unquoted(text: &str) -> &str {
         }
     }
     text
+}
+
+/// A path as it was typed. There is no shell to open a leading `~/`, so it
+/// is opened here.
+fn path(text: &str) -> PathBuf {
+    match (text.strip_prefix("~/"), std::env::var_os("HOME")) {
+        (Some(rest), Some(home)) if !home.is_empty() => PathBuf::from(home).join(rest),
+        _ => PathBuf::from(text),
+    }
 }
 
 fn targets(name: &str, rest: &str) -> Result<Vec<Target>, String> {
@@ -471,6 +494,35 @@ mod tests {
     }
 
     #[test]
+    fn the_record_command() {
+        assert_eq!(parse("record"), Ok(Command::RecordStatus));
+        assert_eq!(parse("record off"), Ok(Command::RecordOff));
+        assert_eq!(
+            parse("record api.jsonl"),
+            Ok(Command::Record(PathBuf::from("api.jsonl")))
+        );
+        // A path may hold spaces; quotes around it are dropped.
+        assert_eq!(
+            parse("record /tmp/my recordings/api.jsonl"),
+            Ok(Command::Record(PathBuf::from(
+                "/tmp/my recordings/api.jsonl"
+            )))
+        );
+        assert_eq!(
+            parse("record \"off\""),
+            Ok(Command::RecordOff),
+            "the quotes are dropped before the word is read"
+        );
+        // A leading `~/` is the home directory, as a shell would have it.
+        if let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) {
+            assert_eq!(
+                parse("record ~/api.jsonl"),
+                Ok(Command::Record(PathBuf::from(home).join("api.jsonl")))
+            );
+        }
+    }
+
+    #[test]
     fn clear_quit_and_help() {
         assert_eq!(parse("clear"), Ok(Command::Clear));
         assert_eq!(parse("q"), Ok(Command::Quit));
@@ -521,6 +573,7 @@ mod tests {
             ":save",
             ":load",
             ":templates",
+            ":record",
             ":clear",
             ":q",
         ] {

@@ -760,6 +760,58 @@ async fn a_resolver_that_takes_over_does_not_repeat_what_was_said_about_a_target
 }
 
 #[tokio::test]
+async fn a_tap_gets_every_record_before_the_filter() {
+    let fake = FakeCluster::start().await;
+    seed(&fake);
+    fake.log(NS, API_POD_A, "api", at(0), "INFO one");
+    fake.log(NS, API_POD_A, "api", at(100), "WARN two");
+    // The filter hides the info lines from the stream.
+    let mut session = Session::start(
+        &fake.cluster(),
+        vec![target(API)],
+        Some(Filter::level_at_least(Level::Warn)),
+        SessionOptions {
+            events: true,
+            ..options()
+        },
+    );
+    let handle = session.handle();
+    let (tap, mut tapped) = mpsc::unbounded_channel();
+    handle.set_tap(Some(tap));
+    assert_eq!(take(&mut session, 1).await, ["WARN two"]);
+    // The tap has both, in the order of the stream, each whole.
+    let first = tapped.recv().await.unwrap();
+    assert_eq!(first.message, "INFO one");
+    assert_eq!(first.pod, API_POD_A);
+    assert_eq!(first.container.as_deref(), Some("api"));
+    assert_eq!(first.level, Some(Level::Info));
+    assert_eq!(tapped.recv().await.unwrap().message, "WARN two");
+
+    // Events and notices are records like any other. A normal event has
+    // the level info, so this filter hides it from the stream too.
+    add_event(&fake, "started", API_POD_A, "Started", Utc::now());
+    assert_eq!(tapped.recv().await.unwrap().kind, Kind::Event);
+    expect_quiet(&mut session).await;
+    handle.set_filter(None);
+    assert_eq!(take(&mut session, 1).await, ["-- filter off"]);
+    assert_eq!(text(&tapped.recv().await.unwrap()), "-- filter off");
+
+    // Without the tap nothing more goes to it, and the stream goes on.
+    handle.set_tap(None);
+    fake.log(NS, API_POD_A, "api", at(1_000), "INFO three");
+    assert_eq!(take(&mut session, 1).await, ["INFO three"]);
+    assert!(tapped.recv().await.is_none());
+
+    // A tap whose receiver is gone does not get in the way.
+    let (tap, tapped) = mpsc::unbounded_channel();
+    handle.set_tap(Some(tap));
+    drop(tapped);
+    fake.log(NS, API_POD_A, "api", at(2_000), "INFO four");
+    fake.log(NS, API_POD_A, "api", at(2_100), "INFO five");
+    assert_eq!(take(&mut session, 2).await, ["INFO four", "INFO five"]);
+}
+
+#[tokio::test]
 async fn a_session_nobody_touches_says_nothing_about_itself() {
     let fake = FakeCluster::start().await;
     seed(&fake);

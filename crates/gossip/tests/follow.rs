@@ -1515,3 +1515,297 @@ async fn the_output_without_a_terminal_is_pinned_byte_for_byte() {
         assert!(!output.contains('\r'), "a carriage return: {output:?}");
     }
 }
+
+// ---- record and replay ------------------------------------------------------
+
+/// A file of its own for one recording.
+fn recording_file(test: &str) -> PathBuf {
+    let path = std::env::temp_dir().join(format!("gossip-{}-{test}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    path
+}
+
+/// The text of a file once it has this many lines.
+async fn file_with_lines(path: &PathBuf, lines: usize) -> String {
+    for _ in 0..1_000 {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        if text.lines().count() >= lines && text.ends_with('\n') {
+            return text;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!(
+        "{} never came to {lines} lines: {:?}",
+        path.display(),
+        std::fs::read_to_string(path)
+    );
+}
+
+/// What `gossip replay` with these arguments writes to stdout, and how it
+/// ended.
+async fn replay(test: &str, config_text: &str, args: &[&str]) -> (String, String, Option<i32>) {
+    let config = std::env::temp_dir().join(format!("gossip-{}-{test}.toml", std::process::id()));
+    std::fs::write(&config, config_text).unwrap();
+    let output = timeout(
+        Duration::from_secs(30),
+        Command::new(env!("CARGO_BIN_EXE_gossip"))
+            .arg("replay")
+            .args(args)
+            .env("TZ", "UTC")
+            .env("GOSSIP_CONFIG", &config)
+            // A replay needs no cluster, and must not look for one.
+            .env("KUBECONFIG", "/no/such/kubeconfig")
+            .stdin(Stdio::null())
+            .output(),
+    )
+    .await
+    .expect("the replay should end by itself")
+    .unwrap();
+    let _ = std::fs::remove_file(config);
+    (
+        String::from_utf8(output.stdout).expect("the output is UTF-8"),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+        output.status.code(),
+    )
+}
+
+#[tokio::test]
+async fn a_recording_holds_every_record_and_replays_as_it_was_shown() {
+    let fake = FakeCluster::start().await;
+    seed_pinned(&fake);
+    let file = recording_file("record");
+    let file_arg = file.to_str().unwrap();
+
+    // Recording changes nothing of the output: it is the pinned text.
+    let args = [&PINNED_ARGS[..], &["--record", file_arg]].concat();
+    let lines = PINNED_TEXT.matches('\n').count();
+    let text = stdout_bytes(&fake, "record-text", &args, lines).await;
+    assert_eq!(text, PINNED_TEXT);
+    // The recording is what `--output json` prints: one object per line,
+    // with every field of the record.
+    let records = PINNED_JSON.lines().count();
+    assert_eq!(file_with_lines(&file, records).await, PINNED_JSON);
+
+    // Played back, every line renders exactly as it did live.
+    let (replayed, stderr, code) = replay("replay-text", "", &[file_arg]).await;
+    assert_eq!(stderr, "");
+    assert_eq!(code, Some(0));
+    assert_eq!(replayed, PINNED_TEXT);
+    let (replayed, _, _) = replay("replay-json", "", &[file_arg, "--output", "json"]).await;
+    assert_eq!(replayed, PINNED_JSON);
+    let (replayed, _, _) = replay("replay-raw", "", &[file_arg, "--raw"]).await;
+    assert_eq!(replayed, PINNED_RAW);
+    std::fs::remove_file(&file).unwrap();
+}
+
+#[tokio::test]
+async fn a_recording_holds_what_the_filter_hid_and_a_replay_filters_like_a_live_run() {
+    let fake = FakeCluster::start().await;
+    seed_pinned(&fake);
+    let file = recording_file("record-filtered");
+    let file_arg = file.to_str().unwrap();
+
+    // A live run with `--level warn`, recorded.
+    let live_args = [&PINNED_ARGS[..], &["--level", "warn", "--record", file_arg]].concat();
+    let mut live = Follow::start(&fake, "record-level", &live_args);
+    // Three events, a warning, a line without a level, an error, and the
+    // four lines of the panic.
+    let shown = live.lines(10).await;
+    live.expect_quiet().await;
+    // The info and debug lines are not on the screen.
+    assert!(
+        shown
+            .iter()
+            .all(|line| !line.contains(" INFO  ") && !line.contains(" DEBUG "))
+    );
+    // The recording holds them all the same: it is taken before the filter.
+    let records = PINNED_JSON.lines().count();
+    assert_eq!(file_with_lines(&file, records).await, PINNED_JSON);
+
+    // The acceptance of section 9: the replay with `--level warn` shows the
+    // same lines the live `--level warn` showed, in order.
+    let (replayed, _, code) = replay("replay-level", "", &[file_arg, "--level", "warn"]).await;
+    assert_eq!(code, Some(0));
+    assert_eq!(replayed.lines().collect::<Vec<_>>(), shown);
+
+    // The other filter flags and the columns work on it too. Events pass
+    // the filter flags, as they do live.
+    let (replayed, _, _) = replay(
+        "replay-flags",
+        "",
+        &[file_arg, "--grep", "upstream", "--columns", "time=0,pod=0"],
+    )
+    .await;
+    assert_eq!(
+        replayed,
+        "EVNT              ScalingReplicaSet: Scaled up replica set fc-web-api-5c8b6d7f9 to 1\n\
+         EVNT              Killing: Container api failed liveness probe, will be restarted\n\
+         EVNT              BackOff: Back-off restarting failed container\n\
+         api         ERROR ERROR upstream is gone\n"
+    );
+    let (replayed, _, _) = replay(
+        "replay-field",
+        "",
+        &[
+            file_arg,
+            "--field",
+            "attempt=2",
+            "--columns",
+            "time=0,pod=0",
+        ],
+    )
+    .await;
+    assert_eq!(
+        replayed.lines().last(),
+        Some("api         DEBUG attempt=2  worker restarted")
+    );
+    assert_eq!(replayed.lines().count(), 4);
+    std::fs::remove_file(&file).unwrap();
+}
+
+#[tokio::test]
+async fn a_recording_is_appended_to_and_cut_by_time_and_played_at_a_speed() {
+    let fake = FakeCluster::start().await;
+    seed_tenant_lines(&fake);
+    let file = recording_file("record-append");
+    let file_arg = file.to_str().unwrap();
+
+    // Two runs into the same file: the second is appended.
+    for run in 0..2 {
+        let mut follow = Follow::start(
+            &fake,
+            &format!("append-{run}"),
+            &["flowcpt", "--no-events", "--record", file_arg],
+        );
+        follow.lines(4).await;
+        file_with_lines(&file, 4 * (run + 1)).await;
+    }
+    let (all, _, _) = replay("replay-all", "", &[file_arg, "--fields", "request_id"]).await;
+    assert_eq!(all.lines().count(), 8);
+
+    // `--from` and `--to` cut by the time of the records, both included,
+    // as a time of day in the zone of the time column or as a full time.
+    let (cut, stderr, _) = replay(
+        "replay-cut",
+        "",
+        &[
+            file_arg,
+            "--fields",
+            "request_id",
+            "--from",
+            "14:00:02",
+            "--to",
+            "2026-11-18T14:00:03Z",
+        ],
+    )
+    .await;
+    assert_eq!(stderr, "");
+    let line_2 = "14:00:02.000 redis-0              api         WARN  request_id=8b1d  payment intent expired";
+    let line_3 =
+        "14:00:03.000 redis-0              api         ERROR request_id=8b1e  card declined";
+    assert_eq!(
+        cut.lines().collect::<Vec<_>>(),
+        [line_2, line_3, line_2, line_3]
+    );
+
+    // The pace: the first four lines span three seconds. At speed 30 that
+    // is a tenth of a second; at speed 0, the default, there is no waiting.
+    let started = std::time::Instant::now();
+    let (paced, _, _) = replay(
+        "replay-speed",
+        "",
+        &[file_arg, "--to", "14:00:04", "--speed", "3"],
+    )
+    .await;
+    let took = started.elapsed();
+    assert_eq!(paced.lines().count(), 8);
+    assert!(
+        took >= Duration::from_millis(1_000) && took < Duration::from_secs(10),
+        "three seconds at three times the speed took {took:?}"
+    );
+    std::fs::remove_file(&file).unwrap();
+}
+
+#[tokio::test]
+async fn a_replay_says_what_it_cannot_read_and_plays_the_rest() {
+    let file = recording_file("replay-broken");
+    let record = r#"{"cluster":"c","namespace":"ns","pod":"redis-0","container":"api","time":"2026-11-18T14:00:01Z","kind":"line","format":"text","level":"info","message":"one","fields":{},"raw":"one","previous":false,"truncated":false}"#;
+    std::fs::write(&file, format!("{record}\nnot a record\n{record}\n")).unwrap();
+    let (replayed, stderr, code) = replay("replay-broken", "", &[file.to_str().unwrap()]).await;
+    assert_eq!(code, Some(0));
+    assert_eq!(replayed.lines().count(), 2);
+    assert!(
+        stderr.starts_with(&format!(
+            "gossip: line 2 of the recording {} is not a record: ",
+            file.display()
+        )),
+        "{stderr}"
+    );
+    std::fs::remove_file(&file).unwrap();
+
+    // A recording that is not there, and a time that is not one.
+    let (replayed, stderr, code) =
+        replay("replay-missing", "", &["/no/such/recording.jsonl"]).await;
+    assert_eq!((replayed.as_str(), code), ("", Some(1)));
+    assert!(
+        stderr.starts_with("gossip: cannot read the recording /no/such/recording.jsonl: "),
+        "{stderr}"
+    );
+    let (_, stderr, code) = replay("replay-time", "", &["x.jsonl", "--from", "soon"]).await;
+    assert_eq!(code, Some(2));
+    assert!(stderr.contains("`soon` is not a time"), "{stderr}");
+}
+
+#[tokio::test]
+async fn a_replay_follows_the_columns_and_the_filter_of_the_config_file() {
+    let file = recording_file("replay-config");
+    let record = |level: &str, message: &str| {
+        format!(
+            r#"{{"cluster":"c","namespace":"ns","pod":"redis-0","container":"api","time":"2026-11-18T14:00:01Z","kind":"line","format":"text","level":"{level}","message":"{message}","fields":{{}},"raw":"{message}","previous":false,"truncated":false}}"#
+        )
+    };
+    let text = format!("{}\n{}\n", record("info", "one"), record("warn", "two"));
+    std::fs::write(&file, text).unwrap();
+    let config = r#"
+[defaults]
+filter = { field = "level", op = ">=", value = "warn" }
+
+[columns]
+time = { width = 0 }
+pod = { width = 9 }
+"#;
+    let file_arg = file.to_str().unwrap();
+    let (replayed, _, _) = replay("replay-config", config, &[file_arg]).await;
+    assert_eq!(replayed, "redis-0   api         WARN  two\n");
+    // `--no-filter` drops the filter of the config file, as for `follow`.
+    let (replayed, _, _) = replay("replay-no-filter", config, &[file_arg, "--no-filter"]).await;
+    assert_eq!(
+        replayed,
+        "redis-0   api         INFO  one\nredis-0   api         WARN  two\n"
+    );
+    std::fs::remove_file(&file).unwrap();
+}
+
+#[tokio::test]
+async fn a_file_that_cannot_be_recorded_to_is_an_error_before_anything_is_followed() {
+    let fake = FakeCluster::start().await;
+    let (mut command, kubeconfig, config) = follow_command(
+        &fake,
+        "record-nowhere",
+        "",
+        &["flowcpt", "--record", "/no/such/directory/api.jsonl"],
+    );
+    let output = timeout(Duration::from_secs(15), command.output())
+        .await
+        .expect("gossip should stop in time")
+        .unwrap();
+    let _ = std::fs::remove_file(kubeconfig);
+    let _ = std::fs::remove_file(config);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.starts_with("gossip: cannot record to /no/such/directory/api.jsonl: "),
+        "{stderr}"
+    );
+}
