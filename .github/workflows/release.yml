@@ -299,7 +299,7 @@ jobs:
           done
       # Title: the tag. Body: GitHub's generated notes since the previous
       # tag. A draft when run by hand, a pre-release for a tag with a suffix.
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ env.TAG }}
           target_commitish: ${{ github.sha }}
