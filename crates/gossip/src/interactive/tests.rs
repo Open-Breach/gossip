@@ -64,7 +64,6 @@ fn bare() -> TextOptions {
     TextOptions {
         colour: false,
         fields: FieldChoice::Default,
-        long_names: false,
         emoji: false,
         zone: Zone::Utc,
         columns: "time=0,pod=0,container=0,level=0"
@@ -808,7 +807,6 @@ async fn any_other_key_is_ignored() {
 async fn fields_and_columns_change_how_the_next_line_looks() {
     let options = TextOptions {
         columns: Columns::default(),
-        long_names: true,
         ..bare()
     };
     let mut run = Run::start_with(Printer::text_with(options), FilterState::default(), None).await;

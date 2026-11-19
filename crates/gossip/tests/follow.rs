@@ -180,7 +180,9 @@ async fn follow_prints_the_last_20_lines_of_every_container_and_then_new_lines()
     let mut follow = Follow::start(&fake, "tail", &["flowcpt/flowcpt-api", "--no-color"]);
     let history = follow.lines(80).await;
     // Twenty lines for each of the four containers, none older than line 6.
-    for pod in ["7d9f-xk2p1", "7d9f-m4q8z"] {
+    // The pod column holds the full name, cut in the middle: the workload
+    // and the pod suffix.
+    for pod in ["flowcpt-api…xk2p1", "flowcpt-api…m4q8z"] {
         for container in ["api", "envoy"] {
             let of_container: Vec<&String> = history
                 .iter()
@@ -200,19 +202,18 @@ async fn follow_prints_the_last_20_lines_of_every_container_and_then_new_lines()
         }
     }
     // Ordered by time across the four streams, with a prefix per source.
-    // The pod names are shortened: every pod belongs to a deployment.
     // Every column has its width, whichever names have been seen.
     assert_eq!(
         history[0],
-        "14:00:06.000 7d9f-xk2p1           api               api line 6"
+        "14:00:06.000 flowcpt-api…xk2p1    api               api line 6"
     );
     assert_eq!(
         history[1],
-        "14:00:06.010 7d9f-xk2p1           envoy             envoy line 6"
+        "14:00:06.010 flowcpt-api…xk2p1    envoy             envoy line 6"
     );
     assert_eq!(
         history[2],
-        "14:00:06.020 7d9f-m4q8z           api               api line 6"
+        "14:00:06.020 flowcpt-api…m4q8z    api               api line 6"
     );
     let mut sorted = history.clone();
     sorted.sort();
@@ -223,7 +224,7 @@ async fn follow_prints_the_last_20_lines_of_every_container_and_then_new_lines()
     fake.log(NS, POD_B, "api", at(60_000), "WARN something new");
     assert_eq!(
         follow.line().await,
-        "14:01:00.000 7d9f-m4q8z           api         WARN  WARN something new"
+        "14:01:00.000 flowcpt-api…m4q8z    api         WARN  WARN something new"
     );
 }
 
@@ -1145,13 +1146,10 @@ async fn a_long_pod_name_is_cut_in_the_middle_and_the_columns_flag_changes_that(
     seed_fc(&fake);
     fake.log(FC, FC_API_POD, "api", at(1_000), "INFO ready");
 
-    // Acceptance 6: in the 20 cells of the pod column the name keeps the
-    // workload and the pod suffix.
-    let mut follow = Follow::start(
-        &fake,
-        "columns-cut",
-        &["fc-stg/fc-api", "--long-names", "--no-color"],
-    );
+    // Acceptance 6, with no flag at all: in the 20 cells of the pod column
+    // the name keeps the workload and the pod suffix. Every pod here is a
+    // deployment's, and the name is not shortened to hash and suffix.
+    let mut follow = Follow::start(&fake, "columns-cut", &["fc-stg/fc-api"]);
     assert_eq!(
         follow.line().await,
         "14:00:01.000 fc-api…vxfgs         api         INFO  INFO ready"
@@ -1161,7 +1159,7 @@ async fn a_long_pod_name_is_cut_in_the_middle_and_the_columns_flag_changes_that(
     let mut follow = Follow::start(
         &fake,
         "columns-wide",
-        &["fc-stg/fc-api", "--long-names", "--columns", "pod=40"],
+        &["fc-stg/fc-api", "--columns", "pod=40"],
     );
     assert_eq!(
         follow.line().await,
@@ -1172,19 +1170,22 @@ async fn a_long_pod_name_is_cut_in_the_middle_and_the_columns_flag_changes_that(
     let mut follow = Follow::start(
         &fake,
         "columns-hidden",
-        &["fc-stg/fc-api", "--long-names", "--columns", "pod=0"],
+        &["fc-stg/fc-api", "--columns", "pod=0"],
     );
     assert_eq!(
         follow.line().await,
         "14:00:01.000 api         INFO  INFO ready"
     );
 
-    // Every pod here is a deployment's, so without --long-names the name is
-    // shortened to hash and suffix first, as before, and that fits.
-    let mut follow = Follow::start(&fake, "columns-short", &["fc-stg/fc-api"]);
+    // A column that just holds the name shows it whole too, hash and all.
+    let mut follow = Follow::start(
+        &fake,
+        "columns-exact",
+        &["fc-stg/fc-api", "--columns", "pod=23"],
+    );
     assert_eq!(
         follow.line().await,
-        "14:00:01.000 7f698fb95f-vxfgs     api         INFO  INFO ready"
+        "14:00:01.000 fc-api-7f698fb95f-vxfgs api         INFO  INFO ready"
     );
 
     // A side to cut on, and several columns at once.
@@ -1193,7 +1194,6 @@ async fn a_long_pod_name_is_cut_in_the_middle_and_the_columns_flag_changes_that(
         "columns-sides",
         &[
             "fc-stg/fc-api",
-            "--long-names",
             "--columns",
             "time=0,pod=10:start,container=2,level=4",
         ],
@@ -1248,7 +1248,7 @@ async fn the_columns_of_the_config_file_and_of_a_template_apply_and_a_flag_goes_
         &fake,
         "columns-config",
         COLUMNS_CONFIG,
-        &["fc-stg/fc-web-api", "--long-names"],
+        &["fc-stg/fc-web-api"],
     );
     assert_eq!(
         follow.line().await,
@@ -1261,7 +1261,7 @@ async fn the_columns_of_the_config_file_and_of_a_template_apply_and_a_flag_goes_
         &fake,
         "columns-template",
         COLUMNS_CONFIG,
-        &["--template", "narrow", "--long-names"],
+        &["--template", "narrow"],
     );
     assert_eq!(
         follow.line().await,
@@ -1276,7 +1276,6 @@ async fn the_columns_of_the_config_file_and_of_a_template_apply_and_a_flag_goes_
         &[
             "--template",
             "narrow",
-            "--long-names",
             "--columns",
             "pod=8,container=13,level=5",
         ],
@@ -1485,8 +1484,10 @@ const PINNED_ARGS: [&str; 3] = ["fc-stg", "--since", "36500d"];
 ///
 /// The JSON and the raw output are what the prototype wrote, to the byte:
 /// the two files were written by the prototype's own binary. The text
-/// output is what the prototype wrote apart from the widths of the columns
-/// (SPEC-interactive 5). None of the three may change without the spec
+/// output is what the prototype wrote apart from the prefix columns of
+/// SPEC-interactive 5: their fixed widths, and the pod column, which holds
+/// the full name of the pod cut in the middle where the prototype shortened
+/// it to hash and suffix. None of the three may change without the spec
 /// saying so.
 const PINNED_TEXT: &str = include_str!("pinned/follow.txt");
 const PINNED_JSON: &str = include_str!("pinned/follow.jsonl");

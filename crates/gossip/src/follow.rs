@@ -205,7 +205,6 @@ impl Printer {
         Printer::text_with(TextOptions {
             colour: stdout_is_terminal && !args.no_color,
             fields: FieldChoice::from_setting(settings.fields.as_deref()),
-            long_names: args.long_names,
             // Emoji only where they will show: a terminal that says
             // it speaks UTF-8.
             emoji: !args.no_emoji && stdout_is_terminal && locale_is_utf8(),

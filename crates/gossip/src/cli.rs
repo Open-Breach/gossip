@@ -140,10 +140,6 @@ pub struct FollowArgs {
     #[arg(long, value_name = "KEYS", value_delimiter = ',')]
     pub fields: Option<Vec<String>>,
 
-    /// Keep pod names whole instead of shortening them to hash and suffix.
-    #[arg(long)]
-    pub long_names: bool,
-
     /// The widths of the columns time, pod, container and level, in terminal
     /// cells, and the side a longer value is cut on (start, end, middle or
     /// none): pod=24:middle,container=8. A width of 0 hides the column
@@ -262,7 +258,6 @@ mod tests {
             "--no-color",
             "--fields",
             "tenant_id,request_id",
-            "--long-names",
             "--no-events",
             "--no-emoji",
             "--no-filter",
@@ -288,7 +283,6 @@ mod tests {
             args.fields,
             Some(vec!["tenant_id".to_string(), "request_id".to_string()])
         );
-        assert!(args.long_names);
         assert!(args.no_events);
         assert!(args.no_emoji);
         assert!(args.no_filter);
@@ -316,7 +310,7 @@ mod tests {
         assert_eq!(args.output, None);
         assert_eq!(args.fields, None);
         assert_eq!(args.columns, None);
-        assert!(!args.raw && !args.no_color && !args.long_names);
+        assert!(!args.raw && !args.no_color);
         assert!(!args.no_events && !args.no_emoji && !args.no_filter);
     }
 
@@ -372,5 +366,8 @@ mod tests {
         assert!(follow(&["flowcpt", "--columns", "pod=wide"]).is_err());
         assert!(follow(&["flowcpt", "--columns", "pod=24:left"]).is_err());
         assert!(follow(&["flowcpt", "--columns", "pod"]).is_err());
+        // Pod names are never shortened, so the flag that kept them whole is
+        // gone.
+        assert!(follow(&["flowcpt", "--long-names"]).is_err());
     }
 }
