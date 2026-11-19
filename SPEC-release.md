@@ -1,6 +1,6 @@
 # Gossip — Release build and README
 
-Status: draft, 2026-11-18. Nothing of this is implemented yet. It adds to `SPEC.md` and `SPEC-interactive.md` and changes no behaviour of the tool.
+Status: implemented (pull requests 16 to 19). The release process of this spec is in `main`, and `v0.1.0` was published with it. It adds to `SPEC.md` and `SPEC-interactive.md` and changes no behaviour of the tool.
 
 A tag builds Gossip for four platforms and publishes the archives as a GitHub release. The README becomes the front page for someone who has never seen Gossip, is brought up to date with every change to what it describes, and is checked against the code instead of trusted. The model for both is the Rick repository (`Open-Breach/rick`: `.github/workflows/release.yml` and `specs/readme.md`), cut down to what a single command-line binary needs.
 
