@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gossip: third-party licences</title>
+<style>
+  body { font-family: system-ui, sans-serif; line-height: 1.5; max-width: 60rem; margin: 2rem auto; padding: 0 1rem; }
+  pre { white-space: pre-wrap; background: #f6f6f6; color: #111; padding: 1rem; border-radius: 4px; }
+  h3 { margin-top: 2.5rem; }
+  ul.crates { columns: 3 14rem; padding-left: 1.2rem; }
+  @media (prefers-color-scheme: dark) {
+    body { background: #161616; color: #e6e6e6; }
+    pre { background: #242424; color: #e6e6e6; }
+    a { color: #8ab4f8; }
+  }
+</style>
+</head>
+<body>
+<h1>Third-party licences</h1>
+<p>Gossip is licensed under Apache-2.0; its licence is the file <code>LICENSE</code> beside this one. The <code>gossip</code> binary in this archive is built from the crates below. Each is listed under its licence with the licence text, as <code>cargo about</code> collected them for this release.</p>
+
+<h2>Overview</h2>
+<ul>
+{{#each overview}}
+  <li><a href="#{{id}}">{{name}}</a> ({{count}})</li>
+{{/each}}
+</ul>
+
+<h2>Licences</h2>
+{{#each licenses}}
+<h3 id="{{id}}">{{name}}</h3>
+<p>Used by:</p>
+<ul class="crates">
+{{#each used_by}}
+  <li><a href="{{#if crate.repository}}{{crate.repository}}{{else}}https://crates.io/crates/{{crate.name}}{{/if}}">{{crate.name}} {{crate.version}}</a></li>
+{{/each}}
+</ul>
+<pre>{{text}}</pre>
+{{/each}}
+</body>
+</html>

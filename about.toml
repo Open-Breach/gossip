@@ -1,0 +1,33 @@
+# cargo-about: the licence texts of every crate compiled into the binary,
+# shipped in each release archive as THIRD-PARTY-LICENSES.html
+# (SPEC-release.md 2.3). The release workflow runs
+# `cargo about generate about.hbs -o THIRD-PARTY-LICENSES.html` and fails
+# when a crate has a licence that is not accepted here.
+#
+# Where a crate offers a choice, the first of these that it offers is taken.
+accepted = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+# The four targets of the release: a crate that none of them compiles is
+# not listed.
+targets = [
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+# One licence is accepted for the one crate that carries it and for no other,
+# so that a new crate under it stops the release until someone has looked at
+# it. MPL-2.0 asks for the source of the files it covers; the crate is used
+# unchanged and its source is on crates.io.
+[option-ext]
+accepted = ["MPL-2.0"]

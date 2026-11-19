@@ -1,2 +1,4 @@
 # The pinned output of the tests is compared byte for byte.
 crates/gossip/tests/pinned/** text eol=lf
+# The scripts of the workflows run under bash, wherever they were checked out.
+*.sh text eol=lf
