@@ -15,7 +15,7 @@
 mod model;
 mod state;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Debug;
 use std::pin::{Pin, pin};
 use std::task::{Context, Poll};
@@ -62,6 +62,16 @@ pub enum ResolverEvent {
     /// A cluster event about a followed pod or a workload above it.
     Cluster(ClusterEvent),
     Notice(Notice),
+    /// How many pods of a namespace each target has followed containers in,
+    /// by the index of the target in the list the resolver was started
+    /// with. Reported whenever it changes; a target with none is left out.
+    Matched {
+        namespace: String,
+        pods: BTreeMap<usize, usize>,
+    },
+    /// Reported once: every namespace the targets name has its first full
+    /// picture, so whatever was there at the start has been announced.
+    Settled,
 }
 
 /// A running resolution of a set of targets: a stream of
@@ -160,15 +170,18 @@ impl NothingTracker {
         self.waiting_for_namespaces = false;
     }
 
-    /// The targets that match nothing, the one time this can first be said.
-    fn report(&mut self) -> Vec<usize> {
+    /// The targets that match nothing, the one time this can first be said;
+    /// none before and after that time.
+    fn report(&mut self) -> Option<Vec<usize>> {
         if self.reported || self.waiting_for_namespaces || !self.pending.is_empty() {
-            return Vec::new();
+            return None;
         }
         self.reported = true;
-        (0..self.targets)
-            .filter(|index| !self.matched.contains(index))
-            .collect()
+        Some(
+            (0..self.targets)
+                .filter(|index| !self.matched.contains(index))
+                .collect(),
+        )
     }
 }
 
@@ -229,16 +242,21 @@ async fn run(
     }
 
     loop {
-        for index in nothing.report() {
-            let notice = Notice {
-                namespace: targets[index].namespace.to_string(),
-                pod: None,
-                message: format!(
-                    "target {} matches nothing yet; still watching",
-                    targets[index]
-                ),
-            };
-            if tx.send(ResolverEvent::Notice(notice)).await.is_err() {
+        if let Some(unmatched) = nothing.report() {
+            for index in unmatched {
+                let notice = Notice {
+                    namespace: targets[index].namespace.to_string(),
+                    pod: None,
+                    message: format!(
+                        "target {} matches nothing yet; still watching",
+                        targets[index]
+                    ),
+                };
+                if tx.send(ResolverEvent::Notice(notice)).await.is_err() {
+                    return;
+                }
+            }
+            if tx.send(ResolverEvent::Settled).await.is_err() {
                 return;
             }
         }
@@ -271,6 +289,13 @@ async fn run(
                 if let Some(handle) = found.remove(&namespace) {
                     handle.abort();
                     nothing.settled(&namespace, BTreeSet::new());
+                    let nothing_left = ResolverEvent::Matched {
+                        namespace,
+                        pods: BTreeMap::new(),
+                    };
+                    if tx.send(nothing_left).await.is_err() {
+                        return;
+                    }
                 }
             }
             Control::NamespacesFailed(reason) => {
@@ -352,6 +377,10 @@ async fn run_namespace(
                 }
                 Output::Container(event) => ResolverEvent::Container(event),
                 Output::Cluster(event) => ResolverEvent::Cluster(event),
+                Output::Matched { pods } => ResolverEvent::Matched {
+                    namespace: namespace.clone(),
+                    pods,
+                },
                 Output::Notice { pod, message } => ResolverEvent::Notice(Notice {
                     namespace: namespace.clone(),
                     pod,
@@ -525,36 +554,38 @@ mod tests {
         let mut nothing = NothingTracker::new(3, false);
         nothing.started("flowcpt");
         nothing.started("monitoring");
-        assert_eq!(nothing.report(), Vec::<usize>::new());
+        assert_eq!(nothing.report(), None);
 
         nothing.settled("flowcpt", BTreeSet::from([0]));
-        assert_eq!(nothing.report(), Vec::<usize>::new());
+        assert_eq!(nothing.report(), None);
         nothing.settled("monitoring", BTreeSet::new());
-        assert_eq!(nothing.report(), [1, 2]);
+        assert_eq!(nothing.report(), Some(vec![1, 2]));
 
         // It is said once, also when more namespaces come later.
         nothing.started("flowcpt-stg");
         nothing.settled("flowcpt-stg", BTreeSet::new());
-        assert_eq!(nothing.report(), Vec::<usize>::new());
+        assert_eq!(nothing.report(), None);
     }
 
     #[test]
     fn a_namespace_glob_waits_for_the_list_of_namespaces() {
         let mut nothing = NothingTracker::new(1, true);
         // No namespace is known yet, which is not the same as none matching.
-        assert_eq!(nothing.report(), Vec::<usize>::new());
+        assert_eq!(nothing.report(), None);
         nothing.started("flowcpt");
         nothing.namespaces_listed();
-        assert_eq!(nothing.report(), Vec::<usize>::new());
+        assert_eq!(nothing.report(), None);
+        // Every target matches: nothing to say, and that is said once.
         nothing.settled("flowcpt", BTreeSet::from([0]));
-        assert_eq!(nothing.report(), Vec::<usize>::new());
+        assert_eq!(nothing.report(), Some(vec![]));
+        assert_eq!(nothing.report(), None);
     }
 
     #[test]
     fn a_namespace_glob_that_matches_no_namespace_matches_nothing() {
         let mut nothing = NothingTracker::new(1, true);
         nothing.namespaces_listed();
-        assert_eq!(nothing.report(), [0]);
+        assert_eq!(nothing.report(), Some(vec![0]));
     }
 
     #[test]

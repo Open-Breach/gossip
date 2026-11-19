@@ -59,8 +59,10 @@ pub struct Config {
     /// the `--columns` flag go over it.
     #[serde(default, skip_serializing_if = "ColumnsSetting::is_empty")]
     pub columns: ColumnsSetting,
+    /// The templates: named, saved combinations of targets, filters and
+    /// options.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub templates: BTreeMap<String, Template>,
+    pub templates: BTreeMap<String, SessionSpec>,
 }
 
 impl Config {
@@ -83,8 +85,8 @@ impl Config {
 
     /// The lowest layer the config file gives: its `[defaults]` and its
     /// `[columns]`, as a template without targets.
-    pub fn base(&self) -> Template {
-        Template {
+    pub fn base(&self) -> SessionSpec {
+        SessionSpec {
             columns: self.columns,
             ..self.defaults.clone().into()
         }
@@ -137,11 +139,22 @@ fn config_path(from_env: Option<OsString>) -> Result<PathBuf, ConfigError> {
     Ok(directories.config_dir().join("gossip.toml"))
 }
 
-/// A named, saved combination of targets, filters and options. Every key is
-/// optional; what a template leaves out comes from `[defaults]`.
+/// What a session follows and how it is shown: targets, a filter and
+/// options. This is the one type behind a template of the config file, its
+/// `[defaults]`, the flags of the command line and a session that is saved:
+/// each of them says some of it, and they are layered with [`or`].
+///
+/// Every key is optional; what one layer leaves out comes from the layer
+/// below, down to the built-in defaults of [`resolve`]. The session itself
+/// runs on the targets, the container glob, the history, the events switch,
+/// the format and the filter; the fields, the output and the columns belong
+/// to whoever renders its records.
+///
+/// [`or`]: SessionSpec::or
+/// [`resolve`]: SessionSpec::resolve
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Template {
+pub struct SessionSpec {
     /// The kubeconfig context of the cluster.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<String>,
@@ -179,13 +192,13 @@ pub struct Template {
     pub columns: ColumnsSetting,
 }
 
-impl Template {
-    /// Fills in whatever this template leaves out from a lower layer: the
-    /// command line over a template, a template over the defaults.
+impl SessionSpec {
+    /// Fills in whatever this layer leaves out from a lower one: the command
+    /// line over a template, a template over the defaults.
     ///
     /// `since` and `tail` are one setting, the history at start: a layer
     /// that gives either one decides both.
-    pub fn or(mut self, lower: Template) -> Template {
+    pub fn or(mut self, lower: SessionSpec) -> SessionSpec {
         self.context = self.context.or(lower.context);
         if self.targets.is_empty() {
             self.targets = lower.targets;
@@ -262,9 +275,9 @@ impl Defaults {
     }
 }
 
-impl From<Defaults> for Template {
+impl From<Defaults> for SessionSpec {
     fn from(defaults: Defaults) -> Self {
-        Template {
+        SessionSpec {
             context: defaults.context,
             targets: Vec::new(),
             container: defaults.container,
@@ -558,9 +571,9 @@ level = { width = 5 }
         assert_eq!(base.tail, Some(5));
         assert_eq!(base.columns, config.columns);
 
-        let flag = Template {
+        let flag = SessionSpec {
             columns: "container=12".parse().unwrap(),
-            ..Template::default()
+            ..SessionSpec::default()
         };
         let settings = flag
             .or(config.templates["t"].clone())
@@ -745,19 +758,19 @@ level = { width = 5 }
 
     #[test]
     fn the_upper_layer_wins() {
-        let upper = Template {
+        let upper = SessionSpec {
             context: Some("other".into()),
             events: Some(false),
             output: Some(Output::Json),
-            ..Template::default()
+            ..SessionSpec::default()
         };
-        let lower = Template {
+        let lower = SessionSpec {
             context: Some("aks-vulcan-01".into()),
             targets: vec![target("flowcpt")],
             events: Some(true),
             output: Some(Output::Text),
             fields: Some(vec!["a".into()]),
-            ..Template::default()
+            ..SessionSpec::default()
         };
         let layered = upper.or(lower);
         assert_eq!(layered.context.as_deref(), Some("other"));
@@ -781,25 +794,25 @@ level = { width = 5 }
         assert_eq!(staging.tail, None);
 
         // A layer that gives both keeps both.
-        let both = Template {
+        let both = SessionSpec {
             since: Some(Duration::from_secs(60)),
             tail: Some(5),
-            ..Template::default()
+            ..SessionSpec::default()
         };
         let settings = both
-            .or(Template {
+            .or(SessionSpec {
                 tail: Some(100),
-                ..Template::default()
+                ..SessionSpec::default()
             })
             .resolve();
         assert_eq!(settings.since, Some(Duration::from_secs(60)));
         assert_eq!(settings.tail, Some(5));
 
         // A layer that gives neither takes both from below.
-        let settings = Template::default()
-            .or(Template {
+        let settings = SessionSpec::default()
+            .or(SessionSpec {
                 since: Some(Duration::from_secs(60)),
-                ..Template::default()
+                ..SessionSpec::default()
             })
             .resolve();
         assert_eq!(settings.since, Some(Duration::from_secs(60)));
@@ -808,7 +821,7 @@ level = { width = 5 }
 
     #[test]
     fn the_built_in_defaults() {
-        let settings = Template::default().resolve();
+        let settings = SessionSpec::default().resolve();
         assert_eq!(settings.context, None);
         assert!(settings.targets.is_empty());
         assert_eq!(settings.container, None);
@@ -840,7 +853,7 @@ level = { width = 5 }
             columns: "time=0,pod=:start".parse().unwrap(),
             templates: BTreeMap::from([(
                 "t".to_string(),
-                Template {
+                SessionSpec {
                     columns: "container=8:none".parse().unwrap(),
                     targets: vec![target("flowcpt/-/*/api")],
                     format: Some(FormatSetting::PerContainer(BTreeMap::from([(
@@ -848,7 +861,7 @@ level = { width = 5 }
                         FormatChoice::Json,
                     )]))),
                     output: Some(Output::Json),
-                    ..Template::default()
+                    ..SessionSpec::default()
                 },
             )]),
         };
