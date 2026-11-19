@@ -72,6 +72,21 @@ impl TextRenderer {
         TextRenderer { options }
     }
 
+    /// Which fields of a line are shown from here on.
+    pub fn set_fields(&mut self, fields: FieldChoice) {
+        self.options.fields = fields;
+    }
+
+    /// The columns of the prefix from here on.
+    pub fn set_columns(&mut self, columns: Columns) {
+        self.options.columns = columns;
+    }
+
+    /// The columns of the prefix.
+    pub fn columns(&self) -> Columns {
+        self.options.columns
+    }
+
     /// The text of a record, without a line ending. A record whose message
     /// holds several lines gives several lines.
     pub fn render(&self, record: &Record) -> String {

@@ -5,28 +5,46 @@ use std::io::{self, IsTerminal, Write};
 
 use anyhow::{Context, bail};
 use gossip_core::{
-    Cluster, Config, Filter, Kind, Output, Record, Session, SessionOptions, SessionSpec, Settings,
+    Cluster, Config, Kind, Output, Record, Session, SessionOptions, SessionSpec, Settings,
 };
 
 use crate::cli::FollowArgs;
 use crate::fields::FieldChoice;
+use crate::filters::{FilterState, LineRules};
+use crate::interactive;
 use crate::render::{TextOptions, TextRenderer, Zone, json_line};
 
 pub async fn run(args: FollowArgs) -> anyhow::Result<()> {
     let config = Config::load()?;
-    let settings = settings(&args, &config)?;
+    let (settings, filter) = settings_and_filter(&args, &config)?;
     let cluster = Cluster::open(settings.context.as_deref()).await?;
     // A cluster that cannot be reached at start is an error. Once the
     // session runs, the core retries instead.
     cluster.check().await?;
 
-    let mut printer = Printer::new(&args, &settings, io::stdout().is_terminal());
-    let mut session = Session::start(
+    let stdout_is_terminal = io::stdout().is_terminal();
+    let printer = Printer::new(&args, &settings, stdout_is_terminal);
+    let session = Session::start(
         &cluster,
         settings.targets.clone(),
         settings.filter.clone(),
         SessionOptions::from(&settings),
     );
+    // The interactive mode is for a terminal on both sides. Without one,
+    // nothing of it shows: the lines are printed as they always were.
+    if interactive::wanted(&args, io::stdin().is_terminal(), stdout_is_terminal) {
+        let setup = interactive::Setup {
+            printer,
+            filter,
+            pause_buffer: config.pause_buffer,
+        };
+        return interactive::run(session, setup).await;
+    }
+    follow_plainly(session, printer).await
+}
+
+/// Prints the records of a session as they come, until Ctrl-C.
+async fn follow_plainly(mut session: Session, mut printer: Printer) -> anyhow::Result<()> {
     let interrupt = tokio::signal::ctrl_c();
     tokio::pin!(interrupt);
     loop {
@@ -49,7 +67,17 @@ pub async fn run(args: FollowArgs) -> anyhow::Result<()> {
 /// The filter is the one thing a flag does not override. The filter flags
 /// narrow the filter of the config file: a record must pass both. With
 /// `--no-filter` the filter of the config file is dropped first.
+#[cfg(test)]
 fn settings(args: &FollowArgs, config: &Config) -> anyhow::Result<Settings> {
+    settings_and_filter(args, config).map(|(settings, _)| settings)
+}
+
+/// The same, and the filter in its two parts: the filter of the config file
+/// and the rules of the flags, which the commands typed later change.
+fn settings_and_filter(
+    args: &FollowArgs,
+    config: &Config,
+) -> anyhow::Result<(Settings, FilterState)> {
     let asked = SessionSpec {
         context: args.context.clone(),
         targets: args.targets.clone(),
@@ -70,45 +98,25 @@ fn settings(args: &FollowArgs, config: &Config) -> anyhow::Result<Settings> {
     let mut settings = asked.or(template).or(config.base()).resolve();
     // What is left in `filter` is the filter of the config file: the
     // template's, or the one of the defaults.
-    let from_config = settings.filter.take().filter(|_| !args.no_filter);
-    settings.filter = match (from_config, filter(args)?) {
-        (Some(from_config), Some(from_flags)) => Some(Filter::All(vec![from_config, from_flags])),
-        (from_config, from_flags) => from_config.or(from_flags),
+    let filter = FilterState {
+        base: settings.filter.take().filter(|_| !args.no_filter),
+        rules: LineRules::from_args(args)?,
     };
+    settings.filter = filter.filter();
     if settings.targets.is_empty()
         && let Some(name) = &args.template
     {
         bail!("the template `{name}` has no targets");
     }
-    Ok(settings)
+    Ok((settings, filter))
 }
 
 /// The filter the flags stand for: every one of them must hold for a line.
 /// The flags are about lines; events pass them, and `--no-events` is what
 /// leaves events out.
-fn filter(args: &FollowArgs) -> anyhow::Result<Option<Filter>> {
-    let mut rules = Vec::new();
-    if let Some(level) = args.level {
-        rules.push(Filter::level_at_least(level));
-    }
-    if let Some(text) = &args.grep {
-        rules.push(Filter::message_contains(text));
-    }
-    if let Some(regex) = &args.matches {
-        rules.push(Filter::message_matches(regex).context("--match")?);
-    }
-    for pair in &args.fields_equal {
-        let Some((key, value)) = pair.split_once('=') else {
-            bail!("--field takes KEY=VALUE, and `{pair}` has no `=`");
-        };
-        rules.push(Filter::field_equals(key, value).context("--field")?);
-    }
-    let lines = match rules.len() {
-        0 => return Ok(None),
-        1 => rules.remove(0),
-        _ => Filter::All(rules),
-    };
-    Ok(Some(Filter::Any(vec![Filter::kind_is(Kind::Event), lines])))
+#[cfg(test)]
+fn filter(args: &FollowArgs) -> anyhow::Result<Option<gossip_core::Filter>> {
+    Ok(LineRules::from_args(args)?.filter())
 }
 
 /// Whether the terminal can be trusted with emoji: the locale says UTF-8.
@@ -129,7 +137,7 @@ fn is_utf8_locale(locale: &str) -> bool {
 }
 
 /// Prints records to stdout in the rendering that was asked for.
-struct Printer {
+pub struct Printer {
     mode: Mode,
 }
 
@@ -139,40 +147,84 @@ enum Mode {
     Raw,
 }
 
+/// A record as it is printed, without its line ending.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Rendered {
+    /// A line of the output.
+    Out(String),
+    /// Something beside the output: a notice of the raw output, which is
+    /// the lines and nothing else, so what the core has to say goes to
+    /// stderr.
+    Aside(String),
+}
+
 impl Printer {
+    /// A printer of text lines.
+    pub fn text_with(options: TextOptions) -> Printer {
+        Printer {
+            mode: Mode::Text(TextRenderer::new(options)),
+        }
+    }
+
+    /// A printer of one JSON object per record.
+    #[cfg(test)]
+    pub fn json() -> Printer {
+        Printer { mode: Mode::Json }
+    }
+
+    /// A printer of the raw lines.
+    #[cfg(test)]
+    pub fn raw() -> Printer {
+        Printer { mode: Mode::Raw }
+    }
+
     fn new(args: &FollowArgs, settings: &Settings, stdout_is_terminal: bool) -> Self {
-        let mode = if args.raw {
-            Mode::Raw
-        } else if settings.output == Output::Json {
-            Mode::Json
-        } else {
-            Mode::Text(TextRenderer::new(TextOptions {
-                colour: stdout_is_terminal && !args.no_color,
-                fields: FieldChoice::from_setting(settings.fields.as_deref()),
-                // Emoji only where they will show: a terminal that says
-                // it speaks UTF-8.
-                emoji: !args.no_emoji && stdout_is_terminal && locale_is_utf8(),
-                zone: Zone::Local,
-                columns: settings.columns,
-            }))
-        };
-        Printer { mode }
+        if args.raw {
+            return Printer { mode: Mode::Raw };
+        }
+        if settings.output == Output::Json {
+            return Printer { mode: Mode::Json };
+        }
+        Printer::text_with(TextOptions {
+            colour: stdout_is_terminal && !args.no_color,
+            fields: FieldChoice::from_setting(settings.fields.as_deref()),
+            // Emoji only where they will show: a terminal that says
+            // it speaks UTF-8.
+            emoji: !args.no_emoji && stdout_is_terminal && locale_is_utf8(),
+            zone: Zone::Local,
+            columns: settings.columns,
+        })
+    }
+
+    /// A record in the rendering that was asked for.
+    pub fn render(&mut self, record: &Record) -> anyhow::Result<Rendered> {
+        Ok(match &mut self.mode {
+            Mode::Text(renderer) => Rendered::Out(renderer.render(record)),
+            Mode::Json => {
+                Rendered::Out(json_line(record).context("cannot write a record as JSON")?)
+            }
+            Mode::Raw if record.kind == Kind::Notice => {
+                Rendered::Aside(format!("-- {}", record.message))
+            }
+            Mode::Raw => Rendered::Out(record.raw.clone()),
+        })
     }
 
     fn print(&mut self, record: &Record) -> anyhow::Result<()> {
-        let mut out = io::stdout().lock();
-        match &mut self.mode {
-            Mode::Text(renderer) => writeln!(out, "{}", renderer.render(record))?,
-            Mode::Json => {
-                let line = json_line(record).context("cannot write a record as JSON")?;
-                writeln!(out, "{line}")?;
-            }
-            // The raw output is the lines and nothing else, so what the
-            // core has to say goes to stderr.
-            Mode::Raw if record.kind == Kind::Notice => eprintln!("-- {}", record.message),
-            Mode::Raw => writeln!(out, "{}", record.raw)?,
+        match self.render(record)? {
+            Rendered::Out(line) => writeln!(io::stdout().lock(), "{line}")?,
+            Rendered::Aside(line) => eprintln!("{line}"),
         }
         Ok(())
+    }
+
+    /// The renderer of the text output; none for JSON and raw output,
+    /// which have no fields and no columns to choose.
+    pub fn text(&mut self) -> Option<&mut TextRenderer> {
+        match &mut self.mode {
+            Mode::Text(renderer) => Some(renderer),
+            Mode::Json | Mode::Raw => None,
+        }
     }
 }
 
@@ -182,7 +234,7 @@ mod tests {
     use std::time::Duration;
 
     use clap::Parser;
-    use gossip_core::{FormatChoice, FormatSetting, Level};
+    use gossip_core::{Filter, FormatChoice, FormatSetting, Level};
 
     use crate::cli::{Cli, Command};
 

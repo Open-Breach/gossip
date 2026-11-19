@@ -75,23 +75,34 @@ pub fn fit(text: &str, column: Column) -> Option<String> {
 /// padded to `width`. A character that is two cells wide is kept whole or
 /// not at all.
 pub fn keep_ends(text: &str, head: usize, tail: usize, width: usize) -> String {
-    let pieces = pieces(text);
-    let mut front = 0;
-    let mut head_cells = 0;
-    while front < pieces.len() && head_cells + pieces[front].cells <= head {
-        head_cells += pieces[front].cells;
-        front += 1;
+    let start = start_of(text, head);
+    let end = end_of(&text[start.len()..], tail);
+    let taken = cells(start) + 1 + cells(end);
+    pad(format!("{start}{ELLIPSIS}{end}"), taken, width)
+}
+
+/// The longest start of a text that takes no more than this many cells.
+pub fn start_of(text: &str, room: usize) -> &str {
+    let mut taken = 0;
+    for piece in pieces(text) {
+        if taken + piece.cells > room {
+            return &text[..piece.start];
+        }
+        taken += piece.cells;
     }
-    let mut back = pieces.len();
-    let mut tail_cells = 0;
-    while back > front && tail_cells + pieces[back - 1].cells <= tail {
-        tail_cells += pieces[back - 1].cells;
-        back -= 1;
+    text
+}
+
+/// The longest end of a text that takes no more than this many cells.
+pub fn end_of(text: &str, room: usize) -> &str {
+    let mut taken = 0;
+    for piece in pieces(text).iter().rev() {
+        if taken + piece.cells > room {
+            return &text[piece.end..];
+        }
+        taken += piece.cells;
     }
-    let head_end = pieces.get(front).map_or(text.len(), |piece| piece.start);
-    let tail_start = pieces.get(back).map_or(text.len(), |piece| piece.start);
-    let cut = format!("{}{ELLIPSIS}{}", &text[..head_end], &text[tail_start..]);
-    pad(cut, head_cells + 1 + tail_cells, width)
+    text
 }
 
 fn pad(mut text: String, taken: usize, width: usize) -> String {
@@ -228,6 +239,21 @@ mod tests {
         let family = "👨\u{200d}👩\u{200d}👧";
         let cut = fitted(&format!("{family}{family}{family}"), 3, Cut::End);
         assert!(cut == format!("{family}…") || cut == "…  ", "{cut:?}");
+    }
+
+    #[test]
+    fn the_start_and_the_end_of_a_text_by_cells() {
+        assert_eq!(start_of("fc-api", 3), "fc-");
+        assert_eq!(end_of("fc-api", 3), "api");
+        assert_eq!(start_of("fc-api", 0), "");
+        assert_eq!(end_of("fc-api", 0), "");
+        assert_eq!(start_of("fc-api", 10), "fc-api");
+        assert_eq!(end_of("fc-api", 10), "fc-api");
+        // An emoji is kept whole or not at all.
+        assert_eq!(start_of("a🚀b", 2), "a");
+        assert_eq!(start_of("a🚀b", 3), "a🚀");
+        assert_eq!(end_of("a🚀b", 2), "b");
+        assert_eq!(end_of("a🚀b", 3), "🚀b");
     }
 
     #[test]
