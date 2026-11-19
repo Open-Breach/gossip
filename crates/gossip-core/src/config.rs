@@ -30,6 +30,10 @@ pub const CONFIG_ENV: &str = "GOSSIP_CONFIG";
 /// nor `tail` is given anywhere.
 pub const DEFAULT_TAIL: u64 = 20;
 
+/// How many records a paused output holds when the config file does not
+/// say.
+pub const DEFAULT_PAUSE_BUFFER: usize = 10_000;
+
 /// Why the config file could not be read or written.
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -52,6 +56,11 @@ pub enum ConfigError {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// How many records the output holds while it is paused; beyond that
+    /// the oldest are dropped. Zero is no limit. This is about whoever
+    /// shows the records, and the core only reads it for them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_buffer: Option<usize>,
     /// Fills in anything a template or the command line leaves out.
     #[serde(default, skip_serializing_if = "Defaults::is_empty")]
     pub defaults: Defaults,
@@ -619,6 +628,31 @@ level = { width = 5 }
     }
 
     #[test]
+    fn the_pause_buffer_is_a_key_at_the_top_of_the_file() {
+        let config = Config::from_toml("pause_buffer = 100\n\n[defaults]\ntail = 5\n").unwrap();
+        assert_eq!(config.pause_buffer, Some(100));
+        assert_eq!(config.defaults.tail, Some(5));
+        assert_eq!(
+            Config::from_toml("pause_buffer = 0\n")
+                .unwrap()
+                .pause_buffer,
+            Some(0)
+        );
+        assert_eq!(Config::from_toml("").unwrap().pause_buffer, None);
+        // It is written back before the tables, where TOML wants it.
+        let text = config.to_toml().unwrap();
+        assert!(text.starts_with("pause_buffer = 100\n"), "{text}");
+        assert_eq!(Config::from_toml(&text).unwrap(), config);
+
+        let error = error_of("pause_buffer = -1\n");
+        assert!(error.contains("line 1"), "{error}");
+        assert!(error.contains("pause_buffer"), "{error}");
+        // Under a table it is an unknown key.
+        let error = error_of("[defaults]\npause_buffer = 100\n");
+        assert!(error.contains("line 2"), "{error}");
+    }
+
+    #[test]
     fn format_is_one_word_or_a_table_by_container() {
         let config = Config::from_toml(
             r#"
@@ -845,6 +879,7 @@ level = { width = 5 }
         assert_eq!(Config::from_toml(&text).unwrap(), config, "{text}");
 
         let everything = Config {
+            pause_buffer: Some(500),
             defaults: Defaults {
                 format: Some(FormatSetting::All(FormatChoice::Logfmt)),
                 since: Some(Duration::from_secs(90)),

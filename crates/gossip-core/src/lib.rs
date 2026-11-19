@@ -50,7 +50,10 @@ pub mod testing;
 
 pub use cluster::{Cluster, ContextInfo};
 pub use columns::{Column, ColumnSetting, Columns, ColumnsError, ColumnsSetting, Cut};
-pub use config::{Config, ConfigError, Defaults, FormatSetting, Output, SessionSpec, Settings};
+pub use config::{
+    Config, ConfigError, DEFAULT_PAUSE_BUFFER, Defaults, FormatSetting, Output, SessionSpec,
+    Settings,
+};
 pub use discovery::{ContainerInfo, DeploymentInfo, NamespaceInfo, PodInfo};
 pub use duration::{DurationError, format_duration, parse_duration};
 pub use error::Error;

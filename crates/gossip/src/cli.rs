@@ -149,6 +149,17 @@ pub struct FollowArgs {
     /// stdout is a terminal and the locale is UTF-8].
     #[arg(long)]
     pub no_emoji: bool,
+
+    /// Read keys while following, also when stdin is not a terminal: Space
+    /// pauses, `:` opens a command line, `?` lists the keys and commands.
+    /// Stdout must be a terminal [default: on when stdin and stdout are
+    /// both a terminal].
+    #[arg(long, conflicts_with = "no_interactive")]
+    pub interactive: bool,
+
+    /// Read no keys: follow and print, and nothing else.
+    #[arg(long)]
+    pub no_interactive: bool,
 }
 
 #[derive(Debug, Args)]
@@ -251,6 +262,7 @@ mod tests {
             "--no-filter",
             "--columns",
             "pod=24:middle,container=8",
+            "--no-interactive",
         ])
         .unwrap();
         assert_eq!(args.targets.len(), 2);
@@ -278,6 +290,15 @@ mod tests {
             args.columns,
             Some("pod=24:middle,container=8".parse().unwrap())
         );
+        assert!(args.no_interactive && !args.interactive);
+    }
+
+    #[test]
+    fn interactive_can_be_forced_or_turned_off_but_not_both() {
+        let args = follow(&["flowcpt"]).unwrap();
+        assert!(!args.interactive && !args.no_interactive);
+        assert!(follow(&["flowcpt", "--interactive"]).unwrap().interactive);
+        assert!(follow(&["flowcpt", "--interactive", "--no-interactive"]).is_err());
     }
 
     #[test]

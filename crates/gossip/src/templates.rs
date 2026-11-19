@@ -132,7 +132,7 @@ fn columns_text(columns: &ColumnsSetting) -> String {
 
 /// A filter as the config file writes it: a rule on one line, `all` and
 /// `any` with one filter per line.
-fn filter_text(filter: &Filter, depth: usize) -> String {
+pub fn filter_text(filter: &Filter, depth: usize) -> String {
     let list = |key: &str, filters: &[Filter]| {
         if filters.is_empty() {
             return format!("{{ {key} = [] }}");
