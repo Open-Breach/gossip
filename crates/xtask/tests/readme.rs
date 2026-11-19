@@ -131,19 +131,8 @@ fn without_line(start: &str) -> String {
 
 // ---- the README of the repository --------------------------------------------
 
-/// Whether README.md has been written to the structure of the spec yet.
-/// It gets its fixed texts and its generated parts in the step after this
-/// one; until then there is nothing of it to hold against the code, and the
-/// tests below hold a README made here against it instead.
-fn the_readme_is_written() -> bool {
-    repository_readme().contains("<!-- generated:")
-}
-
 #[test]
 fn the_readme_of_the_repository_is_what_the_code_and_the_spec_say() {
-    if !the_readme_is_written() {
-        return;
-    }
     let problems = problems(&repository_readme());
     assert!(problems.is_empty(), "README.md:\n{}", problems.join("\n\n"));
 }
@@ -818,9 +807,6 @@ fn the_release_check_fails_on_a_link_to_an_archive_of_another_release() {
 
 #[test]
 fn the_readme_of_the_repository_passes_the_release_check_for_its_version() {
-    if !the_readme_is_written() {
-        return;
-    }
     let path = readme::repository().join("README.md");
     let (code, text) = check_readme(&format!("v{VERSION}"), &path);
     assert_eq!(code, 0, "{text}");

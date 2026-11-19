@@ -193,14 +193,14 @@ fn the_config_example_of_the_readme_is_a_valid_config() {
     assert!(output.status.success(), "{}", text(&output.stderr));
     assert_eq!(
         text(&output.stdout),
-        "NAME          TARGETS\n\
-         dev-api       flowcpt/flowcpt-api, flowcpt/flowcpt-web-api\n\
-         staging-all   flowcpt-stg\n"
+        "NAME       TARGETS\n\
+         api-json   shop/api\n\
+         shop       shop/api, shop/web\n"
     );
-    let output = gossip(&config, &["templates", "show", "staging-all"]);
+    let output = gossip(&config, &["templates", "show", "api-json"]);
     assert!(output.status.success(), "{}", text(&output.stderr));
     assert!(
-        text(&output.stdout).contains(r#"format = { api = "json", envoy = "text" }"#),
+        text(&output.stdout).contains(r#"format = { api = "json" }"#),
         "{}",
         text(&output.stdout)
     );
