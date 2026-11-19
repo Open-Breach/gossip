@@ -25,9 +25,14 @@ pub mod screen;
 mod terminal;
 
 use std::io::{self, IsTerminal, Write};
+use std::path::PathBuf;
 
 use chrono::Utc;
-use gossip_core::{Columns, ColumnsSetting, DEFAULT_PAUSE_BUFFER, Record, Session, SessionHandle};
+use gossip_core::save::LAST;
+use gossip_core::{
+    Columns, ColumnsSetting, Config, ConfigError, DEFAULT_PAUSE_BUFFER, Record, Session,
+    SessionHandle, SessionSpec, is_template_name, template_toml,
+};
 
 use self::command::Command;
 use self::keys::{Action, Key, Keyboard};
@@ -35,7 +40,7 @@ use self::pause::{PauseBuffer, lines, with_thousands};
 use self::screen::{Screen, Status};
 use crate::cli::FollowArgs;
 use crate::fields::FieldChoice;
-use crate::filters::FilterState;
+use crate::filters::{FilterState, LineRules};
 use crate::follow::{Printer, Rendered};
 
 /// Whether the interactive mode is on: with a terminal on both sides, or,
@@ -54,6 +59,11 @@ pub struct Setup {
     /// How many records wait while the output is paused, as the config file
     /// says; zero is no limit.
     pub pause_buffer: Option<usize>,
+    /// The template the session was started from, which `:save` alone
+    /// writes back to.
+    pub template: Option<String>,
+    /// The config file, which `:save` writes and `:load` reads.
+    pub config_path: PathBuf,
 }
 
 /// Whether to go on after a key.
@@ -106,8 +116,17 @@ pub async fn run(mut session: Session, setup: Setup) -> anyhow::Result<()> {
             },
         }
     }
+    // On every quit the session is kept as it is now, for `--last`.
+    let last = console.last_session();
+    let config_path = console.config_path.clone();
     console.leave()?;
     drop(raw_mode);
+    if let Some(session) = last
+        && let Err(error) = Config::save_template(&config_path, LAST, &session)
+    {
+        // Said once; quitting goes on.
+        eprintln!("gossip: the session was not kept for `--last`: {error}");
+    }
     if killed {
         // What the signal would have done, had it not been caught to leave
         // the terminal as it was found.
@@ -151,6 +170,12 @@ pub struct Console<W: Write> {
     /// Whether what goes beside the output, the notices of the raw output,
     /// goes through the screen: stderr is the same terminal.
     asides_on_screen: bool,
+    /// The template the session is: the one it was started from, loaded
+    /// from or saved as last. `:save` alone writes back to it.
+    template: Option<String>,
+    config_path: PathBuf,
+    /// The template whose overwriting waits for a `y` or an `n`.
+    overwriting: Option<String>,
 }
 
 impl<W: Write> Console<W> {
@@ -174,6 +199,9 @@ impl<W: Write> Console<W> {
             columns_at_start,
             cluster,
             asides_on_screen,
+            template: setup.template,
+            config_path: setup.config_path,
+            overwriting: None,
         }
     }
 
@@ -197,6 +225,7 @@ impl<W: Write> Console<W> {
             Action::Clear => self.clear()?,
             Action::Help => self.help()?,
             Action::Prompt => {}
+            Action::Answer(yes) => self.answered(yes)?,
             Action::Run(line) => {
                 // The command line is closed; its answer comes beneath
                 // what is on the screen.
@@ -219,6 +248,9 @@ impl<W: Write> Console<W> {
     /// What the status line shows: the command line while it is open, the
     /// pause while the output is paused, and nothing while lines flow.
     fn status(&self) -> Option<Status> {
+        if let Some(question) = self.keyboard.question() {
+            return Some(Status::plain(question));
+        }
         if let Some((text, before_cursor)) = self.keyboard.prompt() {
             return Some(Status {
                 text: format!(":{text}"),
@@ -345,7 +377,7 @@ impl<W: Write> Console<W> {
             Command::ShowFilter => {
                 let text = match self.filter.filter() {
                     Some(filter) => {
-                        format!("filter = {}", crate::templates::filter_text(&filter, 0))
+                        format!("filter = {}", gossip_core::filter_toml(&filter))
                     }
                     None => "no filter".to_string(),
                 };
@@ -403,6 +435,40 @@ impl<W: Write> Console<W> {
             Command::ShowColumns => self.set_columns(|columns, _| columns)?,
             Command::ColumnsDefault => self.set_columns(|_, at_start| at_start)?,
             Command::Columns(setting) => self.set_columns(|columns, _| setting.over(columns))?,
+            Command::Save(None) => match self.template.clone() {
+                Some(name) => self.save(&name)?,
+                // Without a template to write back to, the name is asked
+                // for: the command line opens again, to take it.
+                None => self.keyboard.open_with("save "),
+            },
+            Command::Save(Some(name)) => self.save_as(name)?,
+            Command::Load(name) => self.load(&name)?,
+            Command::Templates => match self.config() {
+                Ok(config) if config.templates.is_empty() => self.say_one(format!(
+                    "the config file {} holds no templates",
+                    self.config_path.display()
+                ))?,
+                Ok(config) => {
+                    let table = crate::templates::list(&config).render();
+                    let lines: Vec<String> = table.lines().map(str::to_string).collect();
+                    self.say(&lines)?;
+                }
+                Err(error) => self.say_one(error.to_string())?,
+            },
+            Command::ShowTemplate(name) => {
+                let text = self
+                    .config()
+                    .map_err(|error| error.to_string())
+                    .and_then(|config| {
+                        crate::templates::find(&config, &name)
+                            .map(|template| template_toml(&name, template))
+                            .map_err(|error| error.to_string())
+                    });
+                match text {
+                    Ok(text) => self.say_one(text.trim_end())?,
+                    Err(error) => self.say_one(error)?,
+                }
+            }
             Command::Clear => self.clear()?,
             Command::Quit => return Ok(Flow::Quit),
             Command::Help => self.help()?,
@@ -410,6 +476,145 @@ impl<W: Write> Console<W> {
             Command::Panic => panic!("`:panic` was entered"),
         }
         Ok(Flow::Continue)
+    }
+
+    /// The config file as it is on disk right now; another terminal may
+    /// have written to it since this one started.
+    fn config(&self) -> Result<Config, ConfigError> {
+        if !self.config_path.exists() {
+            return Ok(Config::default());
+        }
+        Config::load_from(&self.config_path)
+    }
+
+    /// The session as it is now, as a template holds it: what the session
+    /// follows, with the fields and the columns of the output.
+    fn session_spec(&mut self) -> SessionSpec {
+        let mut spec = self.session.spec();
+        // The filter as it was last asked for; the session has the same,
+        // unless the change is still on its way to it.
+        spec.filter = self.filter.filter();
+        spec.output = self.printer.output();
+        // Only the columns that differ from those of the config file, so
+        // that the rest keeps following it.
+        let base = self
+            .config()
+            .map(|config| config.columns)
+            .unwrap_or_default();
+        if let Some(renderer) = self.printer.text() {
+            spec.fields = renderer.fields_shown().to_setting();
+            spec.columns = renderer.columns().differing_from(base.resolve());
+        }
+        spec
+    }
+
+    /// The session as it is when the program quits, to be kept for
+    /// `--last`. None when nothing is followed: there is nothing to resume.
+    pub fn last_session(&mut self) -> Option<SessionSpec> {
+        let spec = self.session_spec();
+        (!spec.targets.is_empty()).then_some(spec)
+    }
+
+    /// `:save <name>`: writes the session as a template of that name. One
+    /// that is there is written over only after a `y`.
+    fn save_as(&mut self, name: String) -> anyhow::Result<()> {
+        if !is_template_name(&name) {
+            return self.say_one(ConfigError::TemplateName(name).to_string());
+        }
+        if name == LAST {
+            return self.say_one(
+                "`last` is where gossip itself keeps the session when it quits; save under \
+                 another name",
+            );
+        }
+        match self.config() {
+            Ok(config) if config.templates.contains_key(&name) => {
+                self.keyboard
+                    .ask(format!("overwrite the template {name}? y/n"));
+                self.overwriting = Some(name);
+                Ok(())
+            }
+            Ok(_) => self.save(&name),
+            // A file that cannot be read is not written to.
+            Err(error) => self.say_one(format!("not saved: {error}")),
+        }
+    }
+
+    /// The answer to the question on the status line.
+    fn answered(&mut self, yes: bool) -> anyhow::Result<()> {
+        let Some(name) = self.overwriting.take() else {
+            return Ok(());
+        };
+        if yes {
+            self.save(&name)
+        } else {
+            self.say_one(format!("the template {name} was left as it is"))
+        }
+    }
+
+    fn save(&mut self, name: &str) -> anyhow::Result<()> {
+        let spec = self.session_spec();
+        match Config::save_template(&self.config_path, name, &spec) {
+            Ok(()) => {
+                self.template = Some(name.to_string());
+                self.say_one(format!(
+                    "saved as the template {name} in {}",
+                    self.config_path.display()
+                ))
+            }
+            Err(error) => self.say_one(format!("not saved: {error}")),
+        }
+    }
+
+    /// `:load <name>`: replaces the running session with a template. What
+    /// the session follows changes through its handle; the filter, the
+    /// fields and the columns of the template take the place of what the
+    /// flags and the commands had made of them.
+    fn load(&mut self, name: &str) -> anyhow::Result<()> {
+        let config = match self.config() {
+            Ok(config) => config,
+            Err(error) => return self.say_one(error.to_string()),
+        };
+        let template = match crate::templates::find(&config, name) {
+            Ok(template) => template.clone(),
+            Err(error) => return self.say_one(error.to_string()),
+        };
+        if let Some(context) = &template.context
+            && *context != self.cluster
+        {
+            return self.say_one(format!(
+                "the template {name} is for the cluster {context}, and this session follows the \
+                 cluster {}; nothing changed",
+                self.cluster
+            ));
+        }
+        // What the template leaves out comes from the config file, as with
+        // `--template`; the cluster is the one of this session.
+        let spec = SessionSpec {
+            context: None,
+            ..template.or(config.base())
+        };
+        if spec.targets.is_empty() {
+            return self.say_one(format!("the template `{name}` has no targets"));
+        }
+        let settings = spec.clone().resolve();
+        self.filter = FilterState {
+            base: settings.filter.clone(),
+            rules: LineRules::default(),
+        };
+        if self.paused {
+            self.waiting.narrow(settings.filter.as_ref());
+        }
+        if let Some(renderer) = self.printer.text() {
+            renderer.set_fields(FieldChoice::from_setting(settings.fields.as_deref()));
+            renderer.set_columns(settings.columns);
+            self.columns_at_start = Some(settings.columns);
+        }
+        self.template = (name != LAST).then(|| name.to_string());
+        self.say_one(format!("loading the template {name}"))?;
+        // The session answers when the cluster has been asked.
+        self.session.load(spec);
+        Ok(())
     }
 
     /// Hands the filter as it is now to the session, which answers with a

@@ -19,6 +19,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 toml.workspace = true
+toml_edit.workspace = true
 
 [features]
 # A stand-in API server for tests, also for the tests of front ends.

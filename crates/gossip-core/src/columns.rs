@@ -80,6 +80,24 @@ pub struct Columns {
     pub level: Column,
 }
 
+impl Columns {
+    /// The table that, laid over `base`, gives these columns: what differs
+    /// and nothing else. It is what a template holds of its columns, so that
+    /// the rest keeps following the `[columns]` of the config file.
+    pub fn differing_from(self, base: Columns) -> ColumnsSetting {
+        let differing = |column: Column, base: Column| ColumnSetting {
+            width: (column.width != base.width).then_some(column.width),
+            cut: (column.cut != base.cut).then_some(column.cut),
+        };
+        ColumnsSetting {
+            time: differing(self.time, base.time),
+            pod: differing(self.pod, base.pod),
+            container: differing(self.container, base.container),
+            level: differing(self.level, base.level),
+        }
+    }
+}
+
 impl Default for Columns {
     fn default() -> Self {
         Columns {
@@ -403,6 +421,24 @@ mod tests {
         // What no layer names is the built-in column.
         assert_eq!((columns.level.width, columns.level.cut), (0, Cut::End));
         assert_eq!(columns.time, Columns::default().time);
+    }
+
+    #[test]
+    fn what_differs_from_a_base_is_the_table_that_gives_the_columns_back() {
+        let base = "pod=30:start,container=8"
+            .parse::<ColumnsSetting>()
+            .unwrap()
+            .resolve();
+        // Nothing differs from itself.
+        assert!(base.differing_from(base).is_empty());
+        let columns = "time=0,pod=30:end,container=8,level=5"
+            .parse::<ColumnsSetting>()
+            .unwrap()
+            .over(base);
+        let differing = columns.differing_from(base);
+        // Part by part: the width of the time, the side of the pod.
+        assert_eq!(differing.to_string(), "time=0,pod=:end");
+        assert_eq!(differing.over(base), columns);
     }
 
     #[test]

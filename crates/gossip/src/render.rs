@@ -77,6 +77,11 @@ impl TextRenderer {
         self.options.fields = fields;
     }
 
+    /// Which fields of a line are shown.
+    pub fn fields_shown(&self) -> &FieldChoice {
+        &self.options.fields
+    }
+
     /// The columns of the prefix from here on.
     pub fn set_columns(&mut self, columns: Columns) {
         self.options.columns = columns;

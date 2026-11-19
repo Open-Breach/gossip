@@ -2,13 +2,15 @@
 //! terminal shows is read back. The session behind it follows the stand-in
 //! API server of the core.
 
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, TimeZone, Utc};
 use gossip_core::testing::{
     FakeCluster, deployments, owner, pod_object, pods, replica_sets, workload_object,
 };
-use gossip_core::{Columns, Filter, Level, Session, SessionOptions, Target};
+use gossip_core::{Columns, Config, Filter, Level, Session, SessionOptions, Target};
 use tokio::time::timeout;
 
 use super::screen::testing::Tape;
@@ -77,6 +79,13 @@ struct Run {
     session: Session,
     console: Console<Tape>,
     tape: Tape,
+    config_path: PathBuf,
+}
+
+impl Drop for Run {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.config_path);
+    }
 }
 
 impl Run {
@@ -99,10 +108,21 @@ impl Run {
             },
         );
         let tape = Tape::default();
+        // A config file of the test's own; it is not there until something
+        // writes it.
+        static NUMBER: AtomicUsize = AtomicUsize::new(0);
+        let config_path = std::env::temp_dir().join(format!(
+            "gossip-console-{}-{}.toml",
+            std::process::id(),
+            NUMBER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&config_path);
         let setup = Setup {
             printer,
             filter,
             pause_buffer,
+            template: None,
+            config_path: config_path.clone(),
         };
         let console = Console::new(tape.clone(), || 80, setup, session.handle(), true);
         Run {
@@ -110,7 +130,17 @@ impl Run {
             session,
             console,
             tape,
+            config_path,
         }
+    }
+
+    /// The config file as it is on disk; empty when it is not there.
+    fn config_text(&self) -> String {
+        std::fs::read_to_string(&self.config_path).unwrap_or_default()
+    }
+
+    fn config(&self) -> Config {
+        Config::from_toml(&self.config_text()).unwrap()
     }
 
     /// Writes a line to the log of the followed pod.
@@ -893,6 +923,366 @@ async fn the_notices_of_the_raw_output_do_not_stagger_the_lines() {
     );
     // The line itself is byte for byte what the container wrote.
     assert!(run.tape.text().starts_with("  a raw line  \r\n"));
+}
+
+// ---- templates from inside -----------------------------------------------------------
+
+/// A config file with comments, a default, and two templates.
+const CONFIG: &str = r#"# My gossip config.
+
+[defaults]
+tail = 5   # short
+
+# The web api alone, warnings only.
+[templates.web]
+targets = ["fc-stg/fc-web-api"]
+container = "api"
+filter = { field = "level", op = ">=", value = "warn" }
+fields = ["tenant_id"]
+columns = { time = { width = 0 }, pod = { width = 0 }, container = { width = 0 }, level = { width = 5 } }
+
+[templates.elsewhere]
+context = "aks-vulcan-01"
+targets = ["flowcpt"]
+"#;
+
+#[tokio::test]
+async fn save_writes_the_session_as_it_is_at_that_moment_and_keeps_the_rest_of_the_file() {
+    let mut run = Run::start().await;
+    std::fs::write(&run.config_path, CONFIG).unwrap();
+    run.command("add fc-stg/fc-web-api");
+    run.command("level warn");
+    run.command("fields tenant_id,request_id");
+    run.pump(2).await;
+
+    // Acceptance 7.
+    run.command("save dev-api");
+    let lines = run.lines();
+    assert_eq!(
+        lines[lines.len() - 2],
+        format!(
+            "-- saved as the template dev-api in {}",
+            run.config_path.display()
+        )
+    );
+    // The file as it was, comments and all, and the new template after it.
+    assert_eq!(
+        run.config_text(),
+        format!(
+            "{CONFIG}\n{}",
+            r#"[templates.dev-api]
+context = "fake"
+targets = ["fc-stg/fc-api", "fc-stg/fc-web-api"]
+tail = 20
+events = false
+filter = { any = [
+  { field = "kind", op = "==", value = "event" },
+  { field = "level", op = ">=", value = "warn" },
+] }
+fields = ["tenant_id", "request_id"]
+columns = { time = { width = 0 }, pod = { width = 0 }, container = { width = 0 }, level = { width = 0 } }
+"#
+        )
+    );
+    // What was written is what the session follows.
+    let saved = run.config().templates["dev-api"].clone();
+    let spec = run.session.handle().spec();
+    assert_eq!(saved.targets, spec.targets);
+    assert_eq!(saved.filter, spec.filter);
+    assert_eq!(run.config().templates.len(), 3);
+}
+
+#[tokio::test]
+async fn an_existing_template_is_overwritten_only_after_a_y() {
+    let mut run = Run::start().await;
+    std::fs::write(&run.config_path, CONFIG).unwrap();
+
+    run.command("save web");
+    assert_eq!(run.status(), "overwrite the template web? y/n");
+    // The stream goes on above the question.
+    run.log(0, "one");
+    run.pump(1).await;
+    assert_eq!(run.lines(), ["one", "overwrite the template web? y/n"]);
+    // Anything but `y` is a no.
+    run.press(Key::Char('n'));
+    assert_eq!(
+        run.lines(),
+        ["one", "-- the template web was left as it is", ""]
+    );
+    assert_eq!(run.config_text(), CONFIG);
+
+    run.command("save web");
+    run.press(Key::Char('y'));
+    assert!(run.lines()[2].starts_with("-- saved as the template web in "));
+    let config = run.config();
+    assert_eq!(config.templates["web"].targets, [target("fc-stg/fc-api")]);
+    assert_eq!(config.templates["web"].container, None);
+    // In its place, with the comment above it, and the rest untouched.
+    let text = run.config_text();
+    assert!(
+        text.contains("# The web api alone, warnings only.\n[templates.web]\n"),
+        "{text}"
+    );
+    assert!(text.starts_with("# My gossip config.\n\n[defaults]\ntail = 5   # short\n"));
+    assert_eq!(
+        config.templates["elsewhere"],
+        Config::from_toml(CONFIG).unwrap().templates["elsewhere"]
+    );
+    assert!(
+        text.find("[templates.web]").unwrap() < text.find("[templates.elsewhere]").unwrap(),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn save_alone_updates_the_template_the_session_was_started_from() {
+    let mut run = Run::start().await;
+    std::fs::write(&run.config_path, CONFIG).unwrap();
+    // As after `gossip follow --template web`.
+    run.console.template = Some("web".to_string());
+    run.command("level error");
+    run.pump(1).await;
+
+    // No question: writing back is what the command is for.
+    run.command("save");
+    assert!(run.lines()[1].starts_with("-- saved as the template web in "));
+    assert_eq!(
+        run.config().templates["web"].filter,
+        Some(Filter::Any(vec![
+            Filter::kind_is(gossip_core::Kind::Event),
+            Filter::level_at_least(Level::Error),
+        ]))
+    );
+}
+
+#[tokio::test]
+async fn save_alone_without_a_template_asks_for_a_name() {
+    let mut run = Run::start().await;
+    run.command("save");
+    // The command line is open again, to take the name.
+    assert_eq!(run.status(), ":save");
+    assert_eq!(run.tape.terminal().cursor_column(), 6);
+    run.type_text("mine");
+    run.press(Key::Enter);
+    assert!(run.lines()[0].starts_with("-- saved as the template mine in "));
+    assert_eq!(
+        run.config().templates["mine"].targets,
+        [target("fc-stg/fc-api")]
+    );
+
+    // From here on the session is that template, and `:save` alone updates it.
+    run.command("events on");
+    run.pump(1).await;
+    run.command("save");
+    assert_eq!(run.status(), "");
+    assert_eq!(run.config().templates["mine"].events, Some(true));
+
+    // `Esc` instead of a name saves nothing.
+    let mut other = Run::start().await;
+    other.command("save");
+    other.press(Key::Esc);
+    assert_eq!(other.lines(), [""]);
+    assert_eq!(other.config_text(), "");
+}
+
+#[tokio::test]
+async fn a_name_that_cannot_be_a_key_and_the_name_last_are_refused() {
+    let mut run = Run::start().await;
+    run.command("save dev.api");
+    run.command("save last");
+    assert_eq!(
+        run.lines(),
+        [
+            "-- `dev.api` cannot be the name of a template: a name is made of letters, digits, `-` \
+             and `_`",
+            "-- `last` is where gossip itself keeps the session when it quits; save under another \
+             name",
+            ""
+        ]
+    );
+    assert_eq!(run.config_text(), "");
+}
+
+#[tokio::test]
+async fn a_config_file_that_cannot_be_read_is_not_written_and_save_says_why() {
+    let mut run = Run::start().await;
+    let broken = "[templates.dev-api]\ntragets = [\"flowcpt\"]\n";
+    std::fs::write(&run.config_path, broken).unwrap();
+    run.command("save mine");
+    let lines = run.lines();
+    assert!(
+        lines[0].starts_with("-- not saved: the config file "),
+        "{lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| line.contains("tragets")),
+        "{lines:?}"
+    );
+    assert_eq!(run.config_text(), broken);
+}
+
+#[tokio::test]
+async fn load_replaces_the_running_session_with_a_template() {
+    let mut run = Run::start().await;
+    std::fs::write(&run.config_path, CONFIG).unwrap();
+    run.log(0, "INFO api one");
+    run.fake.log(
+        NS,
+        WEB_POD,
+        "api",
+        at(100),
+        r#"{"level":"INFO","message":"web one","tenant_id":"t_1","rows":1}"#,
+    );
+    run.fake.log(
+        NS,
+        WEB_POD,
+        "api",
+        at(200),
+        r#"{"level":"WARN","message":"web two","tenant_id":"t_1","rows":2}"#,
+    );
+    run.command("level error");
+    run.pump(1).await;
+
+    // Acceptance 9: the old pod's stream closes with a notice, the new one
+    // opens, and the filter, the fields and the columns are the template's.
+    run.command("load web");
+    run.pump(3).await;
+    run.expect_quiet().await;
+    let mut lines = run.lines();
+    assert_eq!(lines[1], "-- loading the template web");
+    lines.drain(..2);
+    lines.sort();
+    assert_eq!(
+        lines,
+        [
+            "",
+            format!("-- pod {API_POD} is no longer selected by a target").as_str(),
+            "-- session loaded; following fc-stg/fc-web-api (1 pod)",
+            "WARN  tenant_id=t_1  web two"
+        ]
+    );
+    let spec = run.session.handle().spec();
+    assert_eq!(spec.targets, [target("fc-stg/fc-web-api")]);
+    assert_eq!(spec.filter, Some(Filter::level_at_least(Level::Warn)));
+    // What the template leaves out is the default of the config file.
+    assert_eq!(spec.tail, Some(5));
+    // The rule typed before is gone with the old session.
+    assert_eq!(run.console.filter.rules, LineRules::default());
+    // `:save` alone now writes back to the template that was loaded.
+    assert_eq!(run.console.template.as_deref(), Some("web"));
+}
+
+#[tokio::test]
+async fn a_template_that_cannot_be_loaded_changes_nothing() {
+    let mut run = Run::start().await;
+    std::fs::write(&run.config_path, CONFIG).unwrap();
+    run.command("level warn");
+    run.pump(1).await;
+
+    run.command("load nope");
+    run.command("load elsewhere");
+    assert_eq!(
+        run.lines()[1..],
+        [
+            "-- there is no template `nope`; the templates are: elsewhere, web",
+            "-- the template elsewhere is for the cluster aks-vulcan-01, and this session follows \
+             the cluster fake; nothing changed",
+            ""
+        ]
+    );
+    run.expect_quiet().await;
+    assert_eq!(
+        run.session.handle().spec().targets,
+        [target("fc-stg/fc-api")]
+    );
+    assert!(run.console.filter.filter().is_some());
+    assert_eq!(run.console.template, None);
+}
+
+#[tokio::test]
+async fn templates_lists_them_and_shows_one() {
+    let mut run = Run::start().await;
+    run.command("templates");
+    assert_eq!(
+        run.lines()[0],
+        format!(
+            "-- the config file {} holds no templates",
+            run.config_path.display()
+        )
+    );
+
+    std::fs::write(&run.config_path, CONFIG).unwrap();
+    run.command("templates");
+    // As `gossip templates` prints them.
+    assert_eq!(
+        run.lines()[1..4],
+        [
+            "-- NAME        TARGETS",
+            "-- elsewhere   flowcpt",
+            "-- web         fc-stg/fc-web-api"
+        ]
+    );
+    run.command("templates show elsewhere");
+    assert_eq!(
+        run.lines()[4..],
+        [
+            "-- [templates.elsewhere]",
+            "context = \"aks-vulcan-01\"",
+            "targets = [\"flowcpt\"]",
+            ""
+        ]
+    );
+    run.command("templates show nope");
+    assert!(run.lines()[7].starts_with("-- there is no template `nope`"));
+}
+
+#[tokio::test]
+async fn the_session_as_it_is_at_the_end_is_what_is_kept_for_last() {
+    let mut run = Run::start().await;
+    std::fs::write(&run.config_path, CONFIG).unwrap();
+    run.command("add fc-stg/fc-web-api");
+    run.command("grep payment");
+    run.command("columns pod=40");
+    run.pump(2).await;
+
+    // What `run` writes on every quit.
+    let last = run.console.last_session().expect("something is followed");
+    assert_eq!(
+        last.targets,
+        [target("fc-stg/fc-api"), target("fc-stg/fc-web-api")]
+    );
+    assert_eq!(last.context.as_deref(), Some("fake"));
+    assert_eq!(
+        last.filter,
+        Some(Filter::Any(vec![
+            Filter::kind_is(gossip_core::Kind::Event),
+            Filter::message_contains("payment"),
+        ]))
+    );
+    assert_eq!(last.fields, None);
+    // The columns of the bare output, as far as they differ from those of
+    // the config file.
+    assert_eq!(
+        last.columns.to_string(),
+        "time=0,pod=40,container=0,level=0"
+    );
+    Config::save_template(&run.config_path, gossip_core::save::LAST, &last).unwrap();
+    assert!(run.config_text().starts_with(CONFIG));
+
+    // Acceptance 8: `--last` is `--template last`, and that template
+    // resolves to the same targets and filter.
+    let resumed = run.config().templates["last"]
+        .clone()
+        .or(run.config().base())
+        .resolve();
+    assert_eq!(resumed.targets, last.targets);
+    assert_eq!(resumed.filter, last.filter);
+    assert_eq!(resumed.context, last.context);
+
+    // With nothing followed there is nothing to keep.
+    run.command("drop fc-stg/fc-api fc-stg/fc-web-api");
+    run.pump(4).await;
+    assert_eq!(run.console.last_session(), None);
 }
 
 // ---- when it is on ---------------------------------------------------------------

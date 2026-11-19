@@ -50,6 +50,12 @@ pub enum ConfigError {
     Serialise(#[from] toml::ser::Error),
     #[error("there is no home directory to look for the config file in; set {CONFIG_ENV}")]
     NoHome,
+    #[error(
+        "`{0}` cannot be the name of a template: a name is made of letters, digits, `-` and `_`"
+    )]
+    TemplateName(String),
+    #[error("cannot write a template into the config file {}: {why}", path.display())]
+    Unwritable { path: PathBuf, why: String },
 }
 
 /// The whole config file.
